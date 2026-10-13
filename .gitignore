@@ -1,0 +1,21 @@
+# your settings and runtime state: never commit
+relay.config.toml
+*.config.toml
+!relay.config.example.toml
+state/
+session-id
+last-rowid
+owner-day
+handoff*.md
+contacts.json
+# agents hold private chats: only the example is public
+agents/*
+!agents/example/
+agents/example/*
+!agents/example/RULES.md
+models/
+logs/
+*.log
+__pycache__/
+*.pyc
+.DS_Store

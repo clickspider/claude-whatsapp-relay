@@ -1,0 +1,151 @@
+# claude-whatsapp-relay config. Copy to relay.config.toml and fill it in.
+# This file is the ONLY place for your personal values. relay.config.toml is git-ignored.
+# Relative paths are relative to this file. "~" means your home folder.
+# Risk levels: LOW = safe default, MED = think about it, HIGH = read SECURITY.md first.
+# Check it any time with:  python3 relay.py check
+
+[owner]
+# Your own WhatsApp chat. ONLY this chat can control Claude. Format: <country code + number>@s.whatsapp.net
+jid = "31600000000@s.whatsapp.net"
+# How Claude calls you in prompts and notes.
+name = "Owner"
+# The folder Claude works in (your dossier). MED: Claude reads and edits everything here from WhatsApp.
+folder = "~/dossier"
+# Your timezone (IANA name). Used for the daily new session.
+timezone = "Europe/Amsterdam"
+# Start a fresh Claude session every day at this hour (a short hand-off carries over). -1 = never.
+new_session_hour = 4
+# Start a fresh session when the context passes this many tokens. 0 = never.
+max_context_tokens = 500000
+# Answer voice notes with a voice note (macOS `say`). LOW.
+voice_replies = true
+# Extra instructions for your Claude. "" = a short built-in prompt (plain text, short, @@ markers).
+# A security line about untrusted data is always added after it.
+system_prompt = ""
+# Tools your Claude may use. LOW with file tools only. HIGH if you add "Bash" or "WebFetch":
+# anyone who gets into your WhatsApp (or a message you forward) can then run commands on this computer.
+tools = ["Read", "Write", "Edit", "Glob", "Grep"]
+# Permission mode for the owner run: default | acceptEdits | plan | auto | dontAsk. bypassPermissions is refused.
+permission_mode = "acceptEdits"
+# MCP servers for your Claude, as a JSON file (same format as `claude --mcp-config`). "" = none. MED if set.
+mcp_config = ""
+# Rules approved without asking, e.g. "Bash(./backup.sh)". MED: each one is a door that WhatsApp can open.
+allowed_tools = []
+# Rules that are always refused, e.g. "mcp__whatsapp__send_message".
+denied_tools = []
+# Extra folders your Claude may use besides `folder`. MED.
+extra_dirs = []
+# HIGH. true = ignore tools/permission_mode/mcp_config above and use your global Claude setup
+# (every tool, every MCP server, your permission mode). Only for an owner who knows why.
+inherit_global_setup = false
+
+[bridge]
+# The whatsapp-mcp bridge REST API. Must stay on 127.0.0.1 (the token is sent with every call).
+api = "http://127.0.0.1:8080/api"
+# The bridge's store/ folder: messages.db (read-only here) and .bridge-token.
+# You can also set the token in the WHATSAPP_BRIDGE_TOKEN environment variable.
+store = "~/whatsapp-mcp/whatsapp-bridge/store"
+# Where voice replies are written before sending (the bridge's media folder).
+outbox = "~/.local/share/whatsapp-mcp/outbox"
+
+[paths]
+claude = "claude"
+ffmpeg = "ffmpeg"
+whisper_cli = "whisper-cli"
+# Local speech-to-text model. Get it with scripts/get-model.sh. Voice never leaves this computer.
+whisper_model = "models/ggml-large-v3-turbo-q5_0.bin"
+# Session id, read cursor and hand-off notes. Created with mode 0700.
+state_dir = "state"
+# One folder per agent: RULES.md + its state files.
+agents_dir = "agents"
+
+[limits]
+# Max messages handled per chat per minute and per day (also caps your Claude bill). 0 = no cap (MED).
+per_minute = 6
+per_day = 150
+# Max group messages kept while waiting for a digest turn. 0 = unbounded (MED).
+group_buffer_max = 40
+# Kill a Claude run after this many seconds. 0 = never.
+run_timeout_seconds = 600
+
+[quiet_hours]
+# Agents never START a conversation (check-ins, owner notes) in quiet hours. Replies still go out.
+# "" = owner.timezone.
+timezone = ""
+start = 21
+end = 9
+# Whole days off, e.g. ["sun"]. Days: mon tue wed thu fri sat sun.
+days_off = []
+# Quiet from this hour on a given day, e.g. { fri = 15 }.
+early_close = {}
+
+[groups]
+# Words that mean "the agent is addressed" in a listening group (for example "claude" or "@<its number>").
+self_tags = ["claude"]
+
+[prompts]
+# Fixed words the relay sends to agents. Your agents' RULES.md should use the same words.
+owner_says = "OWNER SAYS: "
+status = "STATUS FOR OWNER"
+intro = "INTRO"
+checkin = "CHECK-IN TIME"
+from_owner_claude = "FROM OWNER'S CLAUDE: "
+# Agents send you a note with a line "@@OWNER: <note>".
+owner_note_marker = "OWNER"
+# First words of a group digest prompt.
+group_label = "GROUP."
+
+[hooks]
+# Command run (as a list, no shell) after an agent log is written, at most every N seconds.
+# MED: with a git push, other people's messages are copied off this computer. [] = off.
+after_log = []
+after_log_min_seconds = 600
+
+[danger]
+# HIGH. true = your Claude may edit relay.py, and the relay restarts itself when it changes.
+# Text from WhatsApp could then change the code that runs next. Keep false.
+self_edit = false
+# LOW when true. Denies edits to ~/.claude/hooks, ~/.claude/settings*.json, ~/Library/LaunchAgents,
+# <folder>/.claude, this config, the state dir and the relay code. false = HIGH.
+protect_sensitive_paths = true
+# HIGH. Needed for any agent with unrestricted = true (no --restricted sandbox). Keep false.
+allow_unrestricted_agents = false
+
+[launchd]
+# Used by scripts/install-launchd.sh (macOS). python must be 3.11 or newer.
+label = "com.example.claude-whatsapp-relay"
+python = "python3"
+# Log folder, created with mode 0700 (logs can hold message text).
+log_dir = "~/Library/Logs/claude-whatsapp-relay"
+
+[contacts_json]
+# Optional, for users of the older contacts.json format. "" = off.
+path = ""
+# Tools for contacts with "gmail": true (they also need unrestricted agents, see above). HIGH.
+extra_allowed_tools = []
+extra_disallowed_tools = []
+
+# ---------- Agents: OFF by default. Each one is a locked Claude for one contact or group. ----------
+# Every agent ALWAYS runs with --restricted, --strict-mcp-config, file tools only, and can only
+# touch its own `home` folder (+ read_also). Copy agents/example/ to agents/<name>/ and edit RULES.md.
+#
+# [[agent]]
+# name = "alex"                          # lowercase letters; you command it with /alex
+# jid = "31600000001@s.whatsapp.net"     # the contact, or a group: "120363000000000000@g.us"
+# live = false                           # false = only dry runs (/asalex <text>) from your chat
+# trust = "draft"                        # draft = every reply waits for your "/alex ok" (LOW)
+#                                        # reply = it answers by itself (MED)
+# trigger = "all"                        # all | mention:<word> | listen (groups: reads all, speaks when tagged)
+# self_tags = ["claude"]                 # listen groups: words that address it (default: [groups])
+# members = { "31600000002" = "Sam" }    # group sender number -> name shown to the agent
+# home = "agents/alex/home"              # its only writable folder (default: agents/<name>/home)
+# read_also = []                         # extra folders it may use (MED: it can read them)
+# read_only = []                         # files/folders it must never edit
+# checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
+# inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
+# timezone = ""                          # "" = quiet_hours.timezone
+# tools = ["Read", "Write", "Edit", "Glob", "Grep"]   # file tools only, nothing else is accepted
+# extra_mcp_config = ""                  # HIGH: give it MCP servers (e.g. email). It stays --restricted.
+# extra_allowed_tools = []               # HIGH: the MCP tools it may use without asking
+# extra_disallowed_tools = []
+# unrestricted = false                   # HIGH: drops the sandbox. Needs danger.allow_unrestricted_agents.
