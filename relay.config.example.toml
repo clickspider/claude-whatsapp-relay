@@ -13,10 +13,14 @@ name = "Owner"
 folder = "~/dossier"
 # Your timezone (IANA name). Used for the daily new session.
 timezone = "Europe/Amsterdam"
-# Start a fresh Claude session every day at this hour (a short hand-off carries over). -1 = never.
+# Automatic /new: start a fresh Claude session every day at this hour. Context is not lost: the old
+# session first writes a short hand-off (open topics, decisions, promises) that opens the new one. -1 = never.
 new_session_hour = 4
-# Start a fresh session when the context passes this many tokens. 0 = never.
+# Automatic /new (with the same hand-off) when the context passes this many tokens. 0 = never.
 max_context_tokens = 500000
+# Where files you send (photos, PDFs, documents) are copied, so they land in your folder.
+# Relative to `folder`, e.g. "_inbox/whatsapp". "" = leave them in the bridge's media folder. LOW.
+media_dir = ""
 # Answer voice notes with a voice note (macOS `say`). LOW.
 voice_replies = true
 # Extra instructions for your Claude. "" = a short built-in prompt (plain text, short, @@ markers).
@@ -54,10 +58,26 @@ ffmpeg = "ffmpeg"
 whisper_cli = "whisper-cli"
 # Local speech-to-text model. Get it with scripts/get-model.sh. Voice never leaves this computer.
 whisper_model = "models/ggml-large-v3-turbo-q5_0.bin"
+# Language of voice notes for whisper ("auto", "en", "nl", ...).
+whisper_language = "auto"
 # Session id, read cursor and hand-off notes. Created with mode 0700.
 state_dir = "state"
 # One folder per agent: RULES.md + its state files.
 agents_dir = "agents"
+
+[feedback]
+# Show "typing..." in WhatsApp while Claude works (repeated every 10 s).
+typing = true
+# Reactions on your message: 👀 got it, ⏳ long job, ✅ done, ⚠️ failed.
+reactions = true
+# Mark your message as read (blue ticks) when the relay picks it up.
+mark_read = true
+# Add ⏳ after this many seconds. 0 = never.
+long_job_seconds = 180
+# How often the relay checks for new messages, in seconds.
+poll_seconds = 2
+# Listening groups: wait this many quiet seconds, then the agent reads the batch at once.
+group_digest_after_seconds = 120
 
 [limits]
 # Max messages handled per chat per minute and per day (also caps your Claude bill). 0 = no cap (MED).

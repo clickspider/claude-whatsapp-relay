@@ -134,6 +134,49 @@ extra_disallowed_tools = ["mcp__mail__send"]
             deny = json.loads(g[g.index("--settings") + 1])["permissions"]["deny"]
             self.assertEqual(deny, [f"Edit(/{tmp}/dossier/g/plan.md)", f"Write(/{tmp}/dossier/g/plan.md)"])
 
+    def test_feedback_switches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for extra, expect in (("", {"mark-read", "react", "typing"}),
+                                  ("[feedback]\ntyping = false\nreactions = false\nmark_read = false", set())):
+                relay.CFG = relay.load_config(write_cfg(tmp, extra))
+                calls, orig = [], relay.api
+                relay.api = lambda path, payload=None: calls.append(path) or {}
+                try:
+                    relay.with_feedback("c", "m", "s", lambda: None)
+                finally:
+                    relay.api = orig
+                self.assertEqual(set(calls), expect)
+
+    def test_owner_media_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = relay.load_config(write_cfg(tmp))
+            relay.CFG = cfg
+            self.assertEqual(relay.keep_media("/x/y.pdf"), "/x/y.pdf")  # default: old behaviour
+            cfg["owner"]["media_dir"] = os.path.join(cfg["owner"]["folder"], "_inbox")
+            relay.CFG = cfg
+            src = os.path.join(tmp, "photo.jpg")
+            with open(src, "w") as f:
+                f.write("x")
+            dest = relay.keep_media(src)
+            self.assertTrue(dest.startswith(cfg["owner"]["media_dir"]) and os.path.isfile(dest))
+
+    def test_auto_new_keeps_context_via_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay.setup(relay.load_config(write_cfg(tmp, '[paths]\nstate_dir = "st"')))
+            relay.write(relay.st("session-id"), "old")
+            relay.write(relay.st("owner-day"), relay.day_key())
+            seen, orig = [], (relay.claude_owner, relay.context_tokens)
+            relay.claude_owner = lambda p, sid, new: seen.append((p, sid, new)) or (
+                "NOTES: open topic X" if p == relay.HANDOFF_PROMPT else "answer")
+            relay.context_tokens = lambda sid: 10**9
+            try:
+                self.assertEqual(relay.ask_owner_claude("hello"), "answer")
+            finally:
+                relay.claude_owner, relay.context_tokens = orig
+            self.assertEqual(seen[0], (relay.HANDOFF_PROMPT, "old", False))
+            prompt, sid, new = seen[1]
+            self.assertTrue(new and sid != "old" and "open topic X" in prompt and prompt.endswith("hello"))
+
 
 if __name__ == "__main__":
     unittest.main()

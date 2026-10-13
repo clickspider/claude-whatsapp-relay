@@ -32,15 +32,18 @@ UNTRUSTED_OPEN, UNTRUSTED_CLOSE = "<<<UNTRUSTED", "UNTRUSTED>>>"
 
 DEFAULTS = {
     "owner": {"jid": "", "name": "Owner", "folder": "", "timezone": "UTC", "new_session_hour": 4,
-              "max_context_tokens": 500_000, "system_prompt": "", "voice_replies": True,
+              "max_context_tokens": 500_000, "system_prompt": "", "media_dir": "", "voice_replies": True,
               "tools": FILE_TOOLS, "permission_mode": "acceptEdits", "mcp_config": "",
               "allowed_tools": [], "denied_tools": [], "extra_dirs": [],
               "inherit_global_setup": False},
     "bridge": {"api": "http://127.0.0.1:8080/api", "store": "",
                "outbox": "~/.local/share/whatsapp-mcp/outbox"},
     "paths": {"claude": "claude", "ffmpeg": "ffmpeg", "whisper_cli": "whisper-cli",
-              "whisper_model": "models/ggml-large-v3-turbo-q5_0.bin", "state_dir": "state",
+              "whisper_model": "models/ggml-large-v3-turbo-q5_0.bin", "whisper_language": "auto",
+              "state_dir": "state",
               "agents_dir": "agents"},
+    "feedback": {"typing": True, "reactions": True, "mark_read": True, "long_job_seconds": 180,
+                 "poll_seconds": 2, "group_digest_after_seconds": 120},
     "limits": {"per_minute": 6, "per_day": 150, "group_buffer_max": 40, "run_timeout_seconds": 600},
     "quiet_hours": {"timezone": "", "start": 21, "end": 9, "days_off": [], "early_close": {}},
     "groups": {"self_tags": []},
@@ -87,6 +90,7 @@ def load_config(path):
     o = cfg["owner"]
     o["folder"] = _path(o["folder"], base)
     o["mcp_config"] = _path(o["mcp_config"], base)
+    o["media_dir"] = _path(o["media_dir"], o["folder"] or base)
     o["extra_dirs"] = [_path(d, base) for d in o["extra_dirs"]]
     for k in ("store", "outbox"):
         cfg["bridge"][k] = _path(cfg["bridge"][k], base)
@@ -395,7 +399,7 @@ def transcribe(path):
         subprocess.run([CFG["paths"]["ffmpeg"], "-loglevel", "error", "-y", "-i", path,
                         "-ar", "16000", "-ac", "1", wav], check=True)
         r = subprocess.run([CFG["paths"]["whisper_cli"], "-m", CFG["paths"]["whisper_model"],
-                            "-f", wav, "-nt", "-l", "auto"], capture_output=True, text=True, timeout=600)
+                            "-f", wav, "-nt", "-l", CFG["paths"]["whisper_language"]], capture_output=True, text=True, timeout=600)
         return r.stdout.strip()
 
 
@@ -458,21 +462,27 @@ def typing_while(chat, stop):
 
 
 def with_feedback(chat, msg_id, sender, fn):
-    """Status on the message: 👀 got it / ⏳ long job / ✅ done / ⚠️ failed."""
-    try:
-        api("mark-read", {"message_ids": [msg_id], "chat_jid": chat})
-    except Exception:
-        pass
-    react(chat, msg_id, sender, "👀")
+    """Status on the message: 👀 got it / ⏳ long job / ✅ done / ⚠️ failed, plus "typing..."
+    while Claude works. Each part can be switched off in [feedback]."""
+    fb = CFG["feedback"]
+    mark = (lambda e: react(chat, msg_id, sender, e)) if fb["reactions"] else (lambda e: None)
+    if fb["mark_read"]:
+        try:
+            api("mark-read", {"message_ids": [msg_id], "chat_jid": chat})
+        except Exception:
+            pass
+    mark("👀")
     stop = threading.Event()
-    threading.Thread(target=typing_while, args=(chat, stop), daemon=True).start()
-    threading.Thread(target=lambda: stop.wait(180) or react(chat, msg_id, sender, "⏳"),
-                     daemon=True).start()
+    if fb["typing"]:
+        threading.Thread(target=typing_while, args=(chat, stop), daemon=True).start()
+    if fb["long_job_seconds"]:
+        threading.Thread(target=lambda: stop.wait(fb["long_job_seconds"]) or mark("⏳"),
+                         daemon=True).start()
     try:
         fn()
-        react(chat, msg_id, sender, "✅")
+        mark("✅")
     except Exception:
-        react(chat, msg_id, sender, "⚠️")
+        mark("⚠️")
         raise
     finally:
         stop.set()
@@ -558,6 +568,18 @@ def ask_owner_claude(prompt):
     return claude_owner(prompt, sid, new)
 
 
+def keep_media(path):
+    """owner.media_dir set: copy the owner's file into that folder (e.g. a dossier inbox) and
+    return the new path. "" = leave it in the bridge's media folder (old behaviour)."""
+    d = CFG["owner"]["media_dir"]
+    if not d:
+        return path
+    os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, owner_now().strftime("%Y%m%d-%H%M%S-") + os.path.basename(path))
+    shutil.copy(path, dest)
+    return dest
+
+
 def owner_turn(msg_id, text, media_type):
     text = text or ""
     if text.strip().lower() == "/new":
@@ -576,6 +598,7 @@ def owner_turn(msg_id, text, media_type):
             if not text:
                 return send_text(OWNER, "I could not understand the voice note.")
         else:
+            path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
     if text.lower().startswith("voice"):
         voice = True
@@ -793,7 +816,7 @@ def listen(chat, a, msg_id, sender, content, media_type):
 
 def flush_quiet_groups():
     for name, b in list(buffers.items()):
-        if time.time() - b["last"] < 120:  # 2 quiet minutes, then one digest turn
+        if time.time() - b["last"] < CFG["feedback"]["group_digest_after_seconds"]:
             continue
         jid, a = by_name(name)
         if a:
@@ -1005,7 +1028,7 @@ def main_loop():
                     fn()
                 except Exception:
                     pass
-        time.sleep(2)
+        time.sleep(CFG["feedback"]["poll_seconds"])
 
 
 # ---------- check / plan ----------
@@ -1031,6 +1054,10 @@ def risk_lines(cfg):
          ", ".join(o["allowed_tools"]) or "none pre-approved"),
         ("INFO", "owner.denied_tools", ", ".join(o["denied_tools"]) or "none"),
         ("MED" if o["extra_dirs"] else "LOW", "owner.extra_dirs", ", ".join(o["extra_dirs"]) or "none"),
+        ("LOW", "owner.media_dir", f"files you send are copied to {o['media_dir']}"
+                                   if o["media_dir"] else "files you send stay in the bridge's media folder"),
+        ("INFO", "feedback", ", ".join(k for k in ("typing", "reactions", "mark_read") if cfg["feedback"][k])
+         or "no typing, reactions or read marks"),
         ("LOW", "owner.voice_replies", "on (macOS say)" if o["voice_replies"] else "off"),
         ("HIGH" if d["self_edit"] else "LOW", "danger.self_edit",
          "ON: Claude may edit relay.py and the relay restarts itself" if d["self_edit"] else "off"),
