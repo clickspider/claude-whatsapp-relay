@@ -375,13 +375,21 @@ def send_voice(chat, text):
     out = CFG["bridge"]["outbox"]
     os.makedirs(out, exist_ok=True)
     base = os.path.join(out, f"reply-{uuid.uuid4().hex}")
-    # Text goes in on stdin, so a leading "-" can never become an option (audit LOW).
-    subprocess.run(["say", "-o", base + ".aiff", "-f", "-"], input=text, text=True, check=True)
-    subprocess.run([CFG["paths"]["ffmpeg"], "-loglevel", "error", "-y", "-i", base + ".aiff",
-                    "-c:a", "libopus", "-b:a", "32k", "-ac", "1", base + ".ogg"], check=True)
-    api("send", {"recipient": chat, "message": "", "media_path": base + ".ogg"})
-    for ext in (".aiff", ".ogg"):
-        os.remove(base + ext)
+    try:
+        # Text goes in on stdin, so a leading "-" can never become an option (audit LOW).
+        # Timeouts: macOS `say` can hang after writing the file, which froze the owner queue.
+        subprocess.run(["say", "-o", base + ".aiff", "-f", "-"], input=text, text=True,
+                       check=True, timeout=180)
+        subprocess.run([CFG["paths"]["ffmpeg"], "-loglevel", "error", "-y", "-i", base + ".aiff",
+                        "-c:a", "libopus", "-b:a", "32k", "-ac", "1", base + ".ogg"],
+                       check=True, timeout=180)
+        api("send", {"recipient": chat, "message": "", "media_path": base + ".ogg"})
+    except Exception:  # voice failed: the answer still goes out, as text
+        send_text(chat, text)
+    finally:
+        for ext in (".aiff", ".ogg"):
+            if os.path.exists(base + ext):
+                os.remove(base + ext)
 
 
 def transcribe(path):
