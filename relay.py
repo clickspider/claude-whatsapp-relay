@@ -688,7 +688,7 @@ def log_thread(a, who, text, en="", dry=False):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def deliver(jid, a, out, dry, allow_hold=True, refs=None):
+def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     """Route the agent's answer: to the chat, or held for the owner, plus notes to the owner."""
     out = apply_fixes(OWNER if dry else jid, out)
     body, m = parse(out)
@@ -699,7 +699,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None):
         flag(a, "next-checkin", m["NEXT_CHECKIN"])
     if not body:
         return
-    if (m["HOLD"] or a["trust"] == "draft") and allow_hold:
+    if (m["HOLD"] or a["trust"] == "draft" or hold) and allow_hold:
         flag(a, "pending", body)
         log_thread(a, f"AGENT (held for {owner})", body, m["EN"], dry)
         send_text(OWNER, f"📝 Draft for {name}, held for your OK.\nEN: {m['EN'] or '(no gist)'}\n\n"
@@ -769,8 +769,10 @@ def owner_command(name, arg):
         return send_text(OWNER, f"{name} is not live yet. Use /as{name} <text> for the dry run.")
     if low == "intro":
         return deliver(jid, a, run_agent(a, p["intro"]), dry=False, allow_hold=False)
-    flag(a, "pending", "")  # the owner's own words: the agent writes and sends them
-    deliver(jid, a, run_agent(a, p["owner_says"] + arg.strip()), dry=False, allow_hold=False)
+    # The owner's words become a DRAFT, never a blind send: a typo ("/mom statys") once sent an
+    # English status meant for the owner straight to the contact. /<name> ok sends it.
+    flag(a, "pending", "")
+    deliver(jid, a, run_agent(a, p["owner_says"] + arg.strip()), dry=False, hold=True)
 
 
 # ---------- groups (trigger "listen") ----------
