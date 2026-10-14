@@ -674,12 +674,12 @@ def run_agent(a, prompt):
 def parse(out):
     note = CFG["prompts"]["owner_note_marker"]
     body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "QUOTE": ""}
-    rx = re.compile(rf"\s*@@({re.escape(note)}|EN|HOLD|NEXT_CHECKIN|QUOTE)\s*:?\s*(.*)$")
+    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|QUOTE)\s*:?\s*(.*)$")  # OWNER = template name, always private
     for line in out.splitlines():
         m = rx.match(line)
         if not m:
             body.append(line)
-        elif m.group(1) == note:
+        elif m.group(1) in (note, "OWNER"):
             marks["NOTE"].append(m.group(2))
         elif m.group(1) == "HOLD":
             marks["HOLD"] = True
