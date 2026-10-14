@@ -100,39 +100,45 @@ tools = ["Read", "Bash"]
         self.assertEqual(w.count(relay.UNTRUSTED_CLOSE), 1)
         self.assertTrue(w.endswith(relay.UNTRUSTED_CLOSE))
 
-    def test_legacy_contacts_json_reproduces_old_args(self):
-        """Old contacts.json format: locked agent = old argv; gmail agent only with both switches."""
+    def test_unrestricted_agent_and_connector_switch(self):
+        """unrestricted = old gmail argv; load_claude_connectors adds user settings, locked down."""
         with tempfile.TemporaryDirectory() as tmp:
-            for n in ("ann", "grp"):
-                os.makedirs(os.path.join(tmp, "agents", n))
-                with open(os.path.join(tmp, "agents", n, "RULES.md"), "w") as f:
-                    f.write("r")
-            with open(os.path.join(tmp, "contacts.json"), "w") as f:
-                json.dump({"15550100003@s.whatsapp.net": {"name": "ann", "home": "cases/ann", "live": True},
-                           "120363999999999991@g.us": {"name": "grp", "home": "g", "live": True,
-                                                       "trigger": "listen", "gmail": True,
-                                                       "read_only": ["g/plan.md"]}}, f)
-            cfg = relay.load_config(write_cfg(tmp, f"""
+            os.makedirs(os.path.join(tmp, "agents", "grp"))
+            with open(os.path.join(tmp, "agents", "grp", "RULES.md"), "w") as f:
+                f.write("r")
+            agent = f"""
 [danger]
 allow_unrestricted_agents = true
-[contacts_json]
-path = "{tmp}/contacts.json"
+[[agent]]
+name = "grp"
+jid = "120363999999999991@g.us"
+live = true
+trigger = "listen"
+home = "dossier/g"
+read_only = ["dossier/g/plan.md"]
+unrestricted = true
 extra_allowed_tools = ["mcp__mail__search"]
 extra_disallowed_tools = ["mcp__mail__send"]
-"""))
+"""
+            cfg = relay.load_config(write_cfg(tmp, agent))
             self.assertEqual(relay.validate(cfg)[0], [])
-            ann, grp = relay.agents(cfg)
-            self.assertEqual(ann["home"], os.path.join(tmp, "dossier", "cases", "ann"))
-            self.assertEqual(ann["trust"], "reply")
-            a = relay.agent_args(cfg, ann, "s", False)
-            self.assertEqual(a[:8], ["claude", "-p", "--restricted", "--strict-mcp-config", "--tools",
-                                     "Read,Write,Edit,Glob,Grep", "--permission-mode", "acceptEdits"])
-            g = relay.agent_args(cfg, grp, "s", False)
+            g = relay.agent_args(cfg, relay.agents(cfg)[0], "s", False)
             self.assertEqual(g[2:4], ["--setting-sources", ""])
+            self.assertNotIn("--permission-mode", g)
             self.assertIn("mcp__mail__search,Read,Glob,Grep", g[g.index("--allowedTools") + 1])
             self.assertEqual(g[g.index("--disallowedTools") + 1], "mcp__mail__send")
-            deny = json.loads(g[g.index("--settings") + 1])["permissions"]["deny"]
-            self.assertEqual(deny, [f"Edit(/{tmp}/dossier/g/plan.md)", f"Write(/{tmp}/dossier/g/plan.md)"])
+            gs = json.loads(g[g.index("--settings") + 1])
+            self.assertEqual(gs, {"permissions": {"deny": [f"Edit(/{tmp}/dossier/g/plan.md)",
+                                                            f"Write(/{tmp}/dossier/g/plan.md)"]}})
+            cfg = relay.load_config(write_cfg(tmp, agent + "load_claude_connectors = true\n"))
+            self.assertEqual(relay.validate(cfg)[0], [])
+            g = relay.agent_args(cfg, relay.agents(cfg)[0], "s", False)
+            self.assertEqual(g[2:4], ["--setting-sources", "user"])
+            self.assertEqual(g[g.index("--permission-mode") + 1], "default")
+            gs = json.loads(g[g.index("--settings") + 1])
+            self.assertTrue(gs["disableAllHooks"])
+            self.assertFalse(gs["autoMemoryEnabled"])
+            self.assertIn("permissions", gs)
 
     def test_feedback_switches(self):
         with tempfile.TemporaryDirectory() as tmp:

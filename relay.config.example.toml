@@ -140,13 +140,6 @@ python = "python3"
 # Log folder, created with mode 0700 (logs can hold message text).
 log_dir = "~/Library/Logs/claude-whatsapp-relay"
 
-[contacts_json]
-# Optional, for users of the older contacts.json format. "" = off.
-path = ""
-# Tools for contacts with "gmail": true (they also need unrestricted agents, see above). HIGH.
-extra_allowed_tools = []
-extra_disallowed_tools = []
-
 # ---------- Agents: OFF by default. Each one is a locked Claude for one contact or group. ----------
 # Every agent ALWAYS runs with --restricted, --strict-mcp-config, file tools only, and can only
 # touch its own `home` folder (+ read_also). Copy agents/example/ to agents/<name>/ and edit RULES.md.
@@ -171,3 +164,5 @@ extra_disallowed_tools = []
 # extra_allowed_tools = []               # HIGH: the MCP tools it may use without asking
 # extra_disallowed_tools = []
 # unrestricted = false                   # HIGH: drops the sandbox. Needs danger.allow_unrestricted_agents.
+# load_claude_connectors = false         # HIGH, needs unrestricted: your claude.ai connectors (Gmail...)
+#                                        # load, and so does your global CLAUDE.md. Hooks + memory stay off.

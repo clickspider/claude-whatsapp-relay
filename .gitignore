@@ -7,7 +7,6 @@ session-id
 last-rowid
 owner-day
 handoff*.md
-contacts.json
 # agents hold private chats: only the example is public
 agents/*
 !agents/example/

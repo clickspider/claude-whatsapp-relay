@@ -53,7 +53,6 @@ DEFAULTS = {
     "hooks": {"after_log": [], "after_log_min_seconds": 600},
     "danger": {"self_edit": False, "protect_sensitive_paths": True,
                "allow_unrestricted_agents": False},
-    "contacts_json": {"path": "", "extra_allowed_tools": [], "extra_disallowed_tools": []},
     "launchd": {"label": "com.example.claude-whatsapp-relay", "python": "python3",
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
@@ -61,7 +60,8 @@ AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigg
                   "self_tags": None, "members": {}, "dir": "", "home": "", "read_also": [],
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
-                  "unrestricted": False, "inbox": False, "group_label": ""}
+                  "unrestricted": False, "load_claude_connectors": False, "inbox": False,
+                  "group_label": ""}
 
 
 # ---------- config ----------
@@ -100,23 +100,20 @@ def load_config(path):
     if os.sep in p["claude"] or p["claude"].startswith("~"):
         p["claude"] = _path(p["claude"], base)
     cfg["hooks"]["after_log"] = [os.path.expanduser(a) for a in cfg["hooks"]["after_log"]]
-    cfg["contacts_json"]["path"] = _path(cfg["contacts_json"]["path"], base)
     cfg["launchd"]["log_dir"] = _path(cfg["launchd"]["log_dir"], base)
     if not cfg["quiet_hours"]["timezone"]:
         cfg["quiet_hours"]["timezone"] = o["timezone"]
-    cfg["toml_agents"] = [normalize_agent(cfg, a, base, legacy=False) for a in raw.get("agent", [])]
+    cfg["agents"] = [normalize_agent(cfg, a, base) for a in raw.get("agent", [])]
     return cfg
 
 
-def normalize_agent(cfg, a, base, legacy):
+def normalize_agent(cfg, a, base):
     a = _merge(AGENT_DEFAULTS, a)
     adir = cfg["paths"]["agents_dir"]
     a["dir"] = _path(a["dir"], base) or os.path.join(adir, a["name"])
-    # Legacy contacts.json: home/read_also/read_only are relative to the owner folder.
-    fbase = cfg["owner"]["folder"] if legacy else base
-    a["home"] = _path(a["home"], fbase) or os.path.join(a["dir"], "home")
-    a["read_also"] = [_path(d, fbase) for d in a["read_also"]]
-    a["read_only"] = [_path(d, fbase) for d in a["read_only"]]
+    a["home"] = _path(a["home"], base) or os.path.join(a["dir"], "home")
+    a["read_also"] = [_path(d, base) for d in a["read_also"]]
+    a["read_only"] = [_path(d, base) for d in a["read_only"]]
     a["extra_mcp_config"] = _path(a["extra_mcp_config"], base)
     a["timezone"] = a["timezone"] or cfg["quiet_hours"]["timezone"]
     if a["self_tags"] is None:
@@ -125,29 +122,8 @@ def normalize_agent(cfg, a, base, legacy):
     return a
 
 
-def legacy_agents(cfg):
-    """Optional: agents from an older contacts.json ({jid: {...}}), re-read on every call."""
-    cj = cfg["contacts_json"]
-    if not cj["path"]:
-        return []
-    with open(cj["path"]) as f:
-        data = json.load(f)
-    out = []
-    for jid, c in data.items():
-        a = {"name": c["name"], "jid": jid, "live": c.get("live", False), "trust": "reply",
-             "trigger": c.get("trigger", "all"), "members": c.get("members", {}),
-             "home": c.get("home", ""), "read_also": c.get("read_also", []),
-             "read_only": c.get("read_only", []), "checkins": c.get("checkins", False),
-             "timezone": c.get("tz", ""), "inbox": True}
-        if c.get("gmail"):
-            a.update(unrestricted=True, extra_allowed_tools=cj["extra_allowed_tools"],
-                     extra_disallowed_tools=cj["extra_disallowed_tools"])
-        out.append(normalize_agent(cfg, a, os.path.dirname(cfg["config_path"]), legacy=True))
-    return out
-
-
 def agents(cfg):
-    return cfg["toml_agents"] + legacy_agents(cfg)
+    return cfg["agents"]
 
 
 def validate(cfg):
@@ -187,12 +163,8 @@ def validate(cfg):
         err.append(f"quiet_hours days must be in {DAYS}.")
     if cfg["hooks"]["after_log"] and not isinstance(cfg["hooks"]["after_log"], list):
         err.append("hooks.after_log must be a list, e.g. [\"/path/to/backup.sh\"].")
-    try:
-        all_agents = agents(cfg)
-    except (OSError, ValueError, KeyError) as e:
-        return err + [f"contacts_json.path could not be read: {e}"], warn
     names = set()
-    for a in all_agents:
+    for a in agents(cfg):
         n = a["name"]
         if not NAME_RE.match(n) or n in ("new",) or n.startswith("as"):
             err.append(f"agent name '{n}' must be lowercase letters only, not 'new', not starting with 'as'.")
@@ -219,6 +191,8 @@ def validate(cfg):
             err.append(f"agent {n}: home must not be your whole owner folder (or a parent of it).")
         if a["unrestricted"] and not cfg["danger"]["allow_unrestricted_agents"]:
             err.append(f"agent {n}: unrestricted needs danger.allow_unrestricted_agents = true.")
+        if a["load_claude_connectors"] and not a["unrestricted"]:
+            err.append(f"agent {n}: load_claude_connectors needs unrestricted = true.")
         if a["extra_allowed_tools"] and not (a["extra_mcp_config"] or a["unrestricted"]):
             warn.append(f"agent {n}: extra_allowed_tools has no effect without extra_mcp_config.")
         if a["extra_mcp_config"] and not os.path.isfile(a["extra_mcp_config"]):
@@ -281,15 +255,22 @@ def owner_args(cfg, sid, new):
 
 def agent_args(cfg, a, sid, new):
     """Audit H1: every agent is --restricted + --strict-mcp-config + file tools + own folders,
-    unless the owner opted into 'unrestricted' (legacy, two danger switches)."""
+    unless the owner opted into 'unrestricted' (two danger switches)."""
     rules = os.path.join(a["dir"], "RULES.md")
+    settings = {}
     claude, tools = cfg["paths"]["claude"], ",".join(t for t in a["tools"] if t in FILE_TOOLS)
     if a["unrestricted"] and cfg["danger"]["allow_unrestricted_agents"]:
-        args = [claude, "-p", "--setting-sources", "", "--tools", tools,
+        # claude.ai connectors (Gmail etc.) only load with your user settings. Opt-in: hooks and
+        # auto memory stay off and tools not listed are denied, but your global CLAUDE.md loads.
+        con = a["load_claude_connectors"]
+        args = [claude, "-p", "--setting-sources", "user" if con else "", "--tools", tools,
                 "--allowedTools", ",".join(a["extra_allowed_tools"] + ["Read", "Glob", "Grep",
                                                                       f"Edit(/{a['home']}/**)"]),
                 "--disallowedTools", ",".join(a["extra_disallowed_tools"]),
                 "--append-system-prompt-file", rules, "--add-dir", a["home"]]
+        if con:
+            args += ["--permission-mode", "default"]
+            settings.update(disableAllHooks=True, autoMemoryEnabled=False)
         deny = []
     else:
         args = [claude, "-p", "--restricted", "--strict-mcp-config", "--tools", tools,
@@ -306,7 +287,9 @@ def agent_args(cfg, a, sid, new):
         args += ["--add-dir", extra]
     deny += [f"{t}(/{p})" for p in a["read_only"] for t in ("Edit", "Write")]
     if deny:
-        args += ["--settings", json.dumps({"permissions": {"deny": deny}})]
+        settings["permissions"] = {"deny": deny}
+    if settings:
+        args += ["--settings", json.dumps(settings)]
     return args + ["--session-id" if new else "--resume", sid]
 
 
@@ -1111,6 +1094,7 @@ def risk_lines(cfg):
                     f"trigger={a['trigger']}, home={a['home']}"
                     + (", UNRESTRICTED (no --restricted, no --strict-mcp-config; tools: "
                        + ", ".join(a["extra_allowed_tools"]) + ")" if unres else ", --restricted")
+                    + (", LOADS claude.ai connectors + your global CLAUDE.md" if unres and a["load_claude_connectors"] else "")
                     + (f", extra MCP {a['extra_mcp_config']}" if a["extra_mcp_config"] else "")
                     + (f", reads also {a['read_also']}" if a["read_also"] else "")))
     return out
