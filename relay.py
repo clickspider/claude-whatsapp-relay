@@ -412,6 +412,19 @@ def last_own(chat):
     return row[0] if row else None
 
 
+def quotes_us(chat, msg_id):
+    """True when this message is a reply (quote) to a message WE sent in this chat."""
+    c = db("messages.db")
+    try:
+        row = c.execute("SELECT 1 FROM messages m JOIN messages q ON q.id = m.quoted_message_id "
+                        "AND q.chat_jid = m.chat_jid WHERE m.id = ? AND m.chat_jid = ? AND q.is_from_me",
+                        (msg_id, chat)).fetchone()
+    except sqlite3.OperationalError:  # older bridge without quoted_message_id
+        row = None
+    c.close()
+    return bool(row)
+
+
 FIX_RE = re.compile(r"^\s*@@(EDIT_LAST|DELETE_LAST)\s*:?\s*(.*)$", re.S)
 
 
@@ -815,7 +828,7 @@ def listen(chat, a, msg_id, sender, content, media_type):
         if cap and len(b["items"]) > cap:  # keep only the newest messages
             del b["items"][:-cap]
         b["last"] = time.time()
-    if any(t.lower() in text.lower() for t in a["self_tags"]):
+    if any(t.lower() in text.lower() for t in a["self_tags"]) or quotes_us(chat, msg_id):
         jsender = sender if "@" in (sender or "") else f"{sender}@s.whatsapp.net"
         flush(a["name"], chat, a, True, msg_id, jsender)
 

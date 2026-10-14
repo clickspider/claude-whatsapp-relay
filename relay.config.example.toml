@@ -157,7 +157,7 @@ extra_disallowed_tools = []
 # live = false                           # false = only dry runs (/asalex <text>) from your chat
 # trust = "draft"                        # draft = every reply waits for your "/alex ok" (LOW)
 #                                        # reply = it answers by itself (MED)
-# trigger = "all"                        # all | mention:<word> | listen (groups: reads all, speaks when tagged)
+# trigger = "all"                        # all | mention:<word> | listen (groups: reads all, speaks when tagged or when someone replies to it)
 # self_tags = ["claude"]                 # listen groups: words that address it (default: [groups])
 # members = { "31600000002" = "Sam" }    # group sender number -> name shown to the agent
 # home = "agents/alex/home"              # its only writable folder (default: agents/<name>/home)

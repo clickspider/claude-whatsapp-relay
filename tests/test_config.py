@@ -178,5 +178,25 @@ extra_disallowed_tools = ["mcp__mail__send"]
             self.assertTrue(new and sid != "old" and "open topic X" in prompt and prompt.endswith("hello"))
 
 
+class QuoteTrigger(unittest.TestCase):
+    def test_reply_to_own_message_triggers(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            c = sqlite3.connect(os.path.join(tmp, "messages.db"))
+            c.execute("CREATE TABLE messages (id TEXT, chat_jid TEXT, is_from_me BOOLEAN, quoted_message_id TEXT)")
+            c.executemany("INSERT INTO messages VALUES (?,?,?,?)", [
+                ("bot1", "g", 1, None), ("them1", "g", 0, None),
+                ("r1", "g", 0, "bot1"), ("r2", "g", 0, "them1"), ("r3", "g", 0, None)])
+            c.commit(); c.close()
+            old = relay.CFG
+            relay.CFG = {"bridge": {"store": tmp}}
+            try:
+                self.assertTrue(relay.quotes_us("g", "r1"))
+                self.assertFalse(relay.quotes_us("g", "r2"))
+                self.assertFalse(relay.quotes_us("g", "r3"))
+            finally:
+                relay.CFG = old
+
+
 if __name__ == "__main__":
     unittest.main()
