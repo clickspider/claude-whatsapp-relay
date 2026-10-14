@@ -67,6 +67,20 @@ unrestricted = true
             self.assertEqual(args[args.index("--tools") + 1], "Read,Write,Edit,Glob,Grep")
             self.assertNotIn("Bash", " ".join(args))
 
+    def test_agent_web_tools_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = relay.load_config(write_cfg(tmp, """
+[[agent]]
+name = "alex"
+jid = "15550100002@s.whatsapp.net"
+tools = ["Read", "WebSearch"]
+"""))
+            err, _ = relay.validate(cfg)
+            self.assertFalse(any("tools" in e for e in err))
+            args = relay.agent_args(cfg, relay.agents(cfg)[0], "s", True)
+            self.assertIn("--restricted", args)
+            self.assertEqual(args[args.index("--allowedTools") + 1], "WebSearch")
+
     def test_agent_rejects_non_file_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = relay.load_config(write_cfg(tmp, """
