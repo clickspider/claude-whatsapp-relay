@@ -100,7 +100,9 @@ days_off = []
 early_close = {}
 
 [groups]
-# Words that mean "the agent is addressed" in a listening group (for example "claude" or "@<its number>").
+# Words that mean "the agent is addressed" in a listening group.
+# A tap-to-mention (@Name) arrives as "@<number>" OR "@<LID>", so add both, or @mentions are ignored.
+# Example: ["claude", "@31600000001", "@123456789012345"]
 self_tags = ["claude"]
 
 [prompts]
