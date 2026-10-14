@@ -730,6 +730,12 @@ def media_text(a, src_chat, msg_id, text, media_type):
             os.makedirs(media, exist_ok=True)
             dest = os.path.join(media, agent_now(a).strftime("%Y%m%d-%H%M%S-") + os.path.basename(path))
             shutil.copy(path, dest)
+            # Scanned PDFs have no text layer: render page 1 to PNG (macOS sips) so the agent can read it.
+            with open(dest, "rb") as f:
+                is_pdf = f.read(5) == b"%PDF-"
+            if is_pdf and subprocess.run(["sips", "-s", "format", "png", dest, "--out", dest + ".png"],
+                                         capture_output=True).returncode == 0:
+                dest += ".png"
             text = f"(sent a {media_type}: {dest}) {text}"
         else:
             text = f"(sent a {media_type} that could not be downloaded) {text}"
