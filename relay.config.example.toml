@@ -48,7 +48,8 @@ inherit_global_setup = false
 api = "http://127.0.0.1:8080/api"
 # The bridge's store/ folder: messages.db (read-only here) and .bridge-token.
 # You can also set the token in the WHATSAPP_BRIDGE_TOKEN environment variable.
-store = "~/whatsapp-mcp/whatsapp-bridge/store"
+# install.sh puts the bridge here. Run your own bridge? Point this to its store/ folder.
+store = "~/.claude-whatsapp-relay/whatsapp-mcp/whatsapp-bridge/store"
 # Where voice replies are written before sending (the bridge's media folder).
 outbox = "~/.local/share/whatsapp-mcp/outbox"
 
@@ -134,11 +135,25 @@ protect_sensitive_paths = true
 allow_unrestricted_agents = false
 
 [launchd]
-# Used by scripts/install-launchd.sh (macOS). python must be 3.11 or newer.
+# Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.
 label = "com.example.claude-whatsapp-relay"
 python = "python3"
 # Log folder, created with mode 0700 (logs can hold message text).
 log_dir = "~/Library/Logs/claude-whatsapp-relay"
+
+[install]
+# Used only by install.sh. Change a value here, then run ./install.sh again.
+# true = install.sh clones, builds, pairs and runs the whatsapp-mcp bridge for you (launchd, macOS).
+# false = you run the bridge yourself: set bridge.store to its store/ folder.
+manage_bridge = true
+# Where the bridge code goes. Its whatsapp-bridge/store/ holds your WhatsApp session: keep it private.
+# Keep bridge.store = <this folder>/whatsapp-bridge/store.
+whatsapp_mcp_dir = "~/.claude-whatsapp-relay/whatsapp-mcp"
+whatsapp_mcp_repo = "https://github.com/verygoodplugins/whatsapp-mcp.git"
+# The bridge version to build (a git tag or commit). A fixed tag means you run code that was reviewed.
+whatsapp_mcp_ref = "v0.7.0"
+# launchd job that keeps the bridge running. Its log is <launchd.log_dir>/bridge.log.
+bridge_label = "com.claude-whatsapp-relay.bridge"
 
 # ---------- Agents: OFF by default. Each one is a locked Claude for one contact or group. ----------
 # Every agent ALWAYS runs with --restricted, --strict-mcp-config, file tools only, and can only
