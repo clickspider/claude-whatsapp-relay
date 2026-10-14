@@ -18,7 +18,7 @@ Then ask: "Do you want to continue?" Stop if the answer is no.
 
 ## 1. Check the parts (no questions)
 1. Check: `python3 --version` (3.11 or newer), `claude --version`, `ffmpeg -version`, `whisper-cli --help`. List what is missing with the install command (`brew install ffmpeg whisper-cpp`), and ask before you install.
-2. Check that the whatsapp-mcp bridge is installed and paired. If not, point the user to https://github.com/verygoodplugins/whatsapp-mcp and stop here until it runs.
+2. Check that the whatsapp-mcp bridge is installed and paired. If not, offer `./install.sh` on macOS (it asks before each step, clones and builds the bridge, and shows the QR code; the user scans it, so the user runs it in their own terminal). Otherwise point the user to https://github.com/verygoodplugins/whatsapp-mcp and stop here until it runs.
 3. Copy the example: `cp relay.config.example.toml relay.config.toml && chmod 600 relay.config.toml`.
 
 ## 2. Interview (one question at a time)
@@ -31,7 +31,7 @@ Then ask: "Do you want to continue?" Stop if the answer is no.
 6. "Should Claude use any MCP servers from WhatsApp, for example a calendar?" Default: none (LOW). If yes, write a small JSON file in the `claude --mcp-config` format with only those servers, and set `owner.mcp_config` (MED). Suggest putting send-type tools in `owner.denied_tools`.
 7. "Do you want voice notes answered with a voice note?" → `owner.voice_replies` (LOW, macOS only).
 8. "How many messages per minute and per day is normal for you?" Explain: a cap also caps the Claude bill. → `[limits]`. Keep the defaults if unsure.
-9. "Where is the bridge's store folder?" Find it (usually `<whatsapp-mcp>/whatsapp-bridge/store`) and confirm. → `bridge.store`.
+9. "Where is the bridge's store folder?" Find it (usually `<whatsapp-mcp>/whatsapp-bridge/store`; `install.sh` uses `~/.claude-whatsapp-relay/whatsapp-mcp/whatsapp-bridge/store`) and confirm. → `bridge.store`. If the user runs their own bridge, set `install.manage_bridge = false`.
 10. "Do you want Claude to answer anyone else (a contact or a group)?" Recommend NO for the first week. Agents are off by default.
     If yes, for each agent: explain it is a locked Claude (no shell, no web, only its own folder), copy `agents/example/` to `agents/<name>/`, fill in `RULES.md` with the user, add an `[[agent]]` block, and start with `live = false` and `trust = "draft"` (every reply waits for `/<name> ok`). Explain each HIGH option (`extra_mcp_config`, `unrestricted`) only if the user asks for more power, and recommend against it.
 11. Leave `[danger]` and `hooks.after_log` at their defaults. Mention them in one line each, only if the user asks.

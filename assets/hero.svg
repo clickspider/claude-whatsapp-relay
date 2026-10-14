@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900">
+  <defs>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.65">
+      <stop offset="0" stop-color="#4dc4bf" stop-opacity="0.2"/>
+      <stop offset="0.55" stop-color="#0f4d85" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#0c0f12" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#4dc4bf"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="#0c0f12"/>
+  <rect width="1600" height="900" fill="url(#glow)"/>
+
+  <!-- phone, left -->
+  <g filter="url(#shadow)">
+    <rect x="110" y="110" width="400" height="700" rx="54" fill="#12161a" stroke="#343c45" stroke-width="3"/>
+  </g>
+  <rect x="250" y="134" width="120" height="26" rx="13" fill="#0c0f12"/>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
+    <circle cx="170" cy="210" r="22" fill="#113330"/>
+    <text x="170" y="218" fill="#4dc4bf" font-size="22" font-weight="700" text-anchor="middle">C</text>
+    <text x="206" y="206" fill="#e6e9ec" font-size="22" font-weight="600">My Claude</text>
+    <text x="206" y="232" fill="#8e97a1" font-size="17">typing…</text>
+    <line x1="134" y1="258" x2="486" y2="258" stroke="#232930" stroke-width="2"/>
+
+    <!-- voice note, from you -->
+    <rect x="236" y="290" width="246" height="70" rx="18" fill="#1f4f4c"/>
+    <circle cx="270" cy="325" r="16" fill="#4dc4bf"/>
+    <path d="M265 316v18l14-9z" fill="#062321"/>
+    <g stroke="#cfe9e7" stroke-width="4" stroke-linecap="round">
+      <path d="M302 325v0M314 315v20M326 309v32M338 318v14M350 312v26M362 320v10M374 306v38M386 316v18M398 321v8M410 313v24M422 319v12"/>
+    </g>
+    <text x="440" y="331" fill="#cfe9e7" font-size="16">0:09</text>
+    <text x="474" y="380" fill="#8e97a1" font-size="15" text-anchor="end">09:41  ✓✓</text>
+
+    <!-- text, from you -->
+    <rect x="236" y="398" width="246" height="66" rx="18" fill="#1f4f4c"/>
+    <text x="256" y="438" fill="#e6e9ec" font-size="20">📄 new-quote.pdf</text>
+    <text x="474" y="452" fill="#cfe9e7" font-size="14" text-anchor="end">👀 ✅</text>
+
+    <!-- answer -->
+    <rect x="138" y="490" width="320" height="196" rx="18" fill="#1a2026"/>
+    <text x="158" y="528" fill="#e6e9ec" font-size="20">Yes, €11 a month cheaper.</text>
+    <text x="158" y="556" fill="#e6e9ec" font-size="20">Your current one renews</text>
+    <text x="158" y="584" fill="#e6e9ec" font-size="20">on Friday. I noted it in</text>
+    <text x="158" y="616" fill="#4dc4bf" font-size="18" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">04-Home/car/NOW.md</text>
+    <text x="158" y="664" fill="#8e97a1" font-size="16">Want a reminder Thursday?</text>
+
+    <rect x="138" y="720" width="344" height="52" rx="26" fill="#1a2026" stroke="#232930" stroke-width="2"/>
+    <text x="164" y="753" fill="#5c6670" font-size="18">Message</text>
+  </g>
+
+  <!-- arrows -->
+  <path d="M540 410C620 410 640 380 720 380" fill="none" stroke="#4dc4bf" stroke-width="3" stroke-dasharray="2 10" stroke-linecap="round" marker-end="url(#arr)"/>
+  <path d="M720 560C640 560 620 590 540 590" fill="none" stroke="#4dc4bf" stroke-width="3" stroke-dasharray="2 10" stroke-linecap="round" marker-end="url(#arr)"/>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="18" fill="#8e97a1" text-anchor="middle">
+    <text x="630" y="360">text, voice, files</text>
+    <text x="630" y="630">answer or voice</text>
+  </g>
+
+  <!-- laptop, right -->
+  <g filter="url(#shadow)">
+    <rect x="750" y="150" width="740" height="520" rx="22" fill="#161b20" stroke="#343c45" stroke-width="3"/>
+    <path d="M690 690h860l-40 44H730z" fill="#1a2026" stroke="#343c45" stroke-width="2"/>
+  </g>
+  <rect x="772" y="172" width="696" height="476" rx="10" fill="#0e1215"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <circle cx="800" cy="200" r="7" fill="#ff5f57"/><circle cx="822" cy="200" r="7" fill="#febc2e"/><circle cx="844" cy="200" r="7" fill="#28c840"/>
+    <text x="1120" y="206" fill="#8e97a1" font-size="17" text-anchor="middle">claude  ~/dossier</text>
+    <line x1="772" y1="226" x2="1468" y2="226" stroke="#232930" stroke-width="2"/>
+    <text x="800" y="270" fill="#8e97a1" font-size="19">relay  voice note → whisper.cpp (local)</text>
+    <text x="800" y="306" fill="#e6e9ec" font-size="19">"is this cheaper than my car insurance?"</text>
+    <text x="800" y="352" fill="#4dc4bf" font-size="19">● Read  new-quote.pdf</text>
+    <text x="800" y="386" fill="#4dc4bf" font-size="19">● Read  04-Home/car/README.md</text>
+    <text x="800" y="420" fill="#4dc4bf" font-size="19">● Edit  04-Home/car/NOW.md</text>
+    <text x="800" y="466" fill="#e6e9ec" font-size="19">Yes, €11 a month cheaper…</text>
+    <text x="800" y="512" fill="#8e97a1" font-size="19">relay  answer sent ✅</text>
+  </g>
+
+  <!-- folder inside the screen -->
+  <g transform="translate(1180 470)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <path d="M0 14a10 10 0 0 1 10-10h80l18 18h152a10 10 0 0 1 10 10v108a10 10 0 0 1-10 10H10A10 10 0 0 1 0 140z" fill="#113330" stroke="#4dc4bf" stroke-width="2.5"/>
+    <text x="24" y="72" fill="#4dc4bf" font-size="20" font-weight="600">your folder</text>
+    <text x="24" y="108" fill="#cfe9e7" font-size="16">stays on this</text>
+    <text x="24" y="130" fill="#cfe9e7" font-size="16">computer</text>
+  </g>
+
+  <text x="800" y="862" fill="#8e97a1" font-size="24" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">Your chat in, Claude Code in your own folder, the answer back. No server in between.</text>
+</svg>

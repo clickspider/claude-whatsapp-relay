@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 640" width="1200" height="640" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#4dc4bf"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="640" rx="24" fill="#0c0f12"/>
+  <text x="45" y="70" fill="#8e97a1" font-size="24">How a message travels</text>
+
+  <!-- your computer -->
+  <rect x="315" y="105" width="860" height="400" rx="20" fill="none" stroke="#343c45" stroke-width="2" stroke-dasharray="8 8"/>
+  <text x="340" y="140" fill="#8e97a1" font-size="19">YOUR COMPUTER</text>
+
+  <g>
+    <rect x="45" y="165" width="240" height="280" rx="16" fill="#12161a" stroke="#343c45" stroke-width="2"/>
+    <circle cx="87" cy="209" r="22" fill="#113330"/><text x="87" y="218" fill="#4dc4bf" font-size="22" font-weight="700" text-anchor="middle">1</text>
+    <text x="123" y="217" fill="#e6e9ec" font-size="26" font-weight="600">Your phone</text>
+    <text x="69" y="276" fill="#aab2bb" font-size="20">You send text, a</text>
+    <text x="69" y="306" fill="#aab2bb" font-size="20">voice note, a photo</text>
+    <text x="69" y="336" fill="#aab2bb" font-size="20">or a file to the</text>
+    <text x="69" y="366" fill="#aab2bb" font-size="20">bridge number.</text>
+  </g>
+  <g>
+    <rect x="335" y="165" width="240" height="280" rx="16" fill="#12161a" stroke="#343c45" stroke-width="2"/>
+    <circle cx="377" cy="209" r="22" fill="#113330"/><text x="377" y="218" fill="#4dc4bf" font-size="22" font-weight="700" text-anchor="middle">2</text>
+    <text x="413" y="217" fill="#e6e9ec" font-size="26" font-weight="600">Bridge</text>
+    <text x="359" y="276" fill="#aab2bb" font-size="20">whatsapp-mcp on</text>
+    <text x="359" y="306" fill="#aab2bb" font-size="20">127.0.0.1 saves</text>
+    <text x="359" y="336" fill="#aab2bb" font-size="20">the message in a</text>
+    <text x="359" y="366" fill="#aab2bb" font-size="20">local SQLite file.</text>
+  </g>
+  <g>
+    <rect x="625" y="165" width="240" height="280" rx="16" fill="#12161a" stroke="#343c45" stroke-width="2"/>
+    <circle cx="667" cy="209" r="22" fill="#113330"/><text x="667" y="218" fill="#4dc4bf" font-size="22" font-weight="700" text-anchor="middle">3</text>
+    <text x="703" y="217" fill="#e6e9ec" font-size="26" font-weight="600">Relay</text>
+    <text x="649" y="276" fill="#aab2bb" font-size="20">Reads it (read-only)</text>
+    <text x="649" y="306" fill="#aab2bb" font-size="20">every 2 seconds.</text>
+    <text x="649" y="336" fill="#aab2bb" font-size="20">Voice: whisper.cpp,</text>
+    <text x="649" y="366" fill="#aab2bb" font-size="20">on this computer.</text>
+  </g>
+  <g>
+    <rect x="915" y="165" width="240" height="280" rx="16" fill="#113330" stroke="#4dc4bf" stroke-width="2.5"/>
+    <circle cx="957" cy="209" r="22" fill="#4dc4bf"/><text x="957" y="218" fill="#062321" font-size="22" font-weight="700" text-anchor="middle">4</text>
+    <text x="991" y="216" fill="#e6e9ec" font-size="24" font-weight="600">Claude Code</text>
+    <text x="939" y="276" fill="#cfe9e7" font-size="20">Runs in your folder,</text>
+    <text x="939" y="306" fill="#cfe9e7" font-size="20">with only the tools</text>
+    <text x="939" y="336" fill="#cfe9e7" font-size="20">you allowed in</text>
+    <text x="939" y="366" fill="#4dc4bf" font-size="18" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">relay.config.toml</text>
+  </g>
+
+  <g stroke="#4dc4bf" stroke-width="3" fill="none" marker-end="url(#arr)">
+    <path d="M289 305H329"/><path d="M579 305H619"/><path d="M869 305H909"/>
+  </g>
+  <path d="M1035 449V560H165V453" fill="none" stroke="#4dc4bf" stroke-width="3" stroke-dasharray="2 10" stroke-linecap="round" marker-end="url(#arr)"/>
+  <rect x="380" y="540" width="440" height="40" rx="20" fill="#0c0f12"/>
+  <text x="600" y="567" fill="#e6e9ec" font-size="20" text-anchor="middle">The answer comes back: text or a voice note</text>
+  <text x="600" y="615" fill="#8e97a1" font-size="18" text-anchor="middle">Only your own chat reaches Claude. Every other chat is ignored, unless you add an agent for it.</text>
+</svg>
