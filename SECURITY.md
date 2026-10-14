@@ -17,6 +17,7 @@ Every agent ALWAYS runs with `claude --restricted --strict-mcp-config --tools <f
 ## Opt-ins that raise the risk (all off by default; `relay.py check` marks them HIGH)
 - `owner.tools` with `Bash` or `WebFetch`: text in your chat (or a forwarded message, image or file) can run commands.
 - `owner.inherit_global_setup = true`: your owner run gets every tool and MCP server from your global Claude setup.
+- `agent.tools` with `WebSearch` / `WebFetch` (MED): the agent can search and read web pages. It stays `--restricted` and locked to its folders, but a web page can carry injected text, and anyone in that chat can make it fetch a URL, so do not give a web agent folders with secrets.
 - `agent.extra_mcp_config` + `extra_allowed_tools`: an agent gets MCP tools (for example email). It stays `--restricted`, but anyone in that chat can ask it to use them.
 - `agent.unrestricted = true` + `danger.allow_unrestricted_agents = true`: the agent loses the sandbox. Anyone in that chat can ask it to read your files. Avoid.
 - `danger.self_edit = true`: your Claude may edit `relay.py`, and the relay restarts on change. Injected text could plant code that runs later.

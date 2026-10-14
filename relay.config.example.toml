@@ -186,7 +186,7 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
 # timezone = ""                          # "" = quiet_hours.timezone
-# tools = ["Read", "Write", "Edit", "Glob", "Grep"]   # file tools only, nothing else is accepted
+# tools = ["Read", "Write", "Edit", "Glob", "Grep"]   # file tools; add "WebSearch", "WebFetch" for web research (MED)
 # extra_mcp_config = ""                  # HIGH: give it MCP servers (e.g. email). It stays --restricted.
 # extra_allowed_tools = []               # HIGH: the MCP tools it may use without asking
 # extra_disallowed_tools = []
