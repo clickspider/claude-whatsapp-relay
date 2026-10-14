@@ -187,6 +187,7 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
 # timezone = ""                          # "" = quiet_hours.timezone
 # tools = ["Read", "Write", "Edit", "Glob", "Grep"]   # file tools; add "WebSearch", "WebFetch" for web research (MED)
+# plugin_dirs = []                      # Claude plugin folders with skills; add "Skill" to tools to use them
 # extra_mcp_config = ""                  # HIGH: give it MCP servers (e.g. email). It stays --restricted.
 # extra_allowed_tools = []               # HIGH: the MCP tools it may use without asking
 # extra_disallowed_tools = []

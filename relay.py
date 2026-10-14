@@ -25,6 +25,7 @@ except ImportError:  # Python < 3.11
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILE_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
 WEB_TOOLS = ["WebSearch", "WebFetch"]  # opt-in per agent, MED: web pages can carry injected text
+OPT_TOOLS = WEB_TOOLS + ["Skill"]  # Skill: only skills from the agent's plugin_dirs (+ built-ins)
 PERMISSION_MODES = {"default", "acceptEdits", "plan", "auto", "dontAsk"}
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 JID_RE = re.compile(r"^\d{5,25}@(s\.whatsapp\.net|g\.us|lid)$")
@@ -63,7 +64,7 @@ AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigg
                   "self_tags": None, "members": {}, "dir": "", "home": "", "read_also": [],
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
-                  "unrestricted": False, "load_claude_connectors": False, "max_context_tokens": 200_000, "inbox": False,
+                  "unrestricted": False, "load_claude_connectors": False, "plugin_dirs": [], "max_context_tokens": 200_000, "inbox": False,
                   "group_label": ""}
 
 
@@ -117,6 +118,7 @@ def normalize_agent(cfg, a, base):
     a["home"] = _path(a["home"], base) or os.path.join(a["dir"], "home")
     a["read_also"] = [_path(d, base) for d in a["read_also"]]
     a["read_only"] = [_path(d, base) for d in a["read_only"]]
+    a["plugin_dirs"] = [_path(d, base) for d in a["plugin_dirs"]]
     a["extra_mcp_config"] = _path(a["extra_mcp_config"], base)
     a["timezone"] = a["timezone"] or cfg["quiet_hours"]["timezone"]
     if a["self_tags"] is None:
@@ -184,9 +186,9 @@ def validate(cfg):
             err.append(f"agent {n}: trust must be 'draft' or 'reply'.")
         if not (a["trigger"] in ("all", "listen") or a["trigger"].startswith("mention:")):
             err.append(f"agent {n}: trigger must be 'all', 'listen' or 'mention:<word>'.")
-        bad = [t for t in a["tools"] if t not in FILE_TOOLS + WEB_TOOLS]
+        bad = [t for t in a["tools"] if t not in FILE_TOOLS + OPT_TOOLS]
         if bad:
-            err.append(f"agent {n}: tools {bad} are not allowed. Agents get file tools only (plus WebSearch, WebFetch).")
+            err.append(f"agent {n}: tools {bad} are not allowed. Agents get file tools only (plus WebSearch, WebFetch, Skill).")
         if not os.path.isfile(os.path.join(a["dir"], "RULES.md")):
             err.append(f"agent {n}: {a['dir']}/RULES.md is missing.")
         if o["folder"] and os.path.realpath(o["folder"]).startswith(os.path.realpath(a["home"]) + os.sep) \
@@ -261,8 +263,8 @@ def agent_args(cfg, a, sid, new):
     unless the owner opted into 'unrestricted' (two danger switches)."""
     rules = os.path.join(a["dir"], "RULES.md")
     settings = {}
-    claude, tools = cfg["paths"]["claude"], ",".join(t for t in a["tools"] if t in FILE_TOOLS + WEB_TOOLS)
-    web = [t for t in a["tools"] if t in WEB_TOOLS]
+    claude, tools = cfg["paths"]["claude"], ",".join(t for t in a["tools"] if t in FILE_TOOLS + OPT_TOOLS)
+    web = [t for t in a["tools"] if t in OPT_TOOLS]
     if a["unrestricted"] and cfg["danger"]["allow_unrestricted_agents"]:
         # claude.ai connectors (Gmail etc.) only load with your user settings. Opt-in: hooks and
         # auto memory stay off and tools not listed are denied, but your global CLAUDE.md loads.
@@ -289,6 +291,8 @@ def agent_args(cfg, a, sid, new):
         deny = [f"Edit(/{rules})", f"Write(/{rules})"]  # the contact must not rewrite the rules
     for extra in a["read_also"]:
         args += ["--add-dir", extra]
+    for d in a["plugin_dirs"]:
+        args += ["--plugin-dir", d]
     deny += [f"{t}(/{p})" for p in a["read_only"] for t in ("Edit", "Write")]
     if deny:
         settings["permissions"] = {"deny": deny}
@@ -1223,7 +1227,7 @@ def risk_lines(cfg):
         out.append(("LOW", "agents", "none: only the owner chat talks to Claude"))
     for a in all_agents:
         unres = a["unrestricted"]
-        web = [t for t in a["tools"] if t in WEB_TOOLS]
+        web = [t for t in a["tools"] if t in OPT_TOOLS]
         lvl = "HIGH" if unres or a["extra_mcp_config"] else ("MED" if a["trust"] == "reply" or web else "LOW")
         kind = "group" if a["jid"].endswith("@g.us") else "contact"
         out.append((lvl, f"agent {a['name']}",
@@ -1234,7 +1238,8 @@ def risk_lines(cfg):
                        + ", ".join(a["extra_allowed_tools"]) + ")" if unres else ", --restricted")
                     + (", LOADS claude.ai connectors + your global CLAUDE.md" if unres and a["load_claude_connectors"] else "")
                     + (f", extra MCP {a['extra_mcp_config']}" if a["extra_mcp_config"] else "")
-                    + (f", web: {', '.join(web)}" if web else "")
+                    + (f", extra tools: {', '.join(web)}" if web else "")
+                    + (f", plugins: {', '.join(a['plugin_dirs'])}" if a["plugin_dirs"] else "")
                     + (f", reads also {a['read_also']}" if a["read_also"] else "")))
     return out
 

@@ -81,6 +81,21 @@ tools = ["Read", "WebSearch"]
             self.assertIn("--restricted", args)
             self.assertEqual(args[args.index("--allowedTools") + 1], "WebSearch")
 
+    def test_agent_skill_plugin_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = relay.load_config(write_cfg(tmp, """
+[[agent]]
+name = "alex"
+jid = "15550100002@s.whatsapp.net"
+tools = ["Read", "Skill"]
+plugin_dirs = ["/tmp/plug"]
+"""))
+            err, _ = relay.validate(cfg)
+            self.assertFalse(any("tools" in e for e in err))
+            args = relay.agent_args(cfg, relay.agents(cfg)[0], "s", True)
+            self.assertIn("--restricted", args)
+            self.assertEqual(args[args.index("--plugin-dir") + 1], "/tmp/plug")
+
     def test_agent_rejects_non_file_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = relay.load_config(write_cfg(tmp, """
