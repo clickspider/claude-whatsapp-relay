@@ -164,5 +164,6 @@ log_dir = "~/Library/Logs/claude-whatsapp-relay"
 # extra_allowed_tools = []               # HIGH: the MCP tools it may use without asking
 # extra_disallowed_tools = []
 # unrestricted = false                   # HIGH: drops the sandbox. Needs danger.allow_unrestricted_agents.
+# max_context_tokens = 200000            # auto /new with a hand-off when its chat gets this big (0 = never)
 # load_claude_connectors = false         # HIGH, needs unrestricted: your claude.ai connectors (Gmail...)
 #                                        # load, and so does your global CLAUDE.md. Hooks + memory stay off.

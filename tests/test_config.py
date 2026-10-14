@@ -204,5 +204,34 @@ class QuoteTrigger(unittest.TestCase):
                 relay.CFG = old
 
 
+class AgentAutoNew(unittest.TestCase):
+    def test_big_agent_session_rotates_with_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = relay.load_config(write_cfg(tmp, f"""
+[[agent]]
+name = "alex"
+jid = "15550100003@s.whatsapp.net"
+max_context_tokens = 100
+"""))
+            a = relay.agents(cfg)[0]
+            calls = []
+            class R:  # fake CompletedProcess
+                def __init__(self, out): self.stdout, self.returncode, self.stderr = out, 0, ""
+            old = (relay.CFG, relay.run_claude, relay.context_tokens)
+            relay.CFG = cfg
+            relay.run_claude = lambda args, cwd, prompt: calls.append((args, prompt)) or R(
+                "open topic X" if prompt == relay.HANDOFF_PROMPT else "answer")
+            relay.context_tokens = lambda sid, cwd=None: 500
+            try:
+                relay.flag(a, "session-id", "old")
+                self.assertEqual(relay.run_agent(a, "hi"), "answer")
+            finally:
+                relay.CFG, relay.run_claude, relay.context_tokens = old
+            (h_args, h_prompt), (n_args, n_prompt) = calls
+            self.assertEqual(h_args[-2:], ["--resume", "old"])
+            self.assertEqual(n_args[-2], "--session-id")
+            self.assertTrue("open topic X" in n_prompt and n_prompt.endswith("hi"))
+
+
 if __name__ == "__main__":
     unittest.main()

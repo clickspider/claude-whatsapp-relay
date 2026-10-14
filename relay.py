@@ -60,7 +60,7 @@ AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigg
                   "self_tags": None, "members": {}, "dir": "", "home": "", "read_also": [],
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
-                  "unrestricted": False, "load_claude_connectors": False, "inbox": False,
+                  "unrestricted": False, "load_claude_connectors": False, "max_context_tokens": 200_000, "inbox": False,
                   "group_label": ""}
 
 
@@ -501,9 +501,9 @@ def claude_owner(prompt, sid, new):
     return r.stdout.strip() or r.stderr.strip()[-1500:] or "(no answer)"
 
 
-def context_tokens(sid):
+def context_tokens(sid, cwd=None):
     """Input tokens of the session's last turn, from its transcript (file size as a fallback)."""
-    mangled = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(CFG["owner"]["folder"]))
+    mangled = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd or CFG["owner"]["folder"]))
     path = os.path.expanduser(f"~/.claude/projects/{mangled}/{sid}.jsonl")
     if not os.path.exists(path):
         return 0
@@ -631,6 +631,15 @@ def flag(a, key, value=None):
 
 def run_agent(a, prompt):
     sid = flag(a, "session-id") or ""
+    limit = a["max_context_tokens"]
+    if sid and limit and context_tokens(sid, a["dir"]) > limit:  # auto /new with a hand-off
+        note = run_claude(agent_args(CFG, a, sid, False), a["dir"], HANDOFF_PROMPT).stdout.strip()
+        write(os.path.join(a["dir"], f"handoff-{agent_now(a):%Y%m%d-%H%M}.md"), note)
+        print(f"{owner_now():%H:%M} new {a['name']} session (context limit): old session {sid}", flush=True)
+        flag(a, "session-id", "")
+        sid = ""
+        if note:
+            prompt = f"Context from the previous session:\n{note}\n\nNow: {prompt}"
     new = not sid
     if new:
         sid = str(uuid.uuid4())
