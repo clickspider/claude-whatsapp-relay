@@ -18,6 +18,8 @@ timezone = "Europe/Amsterdam"
 new_session_hour = 4
 # Automatic /new (with the same hand-off) when the context passes this many tokens. 0 = never.
 max_context_tokens = 500000
+# Messages you send within this many seconds (or while Claude is still busy) get ONE answer.
+batch_seconds = 3
 # Where files you send (photos, PDFs, documents) are copied, so they land in your folder.
 # Relative to `folder`, e.g. "_inbox/whatsapp". "" = leave them in the bridge's media folder. LOW.
 media_dir = ""
@@ -133,6 +135,16 @@ self_edit = false
 protect_sensitive_paths = true
 # HIGH. Needed for any agent with unrestricted = true (no --restricted sandbox). Keep false.
 allow_unrestricted_agents = false
+
+[publish]
+# Opt-in, for people who change the relay code itself: every few hours, if the code folder
+# has committed changes that are not on GitHub yet AND the tests pass, your chat gets one
+# message asking you to publish. Reply /publish to push (never a force push). Off by default.
+remind = false
+remote = "origin"
+branch = "main"
+ssh_key = ""          # e.g. "~/.ssh/id_ed25519" if launchd cannot reach your ssh-agent
+check_hours = 6
 
 [launchd]
 # Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.

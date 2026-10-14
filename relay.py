@@ -35,7 +35,7 @@ DEFAULTS = {
               "max_context_tokens": 500_000, "system_prompt": "", "media_dir": "", "voice_replies": True,
               "tools": FILE_TOOLS, "permission_mode": "acceptEdits", "mcp_config": "",
               "allowed_tools": [], "denied_tools": [], "extra_dirs": [],
-              "inherit_global_setup": False},
+              "inherit_global_setup": False, "batch_seconds": 3},
     "bridge": {"api": "http://127.0.0.1:8080/api", "store": "",
                "outbox": "~/.local/share/whatsapp-mcp/outbox"},
     "paths": {"claude": "claude", "ffmpeg": "ffmpeg", "whisper_cli": "whisper-cli",
@@ -53,6 +53,8 @@ DEFAULTS = {
     "hooks": {"after_log": [], "after_log_min_seconds": 600},
     "danger": {"self_edit": False, "protect_sensitive_paths": True,
                "allow_unrestricted_agents": False},
+    "publish": {"remind": False, "remote": "origin", "branch": "main", "ssh_key": "",
+                "check_hours": 6},
     "launchd": {"label": "com.example.claude-whatsapp-relay", "python": "python3",
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
@@ -576,28 +578,44 @@ def keep_media(path):
     return dest
 
 
-def owner_turn(msg_id, text, media_type):
-    text = text or ""
-    if text.strip().lower() == "/new":
-        note = rotate_session(read(st("session-id")), "manual /new")
-        if note:
-            write(st("handoff-pending.md"), note)
-        return send_text(OWNER, "New conversation started.")
-    voice = False
+def owner_prep(msg_id, text, media_type):
+    """One owner message -> (prompt text, wants voice). Sends its own error and returns None."""
+    text, voice = text or "", False
     if media_type:
         path = download(OWNER, msg_id)
         if not path:
-            return send_text(OWNER, f"Could not download the {media_type}.")
+            send_text(OWNER, f"Could not download the {media_type}.")
+            return None
         if media_type == "audio":
             voice = True
             text = transcribe(path)
             if not text:
-                return send_text(OWNER, "I could not understand the voice note.")
+                send_text(OWNER, "I could not understand the voice note.")
+                return None
         else:
             path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
-    if text.lower().startswith("voice"):
-        voice = True
+    return text, voice or text.lower().startswith("voice")
+
+
+def owner_turn(msg_id, text, media_type, batch=None):
+    """batch = [(msg_id, text, media_type), ...] sent close together: one prompt, one answer."""
+    if not batch and (text or "").strip().lower() == "/new":
+        note = rotate_session(read(st("session-id")), "manual /new")
+        if note:
+            write(st("handoff-pending.md"), note)
+        return send_text(OWNER, "New conversation started.")
+    if not batch and (text or "").strip().lower() == "/publish":
+        return publish_now()
+    preps = [p for p in (owner_prep(*m) for m in (batch or [(msg_id, text, media_type)])) if p]
+    if not preps:
+        return
+    if len(preps) == 1:
+        text, voice = preps[0]
+    else:
+        text = (f"({len(preps)} messages sent close together. Answer them in one reply.)\n\n"
+                + "\n\n".join(f"[{i}] {t}" for i, (t, _) in enumerate(preps, 1)))
+        voice = any(v for _, v in preps)
     voice = voice and CFG["owner"]["voice_replies"]
     answer = apply_fixes(OWNER, ask_owner_claude(text))
     qm = re.search(r"^\s*@@QUOTE\s*:?.*$", answer, re.M)
@@ -865,6 +883,112 @@ workers, busy = {}, [0]
 START_MTIME = os.path.getmtime(os.path.abspath(__file__))
 
 
+owner_buf, owner_lock, owner_sched = [], threading.Lock(), [False]
+
+
+def owner_add(msg_id, content, media_type):
+    """Owner messages that arrive close together (or while Claude is busy) become ONE turn."""
+    with owner_lock:
+        owner_buf.append((msg_id, content, media_type, time.time()))
+        if owner_sched[0]:
+            return
+        owner_sched[0] = True
+    enqueue("owner", owner_drain)
+
+
+def owner_drain():
+    wait = CFG["owner"]["batch_seconds"]
+    while True:  # wait until nothing new came in for `wait` seconds
+        with owner_lock:
+            last = owner_buf[-1][3] if owner_buf else 0
+        if time.time() - last >= wait:
+            break
+        time.sleep(0.3)
+    with owner_lock:
+        items = [m[:3] for m in owner_buf]
+        owner_buf.clear()
+        owner_sched[0] = False
+    commands = [m for m in items if (m[1] or "").strip().lower() in ("/new", "/publish")]
+    rest = [m for m in items if m not in commands]
+    for m in commands:  # commands run on their own, in order
+        with_feedback(OWNER, m[0], OWNER, lambda m=m: owner_turn(*m))
+    if len(rest) == 1:
+        with_feedback(OWNER, rest[0][0], OWNER, lambda: owner_turn(*rest[0]))
+    elif rest:
+        if CFG["feedback"]["reactions"]:
+            for m in rest[:-1]:
+                react(OWNER, m[0], OWNER, "👀")
+        with_feedback(OWNER, rest[-1][0], OWNER, lambda: owner_turn(None, None, None, batch=rest))
+        if CFG["feedback"]["reactions"]:
+            for m in rest[:-1]:
+                react(OWNER, m[0], OWNER, "✅")
+
+
+# ---------- publish reminder (opt-in): local, tested, not yet public ----------
+
+def git(*args, **kw):
+    p = CFG["publish"]
+    env = dict(os.environ)
+    if p["ssh_key"]:
+        env["GIT_SSH_COMMAND"] = f"ssh -i {os.path.expanduser(p['ssh_key'])} -o IdentitiesOnly=yes"
+    return subprocess.run(["git", "-C", HERE, *args], capture_output=True, text=True, env=env,
+                          timeout=120, **kw)
+
+
+def unpublished():
+    """(commit lines not on the remote branch, uncommitted file count)."""
+    p = CFG["publish"]
+    ahead = git("log", "--format=%h %s", f"{p['remote']}/{p['branch']}..HEAD").stdout.split("\n")
+    dirty = [l for l in git("status", "--porcelain").stdout.split("\n") if l.strip()]
+    return [l for l in ahead if l.strip()], len(dirty)
+
+
+def tests_pass():
+    r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", os.path.join(HERE, "tests")],
+                       cwd=HERE, capture_output=True, text=True, timeout=300)
+    return r.returncode == 0, (r.stderr or r.stdout)[-400:]
+
+
+def publish_check(force=False):
+    p = CFG["publish"]
+    if not p["remind"]:
+        return
+    last = read(st("publish-checked"), "0")
+    if not force and time.time() - float(last or 0) < p["check_hours"] * 3600:
+        return
+    write(st("publish-checked"), str(time.time()))
+    commits, dirty = unpublished()
+    head = git("rev-parse", "HEAD").stdout.strip()
+    if not commits or read(st("publish-asked")) == head:
+        return
+    ok, out = tests_pass()
+    if not ok:
+        return  # only ask about changes whose tests pass
+    write(st("publish-asked"), head)
+    trailer = git("log", "--format=%B", f"{p['remote']}/{p['branch']}..HEAD").stdout
+    warn = "\nNote: a commit mentions Co-Authored-By. Clean it before you publish." if "Co-Authored-By" in trailer else ""
+    more = f"\nAlso {dirty} uncommitted file(s); they stay private until committed." if dirty else ""
+    send_text(OWNER, f"Your relay has {len(commits)} tested change(s) that are not public yet:\n"
+              + "\n".join("- " + c for c in commits[:10]) + more + warn
+              + "\n\nReply /publish to push them to GitHub. Ignore this to keep them private.")
+
+
+def publish_now():
+    p = CFG["publish"]
+    if not p["remind"]:
+        return send_text(OWNER, "Publishing is off (publish.remind = false in the config).")
+    commits, _ = unpublished()
+    if not commits:
+        return send_text(OWNER, "Nothing to publish: GitHub already has every commit.")
+    ok, out = tests_pass()
+    if not ok:
+        return send_text(OWNER, "Tests fail, so I did NOT publish:\n" + out)
+    r = git("push", p["remote"], f"HEAD:{p['branch']}")  # never --force
+    if r.returncode != 0:
+        return send_text(OWNER, "Push failed, nothing changed on GitHub:\n" + r.stderr[-600:])
+    send_text(OWNER, f"Published {len(commits)} change(s) to GitHub.")
+
+
 def enqueue(key, fn):
     if key not in workers:  # one worker per chat, so nobody waits behind another
         q = workers[key] = queue.Queue()
@@ -907,8 +1031,7 @@ def route(msg_id, chat, sender, content, media_type):
                     jid, a, msg_id, arg, media_type if not arg else None, dry=True)))
             return enqueue(name, lambda: with_feedback(OWNER, msg_id, OWNER,
                                                        lambda: owner_command(name, arg)))
-        return enqueue("owner", lambda: with_feedback(OWNER, msg_id, OWNER,
-                                                      lambda: owner_turn(msg_id, content, media_type)))
+        return owner_add(msg_id, content, media_type)
     a = by_jid(chat)
     if not a or not a["live"] or flag(a, "paused"):
         return  # unknown chats are ignored
@@ -1033,6 +1156,7 @@ def main_loop():
                     pass
         tick += 1
         for every, fn in ((5, lambda: [deliver_inbox(a, fixes_only=True) for a in agents(CFG) if a["live"]]),
+                          (300, lambda: threading.Thread(target=publish_check, daemon=True).start()),
                           (5, flush_quiet_groups),
                           (3, restart_if_changed if CFG["danger"]["self_edit"] else None),
                           (30, due_checkins)):
