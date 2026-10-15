@@ -6,6 +6,13 @@
 
 [owner]
 # Your own WhatsApp chat. ONLY this chat can control Claude. Format: <country code + number>@s.whatsapp.net
+# Two owner channels, picked for you from the number you link to the bridge:
+#   second number (recommended): the bridge runs on a second number; you message that number
+#     from this one. Your own chats are never read.
+#   own number: you link THIS number to the bridge. You talk to your assistant in your
+#     "Message yourself" chat; only what you type there counts. The relay's own replies there are
+#     recognised (message ID + recent text, kept in state/sent.json) and never start a run.
+#     People you add get replies from your own number. `relay.py check` shows which mode is on.
 jid = "31600000000@s.whatsapp.net"
 # How Claude calls you in prompts and notes.
 name = "Owner"
@@ -95,6 +102,9 @@ run_timeout_seconds = 600
 # from answering it. Messages sent while the relay was off longer than this are skipped too.
 # 0 = handle every new row, old or not (MED).
 history_grace_seconds = 600
+# Agents may read the last this-many messages of their own chat (old ones too) as context,
+# in <agent home>/history.md, 500 characters each. Old messages never start a run. 0 = off.
+history_messages = 200
 
 [quiet_hours]
 # Agents never START a conversation (check-ins, owner notes) in quiet hours. Replies still go out.

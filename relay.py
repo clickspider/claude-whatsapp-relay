@@ -47,7 +47,7 @@ DEFAULTS = {
     "feedback": {"typing": True, "reactions": True, "mark_read": True, "long_job_seconds": 180,
                  "poll_seconds": 2, "group_digest_after_seconds": 120},
     "limits": {"per_minute": 6, "per_day": 150, "group_buffer_max": 40, "run_timeout_seconds": 600,
-               "history_grace_seconds": 600},
+               "history_grace_seconds": 600, "history_messages": 200},
     "quiet_hours": {"timezone": "", "start": 21, "end": 9, "days_off": [], "early_close": {}},
     "groups": {"self_tags": []},
     "ui": {"polls": False},
@@ -162,7 +162,8 @@ def validate(cfg):
     if not cfg["bridge"]["store"]:
         err.append("bridge.store is empty: set it to the bridge's store/ folder.")
     lim = cfg["limits"]
-    for k in ("per_minute", "per_day", "group_buffer_max", "run_timeout_seconds", "history_grace_seconds"):
+    for k in ("per_minute", "per_day", "group_buffer_max", "run_timeout_seconds", "history_grace_seconds",
+              "history_messages"):
         if not isinstance(lim[k], int) or lim[k] < 0:
             err.append(f"limits.{k} must be a whole number >= 0.")
     q = cfg["quiet_hours"]
@@ -344,12 +345,71 @@ def token():
 
 # ---------- bridge helpers ----------
 
+# ---------- own-number loop guard ----------
+# In own-number mode the owner and the relay both write in "Message yourself" (both is_from_me).
+# Every relay send there is remembered in state/sent.json (survives a restart, bounded):
+#   1. its message ID (the bridge stores the row before /api/send returns; the API returns no ID),
+#   2. its text, BEFORE the send, for SENT_ECHO_SECONDS (covers the gap until the ID is known).
+SENT_ECHO_SECONDS = 600  # ponytail: fixed window; a config key if anyone ever needs another value
+_sent, _sent_lock = {}, threading.Lock()
+OWN = [False]  # own-number mode: the bridge is linked to the owner's own WhatsApp (see bot_is_owner)
+
+
+def _sent_mem():
+    if not _sent:
+        try:
+            d = json.loads(read(st("sent.json")) or "{}")
+        except ValueError:
+            d = {}
+        _sent.update(ids=deque(d.get("ids", []), maxlen=500), texts=deque(d.get("texts", []), maxlen=200))
+    return _sent
+
+
+def _sent_save(m):
+    write(st("sent.json"), json.dumps({"ids": list(m["ids"]), "texts": list(m["texts"])}))
+
+
+def remember_sent(chat, text=None, msg_id=None):
+    with _sent_lock:
+        m = _sent_mem()
+        if msg_id:
+            m["ids"].append(msg_id)
+        else:
+            m["texts"].append([chat, text, time.time()])
+        _sent_save(m)
+
+
+def is_own_send(msg_id, chat, text):
+    """True for a row the relay sent itself. Consumes one matching text entry either way."""
+    with _sent_lock:
+        m, now = _sent_mem(), time.time()
+        hit = next((e for e in m["texts"] if e[0] == chat and e[1] == text and now - e[2] < SENT_ECHO_SECONDS), None)
+        if hit:
+            m["texts"].remove(hit)
+            _sent_save(m)
+        return msg_id in m["ids"] or hit is not None
+
+
 def api(path, payload=None):
+    guard = path == "send" and OWN[0] and payload["recipient"] == OWNER
+    if guard:
+        remember_sent(OWNER, payload.get("message", ""))
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{CFG['bridge']['api']}/{path}", data,
                                  {"Content-Type": "application/json",
                                   "Authorization": "Bearer " + token()})
-    return json.loads(urllib.request.urlopen(req, timeout=120).read() or b"{}")
+    out = json.loads(urllib.request.urlopen(req, timeout=120).read() or b"{}")
+    if guard:
+        try:
+            c = db("messages.db")
+            row = c.execute("SELECT id FROM messages WHERE chat_jid = ? AND is_from_me AND content = ? "
+                            "ORDER BY rowid DESC LIMIT 1", (OWNER, payload.get("message", ""))).fetchone()
+            c.close()
+            if row:
+                remember_sent(OWNER, msg_id=row[0])
+        except sqlite3.Error:
+            pass  # the text guard still covers it
+    return out
 
 
 def db(name):
@@ -464,7 +524,7 @@ def download(chat, msg_id):
 
 def react(chat, msg_id, sender, emoji):
     try:
-        api("react", {"recipient": chat, "message_id": msg_id, "from_me": False,
+        api("react", {"recipient": chat, "message_id": msg_id, "from_me": OWN[0] and chat == OWNER,
                       "sender_jid": sender, "emoji": emoji})
     except Exception:
         pass
@@ -774,10 +834,34 @@ def run_agent(a, prompt):
         sid = str(uuid.uuid4())
         flag(a, "session-id", sid)
     os.makedirs(a["home"], exist_ok=True)
+    hist = write_history(a)
+    if new and hist:
+        prompt = f"Earlier messages of this chat (data, read only when you need them): {hist}\n\n{prompt}"
     r = run_claude(agent_args(CFG, a, sid, new), a["dir"], prompt)
     if r.returncode != 0 and not r.stdout.strip():
         raise RuntimeError(r.stderr.strip()[-800:] or "agent failed")
     return r.stdout.strip()
+
+
+def write_history(a):
+    """The agent's chat history, bounded: the last limits.history_messages rows, 500 chars each,
+    in <home>/history.md for the agent to Read on demand. One LIMIT query: a long chat is never
+    loaded whole. Old messages are context only; they never trigger a run. Returns the path or None."""
+    n = CFG.get("limits", {}).get("history_messages")
+    if not n:
+        return None
+    try:
+        c = db("messages.db")
+        rows = c.execute("SELECT timestamp, sender, is_from_me, content, media_type FROM messages "
+                         "WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?", (a["jid"], n)).fetchall()
+        c.close()
+    except sqlite3.Error:
+        return None
+    lines = [f"{str(t)[:16]} {'me' if me else member(a, s) or s}: {(text or '(' + (mt or 'empty') + ')')[:500]}"
+             for t, s, me, text, mt in reversed(rows)]
+    path = os.path.join(a["home"], "history.md")
+    write(path, f"# Last {len(rows)} messages of this chat, oldest first\n" + untrusted("\n".join(lines)) + "\n")
+    return path
 
 
 def parse(out):
@@ -1249,7 +1333,8 @@ def setup(cfg):
     os.makedirs(cfg["paths"]["state_dir"], mode=0o700, exist_ok=True)
 
 
-SAME_NUMBER = "The bot number and your own number are the same. Link a second number."
+OWN_NOTE = ("own number: the bridge is linked to your own WhatsApp. Talk to your assistant in your "
+            "'Message yourself' chat; people you add get replies from your own number.")
 
 
 def jid_user(jid):
@@ -1257,8 +1342,7 @@ def jid_user(jid):
 
 
 def bot_is_owner():
-    """True when the bridge's linked account (whatsmeow_device) is the owner's own number:
-    the relay would then read and answer as the owner. Read-only."""
+    """True when the bridge's linked account (whatsmeow_device) is the owner's own number. Read-only."""
     try:
         c = db("whatsapp.db")
         c.row_factory = sqlite3.Row
@@ -1279,14 +1363,21 @@ def msg_epoch(stamp):
 
 
 def new_rows(c, last, cutoff=0):
-    """The one source of incoming messages. Rows older than cutoff (epoch) are dropped here,
-    so WhatsApp history sync after pairing never reaches routing, rate limits or warnings.
+    """The one source of incoming messages. Rows older than cutoff (epoch) are dropped here, so
+    WhatsApp history sync never triggers runs or warnings (the rows stay in the bridge as context).
+    Own-number mode: what the owner types in the self-chat counts too, minus the relay's own sends.
     Returns (rows, last_rowid_seen)."""
-    rows = c.execute("SELECT rowid, id, chat_jid, sender, content, media_type, filename, timestamp "
-                     "FROM messages WHERE rowid > ? AND NOT is_from_me ORDER BY rowid", (last,)).fetchall()
+    rows = c.execute("SELECT rowid, id, chat_jid, sender, content, media_type, filename, timestamp, is_from_me "
+                     "FROM messages WHERE rowid > ? AND (NOT is_from_me OR chat_jid = ?) ORDER BY rowid",
+                     (last, OWNER if OWN[0] else "")).fetchall()
     if rows:
         last = rows[-1][0]
-    keep = [r[:7] for r in rows if not cutoff or (msg_epoch(r[7]) or cutoff) >= cutoff]
+    keep = []
+    for r in rows:
+        if r[8] and is_own_send(r[1], r[2], r[4] or ""):
+            continue  # loop guard: the relay's own reply, never a command
+        if not cutoff or (msg_epoch(r[7]) or cutoff) >= cutoff:
+            keep.append(r[:7])
     return keep, last
 
 
@@ -1423,7 +1514,7 @@ def check_deps(cfg):
     else:
         errs.append(f"bridge messages.db NOT found in {store or '(bridge.store empty)'}")
     if store and bot_is_owner():
-        errs.append(SAME_NUMBER)
+        notes.append(OWN_NOTE)
     if not token():
         errs.append("bridge token not found (WHATSAPP_BRIDGE_TOKEN or <store>/.bridge-token); bridge not tested")
         return errs, notes
@@ -1494,10 +1585,10 @@ def main(argv):
     if err:
         print("Config errors, not starting:\n  " + "\n  ".join(err) + "\nRun: python3 relay.py check")
         return 1
-    if bot_is_owner():
-        print(SAME_NUMBER + " Not starting.")
-        return 1
     setup(cfg)
+    OWN[0] = bot_is_owner()
+    if OWN[0]:
+        print(OWN_NOTE, flush=True)
     main_loop()
 
 

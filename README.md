@@ -16,6 +16,7 @@
 > **Read before you use it**
 > 1. **Your chat becomes a remote control for your computer.** Whoever can write in it can steer Claude in your folder. See [SECURITY.md](SECURITY.md).
 > 2. **The bridge is an unofficial WhatsApp client.** That breaks WhatsApp's Terms of Service, and the number can get banned. **Use a second number** for the bridge (a cheap prepaid SIM or eSIM), and message it from your normal number.
+> Your own number works too (own-number mode): talk to the assistant in your "Message yourself" chat, and people you add get replies from your own number. A ban then hits your main number.
 
 ## Install (macOS)
 
