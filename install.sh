@@ -387,6 +387,7 @@ else
     esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
     if [ "$DRY" = 1 ]; then info "[dry-run] write $BRIDGE_PLIST from launchd/bridge.plist.template"
     else
+      mkdir -p "$(dirname "$BRIDGE_PLIST")"   # a new Mac user has no ~/Library/LaunchAgents yet
       sed -e "s|__LABEL__|$(esc "$BRIDGE_LABEL")|" -e "s|__BRIDGE_BIN__|$(esc "$BRIDGE_BIN")|" \
           -e "s|__BRIDGE_DIR__|$(esc "$BRIDGE_DIR")|" -e "s|__PORT__|$(esc "$PORT")|" \
           -e "s|__HOME__|$(esc "$HOME")|" -e "s|__LOG_DIR__|$(esc "$LOG_DIR")|g" \

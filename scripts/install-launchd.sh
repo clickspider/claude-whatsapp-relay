@@ -42,6 +42,7 @@ PY_PATH="$(command -v "$PY" || true)"
 
 mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$HOME/Library/LaunchAgents"   # a new Mac user has no LaunchAgents folder yet
 if [ -f "$PLIST" ]; then
   cp "$PLIST" "$PLIST.bak-$(date +%Y%m%d-%H%M%S)"
   echo "Backed up the old $PLIST"
