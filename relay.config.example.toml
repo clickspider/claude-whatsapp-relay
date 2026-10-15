@@ -32,6 +32,10 @@ batch_seconds = 3
 media_dir = ""
 # Answer voice notes with a voice note (macOS `say`). LOW.
 voice_replies = true
+# Your writing style guide (how you write: tone, length, emoji, languages), e.g. made by Lore from your
+# own sent messages. Relative to `folder`. When the file exists, its first 4 KB go into your Claude's
+# prompt ("write like the owner" for drafts) and into agents with use_owner_voice. "" = off. LOW.
+voice_file = "voice.md"
 # Extra instructions for your Claude. "" = a short built-in prompt (plain text, short, @@ markers).
 # A security line about untrusted data is always added after it.
 system_prompt = ""
@@ -208,6 +212,9 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # read_only = []                         # files/folders it must never edit
 # checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
+# use_owner_voice = true                 # write like you (owner.voice_file). Not set = on only in own-number
+#                                        # mode, where its replies come from your own number; with a second
+#                                        # number the agent speaks as your assistant, not as you.
 # ask_contact = false                    # MED: the agent's @@ASK polls go to the contact, not to you.
 #                                        # Needs trust = "reply" (the question skips your OK).
 # timezone = ""                          # "" = quiet_hours.timezone
