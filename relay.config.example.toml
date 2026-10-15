@@ -108,6 +108,14 @@ early_close = {}
 # Example: ["claude", "@31600000001", "@123456789012345"]
 self_tags = ["claude"]
 
+[ui]
+# LOW. true = native WhatsApp polls for choices (needs a bridge with /api/poll):
+# a held draft gets a "Send / Change / Drop" poll (typed /<name> ok still works), and a line
+# "@@ASK: question | option | option" from your Claude or an agent becomes a poll; the vote comes
+# back as "ANSWER to ...". Only votes from the chat the poll went to count, each poll acts once.
+# false = old behavior: typed commands, and @@ASK arrives as a numbered list.
+polls = false
+
 [prompts]
 # Fixed words the relay sends to agents. Your agents' RULES.md should use the same words.
 owner_says = "OWNER SAYS: "
@@ -185,6 +193,8 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # read_only = []                         # files/folders it must never edit
 # checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
+# ask_contact = false                    # MED: the agent's @@ASK polls go to the contact, not to you.
+#                                        # Needs trust = "reply" (the question skips your OK).
 # timezone = ""                          # "" = quiet_hours.timezone
 # tools = ["Read", "Write", "Edit", "Glob", "Grep"]   # file tools; add "WebSearch", "WebFetch" for web research (MED)
 # plugin_dirs = []                      # Claude plugin folders with skills; add "Skill" to tools to use them
