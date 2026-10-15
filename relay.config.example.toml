@@ -109,6 +109,10 @@ history_grace_seconds = 600
 # Agents may read the last this-many messages of their own chat (old ones too) as context,
 # in <agent home>/history.md, 500 characters each. Old messages never start a run. 0 = off.
 history_messages = 200
+# Anti-ban: a random gap of [min, max] seconds between two outgoing messages (all chats together).
+# WhatsApp flags accounts that send bursts. The first message after a quiet spell goes at once;
+# "typing..." already shows while Claude works (see [feedback]). [0, 0] = no gap (MED).
+send_jitter_seconds = [1.5, 4.0]
 
 [quiet_hours]
 # Agents never START a conversation (check-ins, owner notes) in quiet hours. Replies still go out.
@@ -146,6 +150,10 @@ from_owner_claude = "FROM OWNER'S CLAUDE: "
 owner_note_marker = "OWNER"
 # First words of a group digest prompt.
 group_label = "GROUP."
+# Sent when Claude's plan usage limit is reached: always to your chat, and once per reset window to
+# an agent chat with trust = "reply" (draft agents stay silent). Write them in your contacts' language.
+limit_reached = "I hit my Claude limit. Back at {time}."
+limit_later = "I hit my Claude limit. Back later."
 
 [hooks]
 # Command run (as a list, no shell) after an agent log is written, at most every N seconds.
@@ -172,6 +180,12 @@ remote = "origin"
 branch = "main"
 ssh_key = ""          # e.g. "~/.ssh/id_ed25519" if launchd cannot reach your ssh-agent
 check_hours = 6
+
+[power]
+# A sleeping Mac answers nobody. true = the relay starts `caffeinate -i -s -w <relay pid>`: no idle or
+# system sleep while it runs on power; it ends with the relay. No system settings are changed.
+# On battery (or with the lid closed and no display) the Mac can still sleep: the log warns you. LOW.
+keep_awake = true
 
 [launchd]
 # Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.
