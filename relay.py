@@ -46,7 +46,8 @@ DEFAULTS = {
               "agents_dir": "agents"},
     "feedback": {"typing": True, "reactions": True, "mark_read": True, "long_job_seconds": 180,
                  "poll_seconds": 2, "group_digest_after_seconds": 120},
-    "limits": {"per_minute": 6, "per_day": 150, "group_buffer_max": 40, "run_timeout_seconds": 600},
+    "limits": {"per_minute": 6, "per_day": 150, "group_buffer_max": 40, "run_timeout_seconds": 600,
+               "history_grace_seconds": 600},
     "quiet_hours": {"timezone": "", "start": 21, "end": 9, "days_off": [], "early_close": {}},
     "groups": {"self_tags": []},
     "ui": {"polls": False},
@@ -161,7 +162,7 @@ def validate(cfg):
     if not cfg["bridge"]["store"]:
         err.append("bridge.store is empty: set it to the bridge's store/ folder.")
     lim = cfg["limits"]
-    for k in ("per_minute", "per_day", "group_buffer_max", "run_timeout_seconds"):
+    for k in ("per_minute", "per_day", "group_buffer_max", "run_timeout_seconds", "history_grace_seconds"):
         if not isinstance(lim[k], int) or lim[k] < 0:
             err.append(f"limits.{k} must be a whole number >= 0.")
     q = cfg["quiet_hours"]
@@ -1131,12 +1132,16 @@ _limit_noted = set()
 
 def route(msg_id, chat, sender, content, media_type):
     text = content or ""
+    a = None if chat == OWNER else by_jid(chat)
+    if chat != OWNER and (not a or not a["live"] or flag(a, "paused")):
+        return  # unknown chats are ignored: never counted, never reported
     if not allowed(chat):
-        if chat not in _limit_noted:  # tell the owner once per chat per run
+        if chat not in _limit_noted:  # tell the owner once per chat per limit window
             _limit_noted.add(chat)
             send_text(OWNER, f"Rate limit hit for {'your chat' if chat == OWNER else chat}. "
                              "Messages are ignored until it resets (see limits in the config).")
         return
+    _limit_noted.discard(chat)
     if chat == OWNER:
         m = re.match(r"^/(as)?([a-z]+)\b\s*(.*)$", text.strip(), re.S)
         if m and by_name(m.group(2))[1]:
@@ -1148,9 +1153,6 @@ def route(msg_id, chat, sender, content, media_type):
             return enqueue(name, lambda: with_feedback(OWNER, msg_id, OWNER,
                                                        lambda: owner_command(name, arg)))
         return owner_add(msg_id, content, media_type)
-    a = by_jid(chat)
-    if not a or not a["live"] or flag(a, "paused"):
-        return  # unknown chats are ignored
     trig = a["trigger"]
     if trig == "listen":
         return listen(chat, a, msg_id, sender, content, media_type)
@@ -1247,6 +1249,47 @@ def setup(cfg):
     os.makedirs(cfg["paths"]["state_dir"], mode=0o700, exist_ok=True)
 
 
+SAME_NUMBER = "The bot number and your own number are the same. Link a second number."
+
+
+def jid_user(jid):
+    return (jid or "").split("@")[0].split(":")[0]
+
+
+def bot_is_owner():
+    """True when the bridge's linked account (whatsmeow_device) is the owner's own number:
+    the relay would then read and answer as the owner. Read-only."""
+    try:
+        c = db("whatsapp.db")
+        c.row_factory = sqlite3.Row
+        rows = c.execute("SELECT * FROM whatsmeow_device").fetchall()
+        c.close()
+    except sqlite3.Error:
+        return False
+    own = jid_user(CFG["owner"]["jid"])
+    return bool(own) and any(own == jid_user(r[k]) for r in rows for k in r.keys() if k in ("jid", "lid"))
+
+
+def msg_epoch(stamp):
+    """Bridge timestamps are text like '2026-10-15 16:21:03.5+02:00'. None if unreadable."""
+    try:
+        return datetime.datetime.fromisoformat(str(stamp)).timestamp()
+    except ValueError:
+        return None
+
+
+def new_rows(c, last, cutoff=0):
+    """The one source of incoming messages. Rows older than cutoff (epoch) are dropped here,
+    so WhatsApp history sync after pairing never reaches routing, rate limits or warnings.
+    Returns (rows, last_rowid_seen)."""
+    rows = c.execute("SELECT rowid, id, chat_jid, sender, content, media_type, filename, timestamp "
+                     "FROM messages WHERE rowid > ? AND NOT is_from_me ORDER BY rowid", (last,)).fetchall()
+    if rows:
+        last = rows[-1][0]
+    keep = [r[:7] for r in rows if not cutoff or (msg_epoch(r[7]) or cutoff) >= cutoff]
+    return keep, last
+
+
 def main_loop():
     c = db("messages.db")
     cur = st("last-rowid")
@@ -1254,10 +1297,10 @@ def main_loop():
         last = int(read(cur))
     else:  # first start: skip all history
         last = c.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
-    tick = 0
+    tick, grace = 0, CFG["limits"]["history_grace_seconds"]
+    cutoff = time.time() - grace if grace else 0
     while True:
-        rows = c.execute("SELECT rowid, id, chat_jid, sender, content, media_type, filename FROM messages "
-                         "WHERE rowid > ? AND NOT is_from_me ORDER BY rowid", (last,)).fetchall()
+        rows, seen = new_rows(c, last, cutoff)
         for rowid, msg_id, chat, sender, content, media_type, filename in rows:
             last = rowid
             write(cur, str(last))
@@ -1273,6 +1316,9 @@ def main_loop():
                     send_text(OWNER, f"Error routing a message: {e}")
                 except Exception:
                     pass
+        if seen != last:
+            last = seen
+            write(cur, str(last))
         tick += 1
         for every, fn in ((5, lambda: [deliver_inbox(a, fixes_only=True) for a in agents(CFG) if a["live"]]),
                           (300, lambda: threading.Thread(target=publish_check, daemon=True).start()),
@@ -1376,6 +1422,8 @@ def check_deps(cfg):
         notes.append("bridge messages.db: found")
     else:
         errs.append(f"bridge messages.db NOT found in {store or '(bridge.store empty)'}")
+    if store and bot_is_owner():
+        errs.append(SAME_NUMBER)
     if not token():
         errs.append("bridge token not found (WHATSAPP_BRIDGE_TOKEN or <store>/.bridge-token); bridge not tested")
         return errs, notes
@@ -1445,6 +1493,9 @@ def main(argv):
     err, _ = validate(cfg)
     if err:
         print("Config errors, not starting:\n  " + "\n  ".join(err) + "\nRun: python3 relay.py check")
+        return 1
+    if bot_is_owner():
+        print(SAME_NUMBER + " Not starting.")
         return 1
     setup(cfg)
     main_loop()

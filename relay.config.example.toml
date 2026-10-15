@@ -90,6 +90,11 @@ per_day = 150
 group_buffer_max = 40
 # Kill a Claude run after this many seconds. 0 = never.
 run_timeout_seconds = 600
+# Ignore messages sent more than this many seconds before the relay started.
+# After you link the bot number, WhatsApp copies old chat history in; this keeps the relay
+# from answering it. Messages sent while the relay was off longer than this are skipped too.
+# 0 = handle every new row, old or not (MED).
+history_grace_seconds = 600
 
 [quiet_hours]
 # Agents never START a conversation (check-ins, owner notes) in quiet hours. Replies still go out.
