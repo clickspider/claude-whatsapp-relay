@@ -49,4 +49,6 @@ Copy this folder to `agents/<name>/`, then replace the parts marked EDIT.
 - `@@QUOTE: #n`: send your answer as a WhatsApp reply to message #n.
 - `@@EDIT_LAST: <full new text>`: replace your own previous message (within ~15 minutes).
 - `@@DELETE_LAST`: delete your own previous message for everyone.
+- `@@ASK: <question> | <option> | <option>`: ask the owner (or the contact, if the owner turned on
+  `ask_contact`) to choose, as a WhatsApp poll. The vote comes back to you as `ANSWER to "<question>": <option>`.
 Everything else you write is sent to the contact as it is.

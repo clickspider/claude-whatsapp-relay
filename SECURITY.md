@@ -23,6 +23,7 @@ Every agent ALWAYS runs with `claude --restricted --strict-mcp-config --tools <f
 - `agent.unrestricted = true` + `danger.allow_unrestricted_agents = true`: the agent loses the sandbox. Anyone in that chat can ask it to read your files. Avoid.
 - `danger.self_edit = true`: your Claude may edit `relay.py`, and the relay restarts on change. Injected text could plant code that runs later.
 - `danger.protect_sensitive_paths = false`: your Claude may edit hooks and settings = code that runs in later sessions.
+- `agent.ask_contact = true` (MED, needs `trust = "reply"`): the agent's `@@ASK` questions go to the contact as a poll, without your OK. Off = they come to you, privately. `ui.polls` itself is LOW: a vote only counts in the chat the poll went to, acts once, and a draft vote only sends the exact draft the poll was made for.
 - `hooks.after_log`: runs a command after each agent log. If it pushes to git, other people's messages leave your computer.
 
 ## Prompt injection (second order)
