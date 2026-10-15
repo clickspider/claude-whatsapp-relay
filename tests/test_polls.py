@@ -82,3 +82,12 @@ class Votes(unittest.TestCase):
             relay.ask("o@s.whatsapp.net", "mom draft", relay.DRAFT_OPTIONS, kind="draft")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.sent, [("o@s.whatsapp.net", "Lunch?\n1. Yes\n2. No")])
+
+
+class OldBridge(Votes):
+    def test_bridge_without_poll_endpoint_falls_back_to_text(self):
+        def boom(path, p=None):
+            raise OSError("404")
+        with self.patch(api=boom):
+            relay.ask("o@s.whatsapp.net", "Lunch?", ["Yes", "No"], kind="ask")
+        self.assertEqual(self.sent, [("o@s.whatsapp.net", "Lunch?\n1. Yes\n2. No")])

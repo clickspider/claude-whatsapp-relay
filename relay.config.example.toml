@@ -109,7 +109,7 @@ early_close = {}
 self_tags = ["claude"]
 
 [ui]
-# LOW. true = native WhatsApp polls for choices (needs a bridge with /api/poll):
+# LOW. true = native WhatsApp polls for choices (needs a bridge with /api/poll; without it, text is used):
 # a held draft gets a "Send / Change / Drop" poll (typed /<name> ok still works), and a line
 # "@@ASK: question | option | option" from your Claude or an agent becomes a poll; the vote comes
 # back as "ANSWER to ...". Only votes from the chat the poll went to count, each poll acts once.

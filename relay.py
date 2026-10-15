@@ -694,8 +694,11 @@ def polls(update=None):
 def ask(chat, question, options, **record):
     """A choice for a person: a native poll when ui.polls is on, else a numbered text list."""
     if CFG["ui"]["polls"]:
-        mid = api("poll", {"recipient": chat, "question": question[:255], "options": options,
-                           "selectable_count": 1}).get("message_id")
+        try:
+            mid = api("poll", {"recipient": chat, "question": question[:255], "options": options,
+                               "selectable_count": 1}).get("message_id")
+        except Exception:  # bridge without /api/poll (upstream whatsapp-mcp): fall back to text
+            mid = None
         if mid:
             return polls({mid: dict(record, chat=chat, question=question)})
     if record.get("kind") == "ask":
