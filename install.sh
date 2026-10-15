@@ -4,6 +4,12 @@
 #   ./install.sh             install or repair
 #   ./install.sh --dry-run   print every step, change nothing
 #   ./install.sh --uninstall remove only what this script created (asks before deleting data)
+#   ./install.sh --yes       no questions: each answer comes from RELAY_<NAME>, else the default.
+#                            Never reads /dev/tty. Prints `LORE-STEP <id> <status> [detail]` lines for apps.
+#                            RELAY_NUMBER (required) RELAY_NAME RELAY_FOLDER RELAY_TZNAME RELAY_LABEL RELAY_PORT
+#                            RELAY_CONTINUE RELAY_BREW RELAY_MKDIR RELAY_GET_MODEL RELAY_START (y/n, default y)
+#                            RELAY_DEL_CLONE RELAY_DEL_MODEL RELAY_DEL_CONFIG (--uninstall, y/n, default n)
+#   ./install.sh --yes --tools-only   check and install the tools, then stop
 #
 # Every setting lives in relay.config.toml (made from relay.config.example.toml on the first run).
 # The only setting outside it: CLAUDE_WHATSAPP_RELAY_DIR, where `curl ... | bash` clones this repo
@@ -12,13 +18,17 @@ set -euo pipefail
 
 REPO_URL="https://github.com/clickspider/claude-whatsapp-relay.git"
 DRY=0
+YES=0
+TOOLS_ONLY=0
 MODE=install
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --uninstall) MODE=uninstall ;;
-    -h|--help) sed -n '2,10p' "$0" 2>/dev/null || true; exit 0 ;;
-    *) echo "Unknown option: $a (use --dry-run or --uninstall)"; exit 1 ;;
+    --yes) YES=1 ;;
+    --tools-only) TOOLS_ONLY=1 ;;
+    -h|--help) sed -n '2,17p' "$0" 2>/dev/null || true; exit 0 ;;
+    *) echo "Unknown option: $a (use --dry-run, --uninstall, --yes or --tools-only)"; exit 1 ;;
   esac
 done
 
@@ -29,7 +39,9 @@ step() { printf '\n%s==> %s%s\n' "$B" "$1" "$N"; }
 ok()   { printf '  %sok%s    %s\n' "$G" "$N" "$1"; }
 info() { printf '  %s\n' "$1"; }
 warn() { printf '  %swarn%s  %s\n' "$Y" "$N" "$1"; }
-die()  { printf '\n%sStopped:%s %s\n' "$R" "$N" "$1" >&2; exit 1; }
+die()  { lore fail "${1%%$'\n'*}"; printf '\n%sStopped:%s %s\n' "$R" "$N" "$1" >&2; exit 1; }
+# lore ID STATUS [detail]: one machine-readable progress line, only under --yes (apps parse it).
+lore() { [ "$YES" = 1 ] && printf 'LORE-STEP %s\n' "$*"; return 0; }
 
 # run: every command that changes something goes through here.
 run() {
@@ -38,9 +50,13 @@ run() {
 }
 
 # ask VAR "question" "default": reads from the terminal, also under `curl | bash`.
+# Under --yes: the answer is $RELAY_<VAR>, else the default. /dev/tty is never read.
 ask() {
-  local _v="$1" _q="$2" _d="${3:-}" _a=""
-  if [ "$DRY" = 1 ]; then
+  local _v="$1" _q="$2" _d="${3:-}" _a="" _e="RELAY_$1"
+  if [ "$YES" = 1 ]; then
+    _a="${!_e:-$_d}"
+    printf '  ? %s: %s\n' "$_q" "$_a"
+  elif [ "$DRY" = 1 ]; then
     printf '  %s[dry-run]%s would ask: %s (using "%s")\n' "$D" "$N" "$_q" "$_d"
     _a="$_d"
   else
@@ -51,11 +67,10 @@ ask() {
   printf -v "$_v" '%s' "$_a"
 }
 
-# yes_no "question" y|n  -> exit status 0 for yes.
+# yes_no KEY "question" y|n  -> exit status 0 for yes. KEY names the --yes answer: RELAY_<KEY>.
 yes_no() {
-  local q="$1" def="$2" ans
-  ask ans "$q (y/n)" "$def"
-  case "$ans" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+  ask "$1" "$2 (y/n)" "$3"
+  case "${!1}" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
 }
 
 [ "$(uname -s)" = "Darwin" ] || die "this installer is macOS only for now. On Linux, follow the manual steps in README.md."
@@ -72,6 +87,7 @@ else
   if [ -d "$ROOT/.git" ]; then run git -C "$ROOT" pull --ff-only
   else run mkdir -p "$(dirname "$ROOT")"; run git clone "$REPO_URL" "$ROOT"; fi
   [ "$DRY" = 1 ] && { info "[dry-run] would continue with: bash $ROOT/install.sh $*"; exit 0; }
+  if [ "$YES" = 1 ]; then exec bash "$ROOT/install.sh" "$@"; fi
   exec bash "$ROOT/install.sh" "$@" < /dev/tty
 fi
 
@@ -162,13 +178,13 @@ if [ "$MODE" = uninstall ]; then
       clone)
         [ -d "$val" ] || continue
         warn "$val holds your WhatsApp session and message history."
-        if yes_no "Delete $val? This cannot be undone" n; then run rm -rf "$val"; else info "Kept $val"; KEPT="$KEPT$kind $val"$'\n'; fi ;;
+        if yes_no DEL_CLONE "Delete $val? This cannot be undone" n; then run rm -rf "$val"; else info "Kept $val"; KEPT="$KEPT$kind $val"$'\n'; fi ;;
       model)
         [ -f "$val" ] || continue
-        if yes_no "Delete the speech model $val (~550 MB)?" n; then run rm -f "$val"; else info "Kept $val"; KEPT="$KEPT$kind $val"$'\n'; fi ;;
+        if yes_no DEL_MODEL "Delete the speech model $val (~550 MB)?" n; then run rm -f "$val"; else info "Kept $val"; KEPT="$KEPT$kind $val"$'\n'; fi ;;
       config)
         [ -f "$val" ] || continue
-        if yes_no "Delete your settings $val?" n; then run rm -f "$val"; else info "Kept $val"; KEPT="$KEPT$kind $val"$'\n'; fi ;;
+        if yes_no DEL_CONFIG "Delete your settings $val?" n; then run rm -f "$val"; else info "Kept $val"; KEPT="$KEPT$kind $val"$'\n'; fi ;;
       brew)
         info "Homebrew package '$val' was installed by install.sh. Other apps may use it."
         info "  To remove it yourself: brew uninstall $val" ;;
@@ -194,11 +210,12 @@ ${Y}Read this first:${N}
   3. Nothing is installed or started without a yes from you.
 EOF
 [ "$DRY" = 1 ] && printf '\n%s--dry-run: nothing below runs. Commands are printed only.%s\n' "$Y" "$N"
-yes_no "Continue?" y || exit 0
+yes_no CONTINUE "Continue?" y || { lore fail "not confirmed"; exit 0; }
 
 # ---------- 1. tools ----------
 step "1/6  Check the tools"
-command -v brew >/dev/null || die "Homebrew is missing. Install it from https://brew.sh, then run this again."
+lore tools start
+command -v brew >/dev/null && lore tool brew ok || die "Homebrew is missing. Install it from https://brew.sh, then run this again."
 xcode-select -p >/dev/null 2>&1 || die "Apple's command line tools are missing (the bridge needs a C compiler). Run: xcode-select --install"
 
 MISSING=""
@@ -207,23 +224,30 @@ command -v ffmpeg >/dev/null      && ok "ffmpeg" || MISSING="$MISSING ffmpeg"
 command -v whisper-cli >/dev/null && ok "whisper-cli" || MISSING="$MISSING whisper-cpp"
 PY="$(find_python || true)"
 [ -n "$PY" ] && ok "python 3.11+ ($PY)" || MISSING="$MISSING python@3.12"
+for f in go ffmpeg whisper-cpp python@3.12; do
+  case " $MISSING " in *" $f "*) lore tool "$f" missing ;; *) lore tool "$f" ok ;; esac
+done
 if [ -n "$MISSING" ]; then
   info "Missing:$MISSING"
-  yes_no "Install them with Homebrew now (brew install$MISSING)?" y || die "install the missing tools, then run this again."
-  for f in $MISSING; do run brew install "$f"; remember "brew $f"; done
+  yes_no BREW "Install them with Homebrew now (brew install$MISSING)?" y || die "install the missing tools, then run this again."
+  for f in $MISSING; do lore tool "$f" installing; run brew install "$f"; remember "brew $f"; lore tool "$f" installed; done
   [ -n "$PY" ] || PY="$(find_python || true)"
   [ -n "$PY" ] || { [ "$DRY" = 1 ] && PY=python3; } || die "python 3.11+ still not found after brew install."
 fi
 
 if command -v claude >/dev/null && claude --version >/dev/null 2>&1; then
   ok "Claude Code ($(claude --version 2>/dev/null | head -1))"
+  lore tool claude ok
 else
+  lore tool claude missing
   die "Claude Code is not installed. Install it with:
     curl -fsSL https://claude.ai/install.sh | bash
   Then run 'claude' once and sign in there (this installer never signs in for you).
   Then run this installer again."
 fi
 info "Claude Code must be signed in: run 'claude' once yourself if you have not yet."
+lore tools ok
+if [ "$TOOLS_ONLY" = 1 ]; then lore done ok; exit 0; fi
 
 # ---------- 2. config ----------
 step "2/6  Your settings (relay.config.toml)"
@@ -238,6 +262,7 @@ else
     NUMBER="${NUMBER//[^0-9]/}"
     [[ "$NUMBER" =~ ^[1-9][0-9]{6,14}$ ]] && break
     [ "$DRY" = 1 ] && { NUMBER="15551234567"; break; }
+    [ "$YES" = 1 ] && die "RELAY_NUMBER is not a full number with country code (digits only)."
     warn "That does not look like a full number with country code. Try again."
   done
   ask NAME "What should Claude call you?" "$(id -F 2>/dev/null | awk '{print $1}')"
@@ -246,20 +271,25 @@ else
   TZ_DEF="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
   ask TZNAME "Your timezone" "${TZ_DEF:-UTC}"
   if [ ! -d "$FOLDER" ]; then
-    yes_no "$FOLDER does not exist. Create it?" y && run mkdir -p "$FOLDER" || die "pick an existing folder."
+    yes_no MKDIR "$FOLDER does not exist. Create it?" y && run mkdir -p "$FOLDER" || die "pick an existing folder."
   fi
   WA_DEF="$HOME/.claude-whatsapp-relay/whatsapp-mcp"
+  # Only --yes callers (apps) pick another launchd label or bridge port; the terminal flow keeps the defaults.
+  LABEL="com.claude-whatsapp-relay.relay"; PORT_ANS=8080
+  if [ "$YES" = 1 ]; then LABEL="${RELAY_LABEL:-$LABEL}"; PORT_ANS="${RELAY_PORT:-$PORT_ANS}"; fi
+  [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "RELAY_LABEL may only use letters, digits, . _ -"
+  [[ "$PORT_ANS" =~ ^[0-9]+$ ]] || die "RELAY_PORT must be a number"
   if [ "$DRY" = 1 ]; then
     info "[dry-run] would write $CONFIG (mode 600) from the example with your answers"
     SETTINGS_FROM="$EXAMPLE"
   else
     "$PY" - "$EXAMPLE" "$CONFIG" "$NUMBER@s.whatsapp.net" "${NAME:-Owner}" "$FOLDER" "$TZNAME" \
-         "$WA_DEF/whatsapp-bridge/store" "$PY" <<'EOF'
+         "$WA_DEF/whatsapp-bridge/store" "$PY" "$LABEL" "http://127.0.0.1:$PORT_ANS/api" <<'EOF'
 import json, os, sys
-src, dst, jid, name, folder, tz, store, py = sys.argv[1:]
+src, dst, jid, name, folder, tz, store, py, label, api = sys.argv[1:]
 want = {("owner", "jid"): jid, ("owner", "name"): name, ("owner", "folder"): folder,
-        ("owner", "timezone"): tz, ("bridge", "store"): store,
-        ("launchd", "label"): "com.claude-whatsapp-relay.relay", ("launchd", "python"): py}
+        ("owner", "timezone"): tz, ("bridge", "store"): store, ("bridge", "api"): api,
+        ("launchd", "label"): label, ("launchd", "python"): py}
 sec, out, done = "", [], set()
 for line in open(src).read().splitlines(True):
     s = line.strip()
@@ -284,6 +314,7 @@ EOF
   fi
 fi
 load_settings "$SETTINGS_FROM"
+lore config ok
 
 # ---------- 3. bridge ----------
 step "3/6  WhatsApp bridge (whatsapp-mcp)"
@@ -315,6 +346,7 @@ else
     (cd "$BRIDGE_DIR" && go build -o whatsapp-bridge .) || die "the bridge did not build. See the Go errors above."
     ok "Built $BRIDGE_BIN"
   fi
+  lore build ok
 
   BRIDGE_PLIST="$(plist_path "$BRIDGE_LABEL")"
   if [ "$DRY" = 0 ] && job_loaded "$BRIDGE_LABEL" && health; then
@@ -332,6 +364,7 @@ else
       info "Now pair the bridge with WhatsApp, on the phone with the bridge number:"
       info "  WhatsApp > Settings > Linked devices > Link a device > scan the QR below."
     fi
+    lore qr wait
     if [ "$DRY" = 1 ]; then
       info "[dry-run] (cd $BRIDGE_DIR && WHATSAPP_BRIDGE_PORT=$PORT ./whatsapp-bridge)   # shows the QR, waits up to 5 min"
     else
@@ -348,7 +381,7 @@ else
       wait "$BPID" 2>/dev/null || true
       trap - EXIT INT TERM
       [ "$paired" = 1 ] || die "the bridge did not connect (QR not scanned in time, or it stopped). Run ./install.sh again."
-      printf '\n'; ok "Paired and connected"
+      printf '\n'; ok "Paired and connected"; lore paired ok
     fi
     run mkdir -p "$LOG_DIR"; run chmod 700 "$LOG_DIR"
     esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
@@ -369,28 +402,34 @@ else
     fi
   fi
 fi
+lore bridge ok
 
 # ---------- 4. speech model ----------
 step "4/6  Local speech model (voice notes never leave this computer)"
-if [ -f "$MODEL" ]; then ok "Model already there: $MODEL"
-elif yes_no "Download the whisper model now (~550 MB)?" y; then
-  run "$ROOT/scripts/get-model.sh"; remember "model $MODEL"
-else warn "Skipped. Voice notes will fail until you run scripts/get-model.sh"; fi
+if [ -f "$MODEL" ]; then ok "Model already there: $MODEL"; lore model ok
+elif yes_no GET_MODEL "Download the whisper model now (~550 MB)?" y; then
+  lore model downloading
+  run "$ROOT/scripts/get-model.sh"; remember "model $MODEL"; lore model ok
+else warn "Skipped. Voice notes will fail until you run scripts/get-model.sh"; lore model skip; fi
 
 # ---------- 5. check ----------
 step "5/6  Check every setting"
 if [ "$DRY" = 1 ]; then info "[dry-run] $PY $ROOT/relay.py check --config $CONFIG"
 else "$PY" "$ROOT/relay.py" check --config "$CONFIG" || die "fix the problems above in $CONFIG, then run ./install.sh again."; fi
+lore check ok
 
 # ---------- 6. start ----------
 step "6/6  Start the relay"
-if yes_no "Start the relay now, and on every login?" y; then
+if yes_no START "Start the relay now, and on every login?" y; then
   # install-launchd.sh reads the config with the python3 first on PATH: make that the 3.11+ one.
   PATH="$(dirname "$PY"):$PATH" run "$ROOT/scripts/install-launchd.sh" "$CONFIG" --load
   remember "launchd $RELAY_LABEL"
+  lore start ok
 else
   info "Not started. Later: scripts/install-launchd.sh --load"
+  lore start skip
 fi
+lore done ok
 
 cat <<EOF
 
