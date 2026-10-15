@@ -15,12 +15,14 @@ class InstallTests(unittest.TestCase):
             store = os.path.expanduser("~/.claude-whatsapp-relay/whatsapp-mcp/whatsapp-bridge/store")
             subprocess.run([sys.executable, "-c", WRITE_CONFIG, os.path.join(ROOT, "relay.config.example.toml"),
                             cfg_path, "31612345678@s.whatsapp.net", 'Sam "Q"', tmp, "Europe/Amsterdam",
-                            store, sys.executable, "me.example.lore.relay", "http://127.0.0.1:18080/api"], check=True)
+                            store, sys.executable, "me.example.lore.relay", "http://127.0.0.1:18080/api",
+                            "me.example.lore.bridge"], check=True)
             self.assertEqual(os.stat(cfg_path).st_mode & 0o777, 0o600)
             cfg = relay.load_config(cfg_path)
             self.assertEqual(relay.validate(cfg)[0], [])
             self.assertEqual(cfg["owner"]["name"], 'Sam "Q"')
             self.assertEqual(cfg["launchd"]["label"], "me.example.lore.relay")
+            self.assertEqual(cfg["install"]["bridge_label"], "me.example.lore.bridge")
             out = subprocess.run([sys.executable, "-c", READ_CONFIG, cfg_path],
                                  check=True, capture_output=True, text=True).stdout
             s = dict(line.split("=", 1) for line in out.splitlines())
@@ -28,7 +30,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((s["PORT"], s["HOST"], s["MANAGE_BRIDGE"]), ("18080", "127.0.0.1", "true"))
             # never overwrites an existing config
             r = subprocess.run([sys.executable, "-c", WRITE_CONFIG, os.path.join(ROOT, "relay.config.example.toml"),
-                                cfg_path, "x", "x", "x", "x", "x", "x", "x", "x"], capture_output=True)
+                                cfg_path, "x", "x", "x", "x", "x", "x", "x", "x", "x"], capture_output=True)
             self.assertNotEqual(r.returncode, 0)
 
     def test_example_matches_installer_defaults(self):

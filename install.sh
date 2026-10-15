@@ -8,6 +8,9 @@
 #                            Never reads /dev/tty. Prints `LORE-STEP <id> <status> [detail]` lines for apps.
 #                            RELAY_NUMBER (required) RELAY_NAME RELAY_FOLDER RELAY_TZNAME RELAY_LABEL RELAY_PORT
 #                            RELAY_CONTINUE RELAY_BREW RELAY_MKDIR RELAY_GET_MODEL RELAY_START (y/n, default y)
+#                            RELAY_JOBS=n: the caller runs the bridge and relay jobs itself (an app that registers
+#                            them under its own name). install.sh pairs, checks, then stops its bridge; no launchd jobs.
+#                            RELAY_BRIDGE_LABEL: the bridge job label written to install.bridge_label
 #                            RELAY_DEL_CLONE RELAY_DEL_MODEL RELAY_DEL_CONFIG (--uninstall, y/n, default n)
 #   ./install.sh --yes --tools-only   check and install the tools, then stop
 #
@@ -31,6 +34,8 @@ for a in "$@"; do
     *) echo "Unknown option: $a (use --dry-run, --uninstall, --yes or --tools-only)"; exit 1 ;;
   esac
 done
+# RELAY_JOBS=n (only under --yes): no launchd jobs; the calling app registers the bridge and relay itself.
+JOBS=y; [ "$YES" = 1 ] && JOBS="${RELAY_JOBS:-y}"
 
 # ---------- output ----------
 if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
@@ -275,21 +280,22 @@ else
   fi
   WA_DEF="$HOME/.claude-whatsapp-relay/whatsapp-mcp"
   # Only --yes callers (apps) pick another launchd label or bridge port; the terminal flow keeps the defaults.
-  LABEL="com.claude-whatsapp-relay.relay"; PORT_ANS=8080
-  if [ "$YES" = 1 ]; then LABEL="${RELAY_LABEL:-$LABEL}"; PORT_ANS="${RELAY_PORT:-$PORT_ANS}"; fi
+  LABEL="com.claude-whatsapp-relay.relay"; PORT_ANS=8080; BLABEL="com.claude-whatsapp-relay.bridge"
+  if [ "$YES" = 1 ]; then LABEL="${RELAY_LABEL:-$LABEL}"; PORT_ANS="${RELAY_PORT:-$PORT_ANS}"; BLABEL="${RELAY_BRIDGE_LABEL:-$BLABEL}"; fi
   [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "RELAY_LABEL may only use letters, digits, . _ -"
+  [[ "$BLABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "RELAY_BRIDGE_LABEL may only use letters, digits, . _ -"
   [[ "$PORT_ANS" =~ ^[0-9]+$ ]] || die "RELAY_PORT must be a number"
   if [ "$DRY" = 1 ]; then
     info "[dry-run] would write $CONFIG (mode 600) from the example with your answers"
     SETTINGS_FROM="$EXAMPLE"
   else
     "$PY" - "$EXAMPLE" "$CONFIG" "$NUMBER@s.whatsapp.net" "${NAME:-Owner}" "$FOLDER" "$TZNAME" \
-         "$WA_DEF/whatsapp-bridge/store" "$PY" "$LABEL" "http://127.0.0.1:$PORT_ANS/api" <<'EOF'
+         "$WA_DEF/whatsapp-bridge/store" "$PY" "$LABEL" "http://127.0.0.1:$PORT_ANS/api" "$BLABEL" <<'EOF'
 import json, os, sys
-src, dst, jid, name, folder, tz, store, py, label, api = sys.argv[1:]
+src, dst, jid, name, folder, tz, store, py, label, api, blabel = sys.argv[1:]
 want = {("owner", "jid"): jid, ("owner", "name"): name, ("owner", "folder"): folder,
         ("owner", "timezone"): tz, ("bridge", "store"): store, ("bridge", "api"): api,
-        ("launchd", "label"): label, ("launchd", "python"): py}
+        ("launchd", "label"): label, ("launchd", "python"): py, ("install", "bridge_label"): blabel}
 sec, out, done = "", [], set()
 for line in open(src).read().splitlines(True):
     s = line.strip()
@@ -377,13 +383,17 @@ else
         kill -0 "$BPID" 2>/dev/null || break
         if health; then paired=1; break; fi
       done
-      kill "$BPID" 2>/dev/null || true
-      wait "$BPID" 2>/dev/null || true
-      trap - EXIT INT TERM
+      if [ "$paired" = 0 ] || [ "$JOBS" != n ]; then   # JOBS=n: keep it up for the check; the EXIT trap stops it
+        kill "$BPID" 2>/dev/null || true
+        wait "$BPID" 2>/dev/null || true
+        trap - EXIT INT TERM
+      fi
       [ "$paired" = 1 ] || die "the bridge did not connect (QR not scanned in time, or it stopped). Run ./install.sh again."
       printf '\n'; ok "Paired and connected"; lore paired ok
     fi
     run mkdir -p "$LOG_DIR"; run chmod 700 "$LOG_DIR"
+    if [ "$JOBS" = n ]; then info "RELAY_JOBS=n: the caller starts the bridge job ($BRIDGE_LABEL)."
+    else
     esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
     if [ "$DRY" = 1 ]; then info "[dry-run] write $BRIDGE_PLIST from launchd/bridge.plist.template"
     else
@@ -400,6 +410,7 @@ else
       for _ in $(seq 1 15); do health && break; sleep 2; done
       health && ok "Bridge runs in the background ($BRIDGE_LABEL). Log: $LOG_DIR/bridge.log" \
              || die "the bridge job started but does not answer. Look in $LOG_DIR/bridge.log"
+    fi
     fi
   fi
 fi
@@ -421,7 +432,10 @@ lore check ok
 
 # ---------- 6. start ----------
 step "6/6  Start the relay"
-if yes_no START "Start the relay now, and on every login?" y; then
+if [ "$JOBS" = n ]; then
+  info "RELAY_JOBS=n: the caller starts the relay job ($RELAY_LABEL)."
+  lore start skip
+elif yes_no START "Start the relay now, and on every login?" y; then
   # install-launchd.sh reads the config with the python3 first on PATH: make that the 3.11+ one.
   PATH="$(dirname "$PY"):$PATH" run "$ROOT/scripts/install-launchd.sh" "$CONFIG" --load
   remember "launchd $RELAY_LABEL"
