@@ -39,7 +39,7 @@ step() { printf '\n%s==> %s%s\n' "$B" "$1" "$N"; }
 ok()   { printf '  %sok%s    %s\n' "$G" "$N" "$1"; }
 info() { printf '  %s\n' "$1"; }
 warn() { printf '  %swarn%s  %s\n' "$Y" "$N" "$1"; }
-die()  { lore fail "${1%%$'\n'*}"; printf '\n%sStopped:%s %s\n' "$R" "$N" "$1" >&2; exit 1; }
+die()  { lore fail "$(printf '%s' "$1" | tr '\n' ' ' | tr -s ' ')"; printf '\n%sStopped:%s %s\n' "$R" "$N" "$1" >&2; exit 1; }
 # lore ID STATUS [detail]: one machine-readable progress line, only under --yes (apps parse it).
 lore() { [ "$YES" = 1 ] && printf 'LORE-STEP %s\n' "$*"; return 0; }
 
