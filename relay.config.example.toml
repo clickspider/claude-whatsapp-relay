@@ -84,6 +84,9 @@ agents_dir = "agents"
 typing = true
 # Reactions on your message: 👀 got it, ⏳ long job, ✅ done, ⚠️ failed.
 reactions = true
+# Claude may pick a fitting emoji instead of ✅ (❤️ sweet, 😂 joke, 🙏 thanks, 🎉 good news);
+# a reaction alone can be the whole answer. Needs reactions = true. false = always ✅.
+context_reactions = true
 # Mark your message as read (blue ticks) when the relay picks it up.
 mark_read = true
 # Add ⏳ after this many seconds. 0 = never.

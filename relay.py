@@ -45,7 +45,8 @@ DEFAULTS = {
               "whisper_model": "models/ggml-large-v3-turbo-q5_0.bin", "whisper_language": "auto",
               "state_dir": "state",
               "agents_dir": "agents"},
-    "feedback": {"typing": True, "reactions": True, "mark_read": True, "long_job_seconds": 180,
+    "feedback": {"typing": True, "reactions": True, "context_reactions": True, "mark_read": True,
+                 "long_job_seconds": 180,
                  "poll_seconds": 2, "group_digest_after_seconds": 120},
     "limits": {"per_minute": 6, "per_day": 150, "group_buffer_max": 40, "run_timeout_seconds": 600,
                "history_grace_seconds": 600, "history_messages": 200, "send_jitter_seconds": [1.5, 4.0]},
@@ -219,6 +220,8 @@ def validate(cfg):
             err.append(f"agent {n}: ask_contact needs trust = \"reply\" (a question to the contact skips your OK).")
     if not isinstance(cfg["ui"]["polls"], bool):
         err.append("ui.polls must be true or false.")
+    if not isinstance(cfg["feedback"]["context_reactions"], bool):
+        err.append("feedback.context_reactions must be true or false.")
     return err, warn
 
 
@@ -271,6 +274,7 @@ def owner_system(cfg):
         base += ("\nCHOICES: when you need a decision, add a line '@@ASK: <question> | <option> | <option>' "
                  "(2 to 12 options). It arrives as a WhatsApp poll. The vote comes back as your next message, "
                  "'ANSWER: <option>'.")
+    base += react_prompt(cfg)
     voice = owner_voice(cfg)
     if voice:
         base += ("\nOWNER'S VOICE: below is the owner's own writing style guide (voice.md in the dossier, "
@@ -347,7 +351,7 @@ def agent_args(cfg, a, sid, new):
         args += ["--settings", json.dumps(settings)]
     voice = owner_voice(cfg) if agent_voice(a) else ""
     # One --append-system-prompt (a second one would replace the first): security always, voice opt-in.
-    args += ["--append-system-prompt", AGENT_SECURITY + ("\nYou write in the owner's name. Write like the owner. "
+    args += ["--append-system-prompt", AGENT_SECURITY + react_prompt(cfg) + ("\nYou write in the owner's name. Write like the owner. "
              "Style guide follows.\n" + voice if voice else "")]
     return args + ["--session-id" if new else "--resume", sid]
 
@@ -608,6 +612,47 @@ def typing_while(chat, stop):
         pass
 
 
+REACT_EMOJI = "👍 ❤️ 😂 🤣 🙏 🎉 😊 😍 🥰 🔥 👏 💪 🤗 😅 🙌 ✨ 👌 💯 😮 🫶".split()
+_REACT_OK = {e.replace("\ufe0f", ""): e for e in REACT_EMOJI}
+REACT_RE = re.compile(r"^\s*@@REACT\s*:?\s*(.*)$")
+_react = threading.local()  # the reaction the answer picked, for the with_feedback running in this thread
+
+
+def react_on(cfg):
+    fb = cfg["feedback"]
+    return bool(fb.get("reactions") and fb.get("context_reactions"))
+
+
+def react_prompt(cfg):
+    if not react_on(cfg):
+        return ""
+    return ("\nREACTION: you may react to the message with ONE emoji that fits its tone: put a line "
+            "'@@REACT: <emoji>' in your answer. Only when it fits: ❤️ sweet, 😂 joke, 🙏 thanks, 🎉 good news, "
+            "👍 simple OK. Never for serious or sad news, unless 🙏 or ❤️ fits. When the reaction is the whole "
+            "answer (e.g. to 'thanks!'), write only that line and no text.")
+
+
+def take_react(text):
+    """'@@REACT: <emoji>' lines -> (rest of the text, emoji or None). Lines are always removed;
+    only an emoji from REACT_EMOJI counts, anything else is ignored."""
+    keep, emoji = [], None
+    for line in (text or "").splitlines():
+        m = REACT_RE.match(line)
+        if m:
+            emoji = emoji or _REACT_OK.get(m.group(1).strip().replace("\ufe0f", ""))
+        else:
+            keep.append(line)
+    return "\n".join(keep).strip(), emoji
+
+
+def pick_react(chat, emoji):
+    """Use the emoji instead of ✅, only for the message with_feedback is marking in this chat.
+    No with_feedback (a listening group not addressed) = no reaction."""
+    slot = getattr(_react, "slot", None)
+    if emoji and slot and slot["chat"] == chat and react_on(CFG):
+        slot["emoji"] = emoji
+
+
 def with_feedback(chat, msg_id, sender, fn):
     """Status on the message: 👀 got it / ⏳ long job / ✅ done / ⚠️ failed, plus "typing..."
     while Claude works. Each part can be switched off in [feedback]."""
@@ -625,14 +670,16 @@ def with_feedback(chat, msg_id, sender, fn):
     if fb["long_job_seconds"]:
         threading.Thread(target=lambda: stop.wait(fb["long_job_seconds"]) or mark("⏳"),
                          daemon=True).start()
+    _react.slot = {"chat": chat, "emoji": None}
     try:
         fn()
-        mark("✅")
+        mark(_react.slot["emoji"] or "✅")
     except Exception:
         mark("⚠️")
         raise
     finally:
         stop.set()
+        _react.slot = None
 
 
 class ClaudeLimit(Exception):
@@ -811,7 +858,8 @@ def owner_turn(msg_id, text, media_type, batch=None):
                 + "\n\n".join(f"[{i}] {t}" for i, (t, _) in enumerate(preps, 1)))
         voice = any(v for _, v in preps)
     voice = voice and CFG["owner"]["voice_replies"]
-    answer = apply_fixes(OWNER, ask_owner_claude(text))
+    answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(text)))
+    pick_react(OWNER, emoji)
     qm = re.search(r"^\s*@@QUOTE\s*:?.*$", answer, re.M)
     quote = (msg_id, OWNER, text) if qm else None
     answer = re.sub(r"^\s*@@QUOTE\s*:?.*$\n?", "", answer, flags=re.M).strip()
@@ -1022,9 +1070,12 @@ def log_thread(a, who, text, en="", dry=False):
 
 def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     """Route the agent's answer: to the chat, or held for the owner, plus notes to the owner."""
-    out = apply_fixes(OWNER if dry else jid, out)
+    out, emoji = take_react(apply_fixes(OWNER if dry else jid, out))
     body, m = parse(out)
     name, owner = a["name"], CFG["owner"]["name"]
+    held = (m["HOLD"] or a["trust"] == "draft" or hold) and allow_hold
+    if not held:  # a held draft is not reviewed yet: its reaction never goes out
+        pick_react(OWNER if dry else jid, emoji)
     for note in m["NOTE"]:
         send_text(OWNER, f"🔔 {name}: {note}")
     if m["NEXT_CHECKIN"]:
@@ -1035,7 +1086,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         ask(jid if to_contact else OWNER, q if to_contact else f"{name} asks: {q}", opts, kind="ask", agent=name)
     if not body:
         return
-    if (m["HOLD"] or a["trust"] == "draft" or hold) and allow_hold:
+    if held:
         flag(a, "pending", body)
         log_thread(a, f"AGENT (held for {owner})", body, m["EN"], dry)
         send_text(OWNER, f"📝 Draft for {name}, held for your OK.\nEN: {m['EN'] or '(no gist)'}\n\n"

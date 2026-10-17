@@ -83,7 +83,7 @@ and follow its SETUP.md with me, one question at a time.
 | 🧑‍🤝‍🧑 **Agents per contact** | Optional. A locked Claude for one contact or group, with its own role in `RULES.md` and its own folder. Replies wait for your `/<name> ok` until you trust it. |
 | ↩️ **Quote-replies** | Claude can answer as a WhatsApp reply to one message. In a group, replying to the agent's message talks to it. |
 | 🌙 **Quiet hours** | Agents never start a conversation at night or on your days off. Replies still go out. |
-| 👀 **Feedback** | 👀 when it got your message, ⏳ on a long job, ✅ when done, "typing…" while Claude works. |
+| 👀 **Feedback** | 👀 when it got your message, ⏳ on a long job, ✅ when done, "typing…" while Claude works. Claude may swap ✅ for a fitting emoji (❤️, 😂, 🙏, 🎉): `[feedback] context_reactions`. |
 
 ## Commands in your chat
 
