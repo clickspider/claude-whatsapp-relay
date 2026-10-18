@@ -38,7 +38,7 @@ DEFAULTS = {
               "voice_file": "voice.md",
               "tools": FILE_TOOLS, "permission_mode": "acceptEdits", "mcp_config": "",
               "allowed_tools": [], "denied_tools": [], "extra_dirs": [],
-              "inherit_global_setup": False, "batch_seconds": 3},
+              "inherit_global_setup": False, "chrome": False, "batch_seconds": 3},
     "bridge": {"api": "http://127.0.0.1:8080/api", "store": "",
                "outbox": "~/.local/share/whatsapp-mcp/outbox"},
     "paths": {"claude": "claude", "ffmpeg": "ffmpeg", "whisper_cli": "whisper-cli",
@@ -52,7 +52,7 @@ DEFAULTS = {
                "history_grace_seconds": 600, "history_messages": 200, "send_jitter_seconds": [1.5, 4.0]},
     "quiet_hours": {"timezone": "", "start": 21, "end": 9, "days_off": [], "early_close": {}},
     "groups": {"self_tags": []},
-    "ui": {"polls": False},
+    "ui": {"polls": False, "giphy_api_key": ""},
     "prompts": {"owner_says": "OWNER SAYS: ", "status": "STATUS FOR OWNER", "intro": "INTRO",
                 "checkin": "CHECK-IN TIME", "from_owner_claude": "FROM OWNER'S CLAUDE: ",
                 "owner_note_marker": "OWNER", "group_label": "GROUP.",
@@ -68,11 +68,11 @@ DEFAULTS = {
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
 AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigger": "all",
-                  "self_tags": None, "members": {}, "dir": "", "home": "", "read_also": [],
+                  "self_tags": None, "members": {}, "dir": "", "home": "", "read_also": [], "write_also": [],
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
                   "unrestricted": False, "load_claude_connectors": False, "plugin_dirs": [], "max_context_tokens": 200_000, "inbox": False,
-                  "group_label": "", "ask_contact": False, "use_owner_voice": None}
+                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False}
 
 
 # ---------- config ----------
@@ -126,6 +126,7 @@ def normalize_agent(cfg, a, base):
     a["home"] = _path(a["home"], base) or os.path.join(a["dir"], "home")
     a["read_also"] = [_path(d, base) for d in a["read_also"]]
     a["read_only"] = [_path(d, base) for d in a["read_only"]]
+    a["write_also"] = [_path(d, base) for d in a["write_also"]]
     a["plugin_dirs"] = [_path(d, base) for d in a["plugin_dirs"]]
     a["extra_mcp_config"] = _path(a["extra_mcp_config"], base)
     a["timezone"] = a["timezone"] or cfg["quiet_hours"]["timezone"]
@@ -304,6 +305,8 @@ def owner_args(cfg, sid, new):
                  "--strict-mcp-config"]
         if o["mcp_config"]:
             args += ["--mcp-config", o["mcp_config"]]
+    if o["chrome"]:
+        args.append("--chrome")
     for x in dirs:
         args += ["--add-dir", x]
     return args + ["--session-id" if new else "--resume", sid]
@@ -322,7 +325,8 @@ def agent_args(cfg, a, sid, new):
         con = a["load_claude_connectors"]
         args = [claude, "-p", "--setting-sources", "user" if con else "", "--tools", tools,
                 "--allowedTools", ",".join(a["extra_allowed_tools"] + ["Read", "Glob", "Grep",
-                                                                      f"Edit(/{a['home']}/**)"]),
+                                                                      f"Edit(/{a['home']}/**)"]
+                                         + [f"{t}(/{d}/**)" for d in a["write_also"] for t in ("Edit", "Write")]),
                 "--disallowedTools", ",".join(a["extra_disallowed_tools"]),
                 "--append-system-prompt-file", rules, "--add-dir", a["home"]]
         if con:
@@ -340,7 +344,7 @@ def agent_args(cfg, a, sid, new):
         if a["extra_disallowed_tools"]:
             args += ["--disallowedTools", ",".join(a["extra_disallowed_tools"])]
         deny = [f"Edit(/{rules})", f"Write(/{rules})"]  # the contact must not rewrite the rules
-    for extra in a["read_also"]:
+    for extra in a["read_also"] + [d for d in a["write_also"] if d not in a["read_also"]]:
         args += ["--add-dir", extra]
     for d in a["plugin_dirs"]:
         args += ["--plugin-dir", d]
@@ -527,6 +531,46 @@ def send_voice(chat, text):
         send_text(chat, text)
     finally:
         for ext in (".aiff", ".ogg"):
+            if os.path.exists(base + ext):
+                os.remove(base + ext)
+
+
+def send_gif(chat, query, sticker=False):
+    """@@GIF / @@STICKER: one GIPHY search (rating g), a random top-5 hit, sent as a looping GIF or a
+    512x512 webp sticker. Only the short search words leave the laptop. Any failure: nothing is sent."""
+    key = CFG["ui"]["giphy_api_key"]
+    if not key or not query.strip():
+        return
+    base = os.path.join(CFG["bridge"]["outbox"], f"gif-{uuid.uuid4().hex}")
+    try:
+        os.makedirs(CFG["bridge"]["outbox"], exist_ok=True)
+        qs = urllib.parse.urlencode({"api_key": key, "q": query.strip()[:50], "limit": 5, "rating": "g"})
+        url = f"https://api.giphy.com/v1/{'stickers' if sticker else 'gifs'}/search?{qs}"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            hits = json.load(r).get("data") or []
+        if not hits:
+            return
+        img = random.choice(hits)["images"]
+        src = (img.get("original") or {}).get("url" if sticker else "mp4") or (img.get("fixed_height") or {}).get("mp4")  # sticker: the .gif (ffmpeg cannot read animated webp)
+        if not src or not src.startswith("https://"):
+            return
+        urllib.request.urlretrieve(src, base + ".src")
+        if sticker:
+            out = base + ".sticker.webp"
+            subprocess.run([CFG["paths"]["ffmpeg"], "-loglevel", "error", "-y", "-i", base + ".src", "-t", "6",
+                            "-vf", "fps=15,scale=512:512:force_original_aspect_ratio=decrease,"
+                                   "pad=512:512:-1:-1:color=0x00000000",
+                            "-c:v", "libwebp_anim", "-loop", "0", "-q:v", "50", "-an", out], check=True, timeout=120)
+        else:
+            out = base + ".gif.mp4"
+            subprocess.run([CFG["paths"]["ffmpeg"], "-loglevel", "error", "-y", "-i", base + ".src", "-t", "8",
+                            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            "-movflags", "+faststart", "-an", out], check=True, timeout=120)
+        api("send", {"recipient": chat, "message": "", "media_path": out})
+    except Exception as e:
+        print(f"gif/sticker failed: {e}", flush=True)
+    finally:
+        for ext in (".src", ".sticker.webp", ".gif.mp4"):
             if os.path.exists(base + ext):
                 os.remove(base + ext)
 
@@ -1024,8 +1068,8 @@ def write_history(a):
 
 def parse(out):
     note = CFG["prompts"]["owner_note_marker"]
-    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "QUOTE": ""}
-    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|QUOTE)\s*:?\s*(.*)$")  # OWNER = template name, always private
+    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "QUOTE": "", "GIF": "", "STICKER": ""}
+    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|QUOTE|GIF|STICKER)\s*:?\s*(.*)$")  # OWNER = template name, always private
     for line in out.splitlines():
         m = rx.match(line)
         if not m:
@@ -1097,6 +1141,8 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     log_thread(a, "AGENT", body, m["EN"], dry)
     quote = (refs or {}).get(m["QUOTE"].split()[0] if m["QUOTE"] else "")
     send_text(OWNER if dry else jid, (f"[dry run → {name}]\n" if dry else "") + body, quote=quote)
+    if a["gifs"] and (m["GIF"] or m["STICKER"]):
+        send_gif(OWNER if dry else jid, m["STICKER"] or m["GIF"], sticker=bool(m["STICKER"]))
 
 
 def member(a, sender):
@@ -1483,10 +1529,9 @@ def is_quiet(t, q):
 def due_checkins():
     q = CFG["quiet_hours"]
     t = datetime.datetime.now(ZoneInfo(q["timezone"]))
-    if is_quiet(t, q):
-        return
+    quiet = is_quiet(t, q)
     for a in agents(CFG):
-        if not a["live"] or flag(a, "paused"):
+        if not a["live"] or flag(a, "paused") or (quiet and a["quiet_hours"]):  # quiet_hours = false: agent ignores [quiet_hours]
             continue
         deliver_inbox(a)
         when = a["checkins"] and flag(a, "next-checkin")
@@ -1652,6 +1697,9 @@ def risk_lines(cfg):
         ("MED" if o["allowed_tools"] else "LOW", "owner.allowed_tools",
          ", ".join(o["allowed_tools"]) or "none pre-approved"),
         ("INFO", "owner.denied_tools", ", ".join(o["denied_tools"]) or "none"),
+        ("HIGH" if o["chrome"] else "LOW", "owner.chrome",
+         "Claude in Chrome ON: a message in your chat can make Claude click in your logged-in browser"
+         if o["chrome"] else "off: no browser"),
         ("MED" if o["extra_dirs"] else "LOW", "owner.extra_dirs", ", ".join(o["extra_dirs"]) or "none"),
         ("LOW", "owner.media_dir", f"files you send are copied to {o['media_dir']}"
                                    if o["media_dir"] else "files you send stay in the bridge's media folder"),
@@ -1706,7 +1754,8 @@ def risk_lines(cfg):
                     + (f", extra tools: {', '.join(web)}" if web else "")
                     + (f", plugins: {', '.join(a['plugin_dirs'])}" if a["plugin_dirs"] else "")
                     + (", @@ASK polls go to the contact" if a["ask_contact"] else "")
-                    + (f", reads also {a['read_also']}" if a["read_also"] else "")))
+                    + (f", reads also {a['read_also']}" if a["read_also"] else "")
+                    + (f", WRITES also {a['write_also']}" if a["write_also"] else "")))
     return out
 
 

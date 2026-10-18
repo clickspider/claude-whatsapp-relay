@@ -55,6 +55,9 @@ extra_dirs = []
 # HIGH. true = ignore tools/permission_mode/mcp_config above and use your global Claude setup
 # (every tool, every MCP server, your permission mode). Only for an owner who knows why.
 inherit_global_setup = false
+# HIGH. true = start your Claude with --chrome (Claude in Chrome): it can click in your
+# logged-in browser, so anyone who can write in your chat can too.
+chrome = false
 
 [bridge]
 # The whatsapp-mcp bridge REST API. Must stay on 127.0.0.1 (the token is sent with every call).
@@ -141,6 +144,9 @@ self_tags = ["claude"]
 # back as "ANSWER to ...". Only votes from the chat the poll went to count, each poll acts once.
 # false = old behavior: typed commands, and @@ASK arrives as a numbered list.
 polls = false
+# LOW. Free key from developers.giphy.com: agents with gifs = true may send GIFs and stickers.
+# Only the search words go to GIPHY. "" = off.
+giphy_api_key = ""
 
 [prompts]
 # Fixed words the relay sends to agents. Your agents' RULES.md should use the same words.
@@ -226,8 +232,11 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # members = { "31600000002" = "Sam" }    # group sender number -> name shown to the agent
 # home = "agents/alex/home"              # its only writable folder (default: agents/<name>/home)
 # read_also = []                         # extra folders it may use (MED: it can read them)
+# write_also = []                        # MED: extra folders it may edit + create files in
 # read_only = []                         # files/folders it must never edit
 # checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
+# quiet_hours = true                     # false = this agent ignores [quiet_hours] (check-ins + inbox notes any time)
+# gifs = false                           # true = it may add @@GIF: <words> or @@STICKER: <words> (needs ui.giphy_api_key)
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
 # use_owner_voice = true                 # write like you (owner.voice_file). Not set = on only in own-number
 #                                        # mode, where its replies come from your own number; with a second
