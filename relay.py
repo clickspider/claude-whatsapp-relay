@@ -607,6 +607,21 @@ def quotes_us(chat, msg_id):
     return bool(row)
 
 
+def quoted_text(chat, msg_id):
+    """Text of the message this one replies to (quotes), or ''."""
+    c = db("messages.db")
+    try:
+        row = c.execute("SELECT q.content, q.is_from_me FROM messages m JOIN messages q "
+                        "ON q.id = m.quoted_message_id AND q.chat_jid = m.chat_jid "
+                        "WHERE m.id = ? AND m.chat_jid = ?", (msg_id, chat)).fetchone()
+    except sqlite3.OperationalError:  # older bridge without quoted_message_id
+        row = None
+    c.close()
+    if not row or not row[0]:
+        return ""
+    return f"[Replying to {'your' if row[1] else 'their own'} message: \"{row[0][:500]}\"]\n"
+
+
 FIX_RE = re.compile(r"^\s*@@(EDIT_LAST|DELETE_LAST)\s*:?\s*(.*)$", re.S)
 
 
@@ -880,6 +895,7 @@ def owner_prep(msg_id, text, media_type):
         else:
             path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
+    text = quoted_text(OWNER, msg_id) + text
     return text, voice or text.lower().startswith("voice")
 
 

@@ -232,6 +232,23 @@ class QuoteTrigger(unittest.TestCase):
             finally:
                 relay.CFG = old
 
+    def test_quoted_text_shown(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            c = sqlite3.connect(os.path.join(tmp, "messages.db"))
+            c.execute("CREATE TABLE messages (id TEXT, chat_jid TEXT, content TEXT, is_from_me BOOLEAN, quoted_message_id TEXT)")
+            c.executemany("INSERT INTO messages VALUES (?,?,?,?,?)", [
+                ("a", "o", "add meeting 14:30", 0, None), ("b", "o", "changed to 13:00", 0, "a"),
+                ("c", "o", "hi", 0, None)])
+            c.commit(); c.close()
+            old = relay.CFG
+            relay.CFG = {"bridge": {"store": tmp}}
+            try:
+                self.assertIn("add meeting 14:30", relay.quoted_text("o", "b"))
+                self.assertEqual(relay.quoted_text("o", "c"), "")
+            finally:
+                relay.CFG = old
+
 
 class AgentAutoNew(unittest.TestCase):
     def test_big_agent_session_rotates_with_handoff(self):
