@@ -196,6 +196,17 @@ check_hours = 6
 # On battery (or with the lid closed and no display) the Mac can still sleep: the log warns you. LOW.
 keep_awake = true
 
+[threads]
+# Your chat works like a Claude Project. It becomes the coordinator: it answers small things itself and
+# starts a thread for real work. Each thread is its own Claude session with your owner settings (same
+# folder, tools and permissions) and runs in parallel, so a long task never blocks your chat.
+# Thread messages start with "#<n> <title>:". Swipe-reply to one, or start your message with "#<n>",
+# to talk to that thread. /threads lists the open ones, /done <n> closes one. Threads only talk to you.
+# MED: more parallel Claude runs = more usage. false = one conversation (old behavior).
+enabled = false
+# Max threads that run Claude at the same time. The others wait their turn.
+max_parallel = 3
+
 [launchd]
 # Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.
 label = "com.example.claude-whatsapp-relay"

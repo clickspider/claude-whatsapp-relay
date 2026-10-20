@@ -83,12 +83,14 @@ and follow its SETUP.md with me, one question at a time.
 | 🧑‍🤝‍🧑 **Agents per contact** | Optional. A locked Claude for one contact or group, with its own role in `RULES.md` and its own folder. Replies wait for your `/<name> ok` until you trust it. |
 | ↩️ **Quote-replies** | Claude can answer as a WhatsApp reply to one message. In a group, replying to the agent's message talks to it. |
 | 🌙 **Quiet hours** | Agents never start a conversation at night or on your days off. Replies still go out. |
+| 🧵 **Threads** | Optional (`[threads]`). Your chat works like a Claude Project: it starts a thread for each real task, threads run in parallel, and each reply carries its tag (`#3 flat move: ...`). |
 | 👀 **Feedback** | 👀 when it got your message, ⏳ on a long job, ✅ when done, "typing…" while Claude works. Claude may swap ✅ for a fitting emoji (❤️, 😂, 🙏, 🎉): `[feedback] context_reactions`. |
 
 ## Commands in your chat
 
 - Anything: goes to your Claude. Start with "voice" to get a voice-note answer.
 - `/new`: fresh conversation (a short hand-off carries over).
+- With `[threads] enabled = true`: `/threads` (open threads and what each waits on), `/threads all`, `/done 3` (close thread 3). Swipe-reply to a thread's message, or start with `#3`, to talk to thread 3.
 - For an agent named `alex`: `/alex ok` (send the held draft), `/alex status`, `/alex pause`, `/alex resume`, `/alex intro`, `/alex <your words>`, `/asalex <text>` (dry run: you play the contact).
 
 ## Set it up by hand
