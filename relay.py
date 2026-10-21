@@ -54,7 +54,8 @@ DEFAULTS = {
     "groups": {"self_tags": []},
     "ui": {"polls": False, "giphy_api_key": ""},
     "prompts": {"owner_says": "OWNER SAYS: ", "status": "STATUS FOR OWNER", "intro": "INTRO",
-                "checkin": "CHECK-IN TIME", "from_owner_claude": "FROM OWNER'S CLAUDE: ",
+                "checkin": "CHECK-IN TIME", "reminder": "REMINDER DUE (you set this earlier with @@REMIND):",
+                "from_owner_claude": "FROM OWNER'S CLAUDE: ",
                 "owner_note_marker": "OWNER", "group_label": "GROUP.",
                 "limit_reached": "I hit my Claude limit. Back at {time}.",
                 "limit_later": "I hit my Claude limit. Back later."},
@@ -1240,8 +1241,8 @@ def write_history(a):
 
 def parse(out):
     note = CFG["prompts"]["owner_note_marker"]
-    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "QUOTE": "", "GIF": "", "STICKER": ""}
-    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|QUOTE|GIF|STICKER)\s*:?\s*(.*)$")  # OWNER = template name, always private
+    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "REMIND": [], "QUOTE": "", "GIF": "", "STICKER": ""}
+    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|REMIND|QUOTE|GIF|STICKER)\s*:?\s*(.*)$")  # OWNER = template name, always private
     for line in out.splitlines():
         m = rx.match(line)
         if not m:
@@ -1250,6 +1251,8 @@ def parse(out):
             marks["NOTE"].append(m.group(2))
         elif m.group(1) == "HOLD":
             marks["HOLD"] = True
+        elif m.group(1) == "REMIND":
+            marks["REMIND"].append(m.group(2).strip())
         else:
             marks[m.group(1)] = m.group(2).strip()
     return "\n".join(body).strip(), marks
@@ -1296,6 +1299,9 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         send_text(OWNER, f"🔔 {name}: {note}")
     if m["NEXT_CHECKIN"]:
         flag(a, "next-checkin", m["NEXT_CHECKIN"])
+    for r in m.get("REMIND", []):
+        if not a["checkins"] or not add_reminder(a, r):
+            send_text(OWNER, f"🔔 {name}: reminder NOT set ({'checkins are off' if not a['checkins'] else 'bad format'}): {r}")
     body, asks = take_asks(body)
     for q, opts in asks:  # to the owner (private), or to the contact when ask_contact is on
         to_contact = a["ask_contact"] and not dry
@@ -1700,6 +1706,53 @@ def is_quiet(t, q):
     return (t.hour >= s or t.hour < e) if s > e else (s <= t.hour < e)
 
 
+REMIND_FMT = "%Y-%m-%d %H:%M"
+_remind_lock = threading.Lock()
+
+
+def parse_reminder(line, tz):
+    """'YYYY-MM-DD HH:MM | note' (agent's local time) -> (aware datetime, note) or None."""
+    when, sep, note = line.partition("|")
+    try:
+        due = datetime.datetime.strptime(when.strip(), REMIND_FMT).replace(tzinfo=ZoneInfo(tz))
+    except ValueError:
+        return None
+    return (due, note.strip()) if sep and note.strip() else None
+
+
+def split_due(lines, now, tz):
+    """-> (due lines, lines to keep). Bad lines are dropped. Each due line fires once, however late."""
+    due, keep = [], []
+    for l in lines:
+        r = parse_reminder(l, tz)
+        if r:
+            (due if now >= r[0] else keep).append(l)
+    return due, keep
+
+
+def add_reminder(a, line):
+    """@@REMIND: one line in <agent dir>/reminders. Returns False on a bad line."""
+    if not parse_reminder(line, a["timezone"]):
+        return False
+    with _remind_lock:
+        flag(a, "reminders", (flag(a, "reminders") or "").rstrip("\n") + "\n" + line.strip())
+    return True
+
+
+def fire_reminders(a):
+    with _remind_lock:
+        lines = [l for l in (flag(a, "reminders") or "").splitlines() if l.strip()]
+        due, keep = split_due(lines, agent_now(a), a["timezone"])
+        if not due:
+            return
+        flag(a, "reminders", "\n".join(keep))  # remove first: never fire twice
+    text = "\n".join(f"- {l}" for l in due)
+    print(f"{owner_now():%H:%M} reminders due for {a['name']}: {len(due)}", flush=True)
+    log_thread(a, "REMINDER DUE", text)
+    prompt = f"{CFG['prompts']['reminder']}\n{text}\n(now {agent_now(a):{REMIND_FMT}})"
+    enqueue(a["name"], lambda: deliver(a["jid"], a, run_agent(a, prompt), False))
+
+
 def due_checkins():
     q = CFG["quiet_hours"]
     t = datetime.datetime.now(ZoneInfo(q["timezone"]))
@@ -1708,6 +1761,8 @@ def due_checkins():
         if not a["live"] or flag(a, "paused") or (quiet and a["quiet_hours"]):  # quiet_hours = false: agent ignores [quiet_hours]
             continue
         deliver_inbox(a)
+        if a["checkins"]:
+            fire_reminders(a)
         when = a["checkins"] and flag(a, "next-checkin")
         if not when:
             continue

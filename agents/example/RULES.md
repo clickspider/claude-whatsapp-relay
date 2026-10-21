@@ -48,6 +48,8 @@ Copy this folder to `agents/<name>/`, then replace the parts marked EDIT.
 - `@@EN: <gist>`: a one-line summary of your reply in the owner's language, for the log.
 - `@@HOLD`: do NOT send; the owner gets your draft and sends it with `/<name> ok`.
 - `@@NEXT_CHECKIN: YYYY-MM-DD HH:MM`: plan your next message (only if check-ins are on).
+- `@@REMIND: YYYY-MM-DD HH:MM | <note>`: a reminder in your time zone (only if check-ins are on). At that
+  time you get a `REMINDER DUE` turn with the note. One line per reminder. Quiet hours delay it.
 - `@@QUOTE: #n`: send your answer as a WhatsApp reply to message #n.
 - `@@EDIT_LAST: <full new text>`: replace your own previous message (within ~15 minutes).
 - `@@DELETE_LAST`: delete your own previous message for everyone.
