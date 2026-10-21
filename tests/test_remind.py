@@ -28,6 +28,14 @@ class RemindTests(unittest.TestCase):
         # same instant seen from Israel (11:00 there) is still due: times are absolute
         self.assertEqual(relay.split_due(lines[:1], now.astimezone(ZoneInfo("Asia/Jerusalem")), TZ)[0], lines[:1])
 
+    def test_self_per_day_cap(self):
+        ok, d = relay.self_start_ok, "2026-10-22"
+        self.assertTrue(ok(0, ["2026-10-22 09:00"] * 5, "", d))  # 0 = no cap
+        self.assertTrue(ok(1, [], "", d))
+        self.assertTrue(ok(1, ["2026-10-21 18:00"], "", d))  # yesterday does not count
+        self.assertFalse(ok(1, ["2026-10-22 09:00"], "2026-10-22 08:59", d))  # wrote before it
+        self.assertTrue(ok(1, ["2026-10-22 09:00"], "2026-10-22 11:30", d))  # wrote after: open
+
 
 if __name__ == "__main__":
     unittest.main()

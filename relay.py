@@ -74,7 +74,8 @@ AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigg
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
                   "unrestricted": False, "load_claude_connectors": False, "plugin_dirs": [], "max_context_tokens": 200_000, "inbox": False,
-                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False}
+                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False,
+                  "self_per_day": 0}
 
 
 # ---------- config ----------
@@ -1643,6 +1644,7 @@ def route(msg_id, chat, sender, content, media_type):
     if trig.startswith("mention:") and trig.split(":", 1)[1] not in text.lower():
         return
     who = sender if "@" in (sender or "") else f"{sender}@s.whatsapp.net"
+    flag(a, "last-in", f"{agent_now(a):{REMIND_FMT}}")  # self_per_day: they wrote, so the cap opens
     enqueue(a["name"], lambda: with_feedback(chat, msg_id, who, lambda: contact_turn(
         chat, a, msg_id, content, media_type, sender=sender)))
 
@@ -1739,11 +1741,28 @@ def add_reminder(a, line):
     return True
 
 
+def self_start_ok(cap, sent, last_in, today):
+    """self_per_day: at most `cap` self-started messages a day (0 = no cap), unless the contact
+    wrote after the last one. sent = 'YYYY-MM-DD HH:MM' stamps, last_in = same format or ''."""
+    sent = sorted(x for x in sent if x.startswith(today))
+    return not cap or len(sent) < cap or bool(last_in) and last_in > sent[-1]
+
+
+def may_self_start(a):
+    """True if the agent may send a check-in/reminder now; records the send when it may."""
+    now = f"{agent_now(a):{REMIND_FMT}}"
+    sent = [l for l in (flag(a, "self-sent") or "").splitlines() if l.startswith(now[:10])]
+    if not self_start_ok(a["self_per_day"], sent, flag(a, "last-in") or "", now[:10]):
+        return False
+    flag(a, "self-sent", "\n".join(sent + [now]))
+    return True
+
+
 def fire_reminders(a):
     with _remind_lock:
         lines = [l for l in (flag(a, "reminders") or "").splitlines() if l.strip()]
         due, keep = split_due(lines, agent_now(a), a["timezone"])
-        if not due:
+        if not due or not may_self_start(a):  # capped: stays in the file for tomorrow
             return
         flag(a, "reminders", "\n".join(keep))  # remove first: never fire twice
     text = "\n".join(f"- {l}" for l in due)
@@ -1770,7 +1789,7 @@ def due_checkins():
             due = datetime.datetime.strptime(when.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo(q["timezone"]))
         except ValueError:
             continue
-        if t >= due:
+        if t >= due and may_self_start(a):
             flag(a, "next-checkin", "")
             enqueue(a["name"], lambda a=a: deliver(a["jid"], a, run_agent(a, CFG["prompts"]["checkin"]), False))
 

@@ -247,6 +247,7 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # read_only = []                         # files/folders it must never edit
 # checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
 #                                        # and set reminders with @@REMIND: YYYY-MM-DD HH:MM | note
+# self_per_day = 0                       # max check-ins/reminders a day it starts itself, unless the contact wrote after the last one (0 = no cap)
 # quiet_hours = true                     # false = this agent ignores [quiet_hours] (check-ins + inbox notes any time)
 # gifs = false                           # true = it may add @@GIF: <words> or @@STICKER: <words> (needs ui.giphy_api_key)
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
