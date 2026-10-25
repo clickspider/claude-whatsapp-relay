@@ -203,7 +203,8 @@ keep_awake = true
 # starts a thread for real work. Each thread is its own Claude session with your owner settings (same
 # folder, tools and permissions) and runs in parallel, so a long task never blocks your chat.
 # Thread messages start with "#<n> <title>:". Swipe-reply to one, or start your message with "#<n>",
-# to talk to that thread. /threads lists the open ones, /done <n> closes one. Threads only talk to you.
+# to talk to that thread. /threads lists the open ones, /done <n> closes one. Threads never write to
+# you: their reports go to the coordinator, which sends you one short message with the bottom line.
 # MED: more parallel Claude runs = more usage. false = one conversation (old behavior).
 enabled = false
 # Max threads that run Claude at the same time. The others wait their turn.
@@ -212,6 +213,9 @@ max_parallel = 3
 # Each thread run starts with the part it has not seen, and the coordinator sees the thread news,
 # so a decision made in one place reaches the others. Max characters per run; 0 = off.
 main_chat_chars = 10000
+# Seconds the coordinator waits after a thread result before it writes to you, so results that come
+# close together arrive as ONE message. 0 = right away.
+digest_seconds = 120
 # Threads waiting in review this many hours close by themselves (a reply opens them again). 0 = never.
 auto_close_hours = 72
 # Effort (claude --effort low|medium|high|xhigh|max; "" = the CLI default). The coordinator may end a

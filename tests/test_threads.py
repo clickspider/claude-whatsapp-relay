@@ -23,7 +23,10 @@ class ThreadTests(unittest.TestCase):
         self.sent, self.jobs = [], []
         self.p = [mock.patch.object(relay, "send_text", lambda c, t, quote=None: self.sent.append(t)),
                   mock.patch.object(relay, "enqueue", lambda k, fn: self.jobs.append((k, fn))),
-                  mock.patch.object(relay, "quoted_text", lambda c, m: "")]
+                  mock.patch.object(relay, "quoted_text", lambda c, m: ""),
+                  mock.patch.object(relay, "digest_soon", lambda: self.digests.append(1))]
+        self.digests = []
+        relay._digest.update(due=False, timer=None)
         for p in self.p:
             p.start()
 
@@ -36,8 +39,8 @@ class ThreadTests(unittest.TestCase):
 
     def test_config(self):
         self.assertEqual(relay.validate(relay.CFG)[0], [])
-        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1, "auto_close_hours": -1, "effort_default": "huge", "effort_high": "", "effort_high_words": []})
-        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 5)
+        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1, "auto_close_hours": -1, "digest_seconds": -1, "effort_default": "huge", "effort_high": "", "effort_high_words": []})
+        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 6)
         self.assertIn("THREADS:", relay.owner_system(relay.CFG))
 
     def test_markers(self):
@@ -55,7 +58,7 @@ class ThreadTests(unittest.TestCase):
         args = rc.call_args[0][0]
         self.assertIn("--session-id", args)
         self.assertTrue(any("THREAD: you work on ONE thread (#1: flat move)" in a for a in args))
-        self.assertEqual(self.sent[-1], "#1 flat move: 3 movers found.")
+        self.assertEqual((self.sent, self.digests), ([], [1]))  # the result goes to the coordinator only
         t = relay.threads_db()["1"]
         self.assertEqual((t["state"], t["last"]), ("review", "3 movers found."))
         self.assertIn("#1 flat move [review]", relay.thread_list())
@@ -133,6 +136,71 @@ class ThreadTests(unittest.TestCase):
         self.assertNotIn("THREAD NEWS", prompts[1])  # its own turn is not news
         self.assertEqual(self.sent[-1], "Fine.")
 
+    def test_threads_report_to_the_coordinator(self):
+        relay.threads_db("4", title="trip", state="working", sid="", last="")
+        relay.threads_db("5", title="t212", state="working", sid="", last="")
+        relay.main_log("DANIEL to #4", "ask lara")  # not a result: no digest for it alone
+        relay._digest["due"] = True
+        prompts, asks = [], []
+        fake = mock.patch.object(relay, "ask_owner_claude", lambda p: prompts.append(p) or
+                                 "Bottom line: nothing to do, Lara picks the hotel.\n@@ASK: Sell tomorrow? | yes | no")
+        with fake, mock.patch.object(relay, "apply_fixes", lambda c, t: t), \
+                mock.patch.object(relay, "ask", lambda c, q, o, kind: asks.append((q, o))):
+            relay.coordinator_digest()
+            self.assertEqual(prompts, [])
+            for n, out in (("4", "Hotel needs dates.\n@@STATE: blocked"), ("5", "G2 6/6.\n@@STATE: review")):
+                with mock.patch.object(relay, "run_claude", return_value=R(out)):
+                    relay.thread_run(n, "go")
+            self.assertEqual((self.sent, self.digests), ([], [1, 1]))
+            relay.coordinator_digest()  # two results -> one coordinator turn, one message
+            self.assertEqual(len(prompts), 1)
+            self.assertIn("Hotel needs dates", prompts[0])
+            self.assertIn("G2 6/6", prompts[0])
+            self.assertIn("ask lara", prompts[0])
+            self.assertIn("NO MESSAGE FROM", prompts[0])
+            self.assertEqual(self.sent, ["Bottom line: nothing to do, Lara picks the hotel."])
+            self.assertEqual(asks, [("Sell tomorrow?", ["yes", "no"])])
+            relay.coordinator_digest()  # nothing new: no turn
+            self.assertEqual(len(prompts), 1)
+            # an owner turn in between reads the news itself: the digest then stays quiet
+            with mock.patch.object(relay, "run_claude", return_value=R("done\n@@STATE: done")):
+                relay.thread_run("5", "again")
+            with mock.patch.object(relay, "pick_react", lambda c, e: None):
+                relay.owner_turn("m1", "status?", None)
+            self.assertIn("done", prompts[-1])
+            relay.coordinator_digest()
+            self.assertEqual(len(prompts), 2)
+        with mock.patch.object(relay, "ask_owner_claude", lambda p: "@@SKIP"), \
+                mock.patch.object(relay, "apply_fixes", lambda c, t: t):
+            relay.main_log("#4 trip (review)", "minor")
+            relay._digest["due"] = True
+            n = len(self.sent)
+            relay.coordinator_digest()
+            self.assertEqual(len(self.sent), n)  # @@SKIP sends nothing
+        self.assertIn("never write to the owner", relay.owner_system(relay.CFG))
+
+    def test_digest_waits_and_batches(self):
+        self.p[-1].stop()  # the real digest_soon
+        try:
+            timers = []
+            class T:
+                def __init__(self, sec, fn):
+                    self.sec, self.fn, self.daemon = sec, fn, False
+                    timers.append(self)
+                def start(self): pass
+                def is_alive(self): return not hasattr(self, "fired")
+            with mock.patch.object(relay.threading, "Timer", T):
+                relay.digest_soon()
+                relay.digest_soon()  # inside the wait: same timer
+                self.assertEqual([t.sec for t in timers], [120])
+                timers[0].fn()
+                self.assertEqual(self.jobs[-1], ("owner", relay.coordinator_digest))
+                timers[0].fired = True
+                relay.digest_soon()
+                self.assertEqual(len(timers), 2)
+        finally:
+            self.p[-1].start()
+
     def test_effort_marked_or_automatic(self):
         relay.CFG["threads"].update(effort_default="medium", effort_high_words=["budget"])
         self.assertIn("effort=", relay.owner_system(relay.CFG))
@@ -154,7 +222,7 @@ class ThreadTests(unittest.TestCase):
         with mock.patch.object(relay, "run_claude",
                                return_value=R("Done.\n@@DECISION: no insulation\n@@DECISION [general]: Mac on power\n@@STATE: review")):
             self.jobs[0][1]()  # #1 budget
-        self.assertEqual(self.sent[-1], "#1 a: Done.")  # markers never reach the chat
+        self.assertNotIn("@@", relay.read(relay.st("threads/main.md")))  # markers never reach the timeline
         for i in range(50):  # lots of other news must not push it out
             relay.take_decisions("#2", f"@@DECISION: mom item {i}", "mom")
         relay.threads_db("3", title="c", state="working", sid="", last="", topic="budget")

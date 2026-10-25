@@ -67,7 +67,7 @@ DEFAULTS = {
                 "check_hours": 6},
     "power": {"keep_awake": True},
     "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 10000, "auto_close_hours": 72,
-                "effort_default": "", "effort_high": "", "effort_high_words": []},
+                "digest_seconds": 120, "effort_default": "", "effort_high": "", "effort_high_words": []},
     "launchd": {"label": "com.example.claude-whatsapp-relay", "python": "python3",
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
@@ -241,6 +241,8 @@ def validate(cfg):
         err.append("threads.main_chat_chars must be a whole number >= 0.")
     if not isinstance(t["auto_close_hours"], int) or isinstance(t["auto_close_hours"], bool) or t["auto_close_hours"] < 0:
         err.append("threads.auto_close_hours must be a whole number >= 0.")
+    if not isinstance(t["digest_seconds"], int) or isinstance(t["digest_seconds"], bool) or t["digest_seconds"] < 0:
+        err.append("threads.digest_seconds must be a whole number >= 0.")
     return err, warn
 
 
@@ -947,6 +949,7 @@ def owner_turn(msg_id, text, media_type, batch=None):
         voice = any(v for _, v in preps)
     voice = voice and CFG["owner"]["voice_replies"]
     threads_on = CFG["threads"]["enabled"]
+    _digest["due"] = False  # this turn reads the thread news itself
     listing = thread_list() if threads_on else ""
     news = main_since("coordinator", lambda who: who in (CFG["owner"]["name"].upper(), "COORDINATOR")) \
         if threads_on else ""
@@ -954,11 +957,16 @@ def owner_turn(msg_id, text, media_type, batch=None):
         (f"THREAD NEWS (since your last turn):\n{news}\n\n" if news else "")
     answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(head + text)))
     pick_react(OWNER, emoji)
+    coordinator_send(answer, text, msg_id, voice)
+
+
+def coordinator_send(answer, text, msg_id=None, voice=False):
+    """The coordinator's answer -> markers handled, the rest sent to the owner."""
     qm = re.search(r"^\s*@@QUOTE\s*:?.*$", answer, re.M)
-    quote = (msg_id, OWNER, text) if qm else None
-    answer = re.sub(r"^\s*@@QUOTE\s*:?.*$\n?", "", answer, flags=re.M).strip()
+    quote = (msg_id, OWNER, text) if qm and msg_id else None
+    answer = re.sub(r"^\s*@@(QUOTE|SKIP)\s*:?.*$\n?", "", answer, flags=re.M).strip()
     answer, asks = take_asks(answer)
-    if threads_on:
+    if CFG["threads"]["enabled"]:
         answer, notes = take_thread_markers(answer)
         main_log(CFG["owner"]["name"].upper(), text)
         answer = take_decisions("coordinator", answer)
@@ -992,7 +1000,8 @@ COORDINATOR_RULES = (
     "Each thread runs at an effort level: end the brief with ' | effort=<low|medium|high|xhigh|max>' "
     "to pick it ('@@TO #<n>: effort=high' changes it). Pick high for work where a mistake is costly{high}. "
     "When you and the owner agree on something that touches an open thread, also send it there "
-    "with '@@TO #<n>: <decision>'.")
+    "with '@@TO #<n>: <decision>'. Threads never write to the owner: their reports reach only you, "
+    "as THREAD NEWS, and you pass on what matters.")
 THREAD_RULES = (
     "\nTHREAD: you work on ONE thread (#{n}: {title}) of the owner's project. Other sessions handle "
     "the main chat and the other threads. Work until the task is done or you need the owner. Reply "
@@ -1009,7 +1018,10 @@ THREAD_RULES = (
     "it: finish all work, also any agents you start, before you reply. "
     "End every reply with one line '@@STATE: blocked' (you need the owner), '@@STATE: review' (ready "
     "for the owner to check) or '@@STATE: done' (finished, the thread closes). Do not use @@ASK, "
-    "@@QUOTE, @@EDIT_LAST, @@DELETE_LAST or @@REACT here: ask in plain text.")
+    "@@QUOTE, @@EDIT_LAST, @@DELETE_LAST or @@REACT here: ask in plain text. Your reply goes to the "
+    "coordinator only, never straight to the owner: the coordinator tells the owner the bottom line "
+    "and asks your questions for you, so write them out in full. A file you send the owner yourself "
+    "still reaches the owner: name it in your reply.")
 DECISION_RE = re.compile(r"^\s*@@DECISION\s*(?:\[\s*([^\]]*?)\s*\])?\s*:?\s*(.+)$", re.M)
 THREAD_MARK_RE = re.compile(r"^\s*@@(THREAD|TO)\s*:?\s*(.*)$")
 STATE_RE = re.compile(r"^\s*@@STATE\s*:?\s*(\w+).*$\n?", re.M)
@@ -1106,9 +1118,9 @@ def decisions_for(n, topic, new):
     return "\n".join(sorted(mine + rest))  # lines start with the date: sorted = in time order
 
 
-def main_since(key, own):
+def main_since(key, own, peek=False):
     """Timeline entries `key` has not seen yet, minus its own (own(who) is True), newest
-    threads.main_chat_chars of them. Offsets per reader in state/main-seen.json."""
+    threads.main_chat_chars of them. Offsets per reader in state/main-seen.json; peek = keep it."""
     limit, path = CFG["threads"]["main_chat_chars"], st("threads/main.md")
     if not limit or not os.path.exists(path):
         return ""
@@ -1119,7 +1131,8 @@ def main_since(key, own):
         except ValueError:
             seen = {}
         start, seen[key] = seen.get(key, 0), len(data)
-        write(st("main-seen.json"), json.dumps(seen))
+        if not peek:
+            write(st("main-seen.json"), json.dumps(seen))
     new = data[start:] if start <= len(data) else data
     keep = [e.strip() for e in ENTRY_RE.split(new)
             if e.strip() and not own((WHO_RE.match(e) or [None, ""])[1])]
@@ -1174,7 +1187,7 @@ def thread_dispatch(note, owner_text):
         b, topic = take_topic(b)
         threads_db(n, title=a, state="working", sid="", last="", topic=topic,
                    effort=effort or auto_effort(a, b, owner_text))
-        prompt = f"BRIEF FROM THE COORDINATOR: {b}\n\n{name} SAID:\n{owner_text}"
+        prompt = f"BRIEF FROM THE COORDINATOR: {b}" + (f"\n\n{name} SAID:\n{owner_text}" if owner_text else "")
         enqueue(f"#{n}", lambda: thread_run(n, prompt))
         return f"Started #{n}: {a}"
     if a not in threads_db():
@@ -1182,7 +1195,7 @@ def thread_dispatch(note, owner_text):
     b, effort = take_effort(b)
     b, topic = take_topic(b)
     threads_db(a, state="working", **({"effort": effort} if effort else {}), **({"topic": topic} if topic else {}))
-    prompt = f"NOTE FROM THE COORDINATOR: {b}\n\n{name} SAID:\n{owner_text}"
+    prompt = f"NOTE FROM THE COORDINATOR: {b}" + (f"\n\n{name} SAID:\n{owner_text}" if owner_text else "")
     enqueue(f"#{a}", lambda: thread_run(a, prompt))
     return f"Sent to #{a}."
 
@@ -1225,7 +1238,43 @@ def thread_run(n, prompt):
     main_log(f"#{n} {t['title']} ({state})", body)
     threads_db(n, sid=sid, state="closed" if state == "done" else state,
                last=(body.splitlines() or [""])[0][:160])
-    send_text(OWNER, f"#{n} {t['title']}: {body}" + ("\n(Thread closed.)" if state == "done" else ""))
+    digest_soon()
+
+
+# Thread results go to the coordinator, not the owner: threads.digest_seconds after the first one,
+# the coordinator gets a turn of its own and sends ONE short message for all of them.
+DIGEST_PROMPT = (
+    "NO MESSAGE FROM {name}. Threads reported (THREAD NEWS above). Send {name} ONE short message for "
+    "all of it: the bottom line first, what {name} must do (or that nothing is needed), and why it was "
+    "decided. Plain words, no thread transcripts. A thread question for {name}: ask it with @@ASK. "
+    "A file a thread sent: one line about it. Nothing worth telling: reply with only @@SKIP.")
+THREAD_RESULT_RE = re.compile(r"\*\*\S+ \S+ #\d+ .*\((?:blocked|review|done)\):\*\*")
+_digest = {"due": False, "timer": None}
+
+
+def digest_soon():
+    with _tlock:
+        _digest["due"] = True
+        if _digest["timer"] and _digest["timer"].is_alive():
+            return  # results inside the wait join the same message
+        _digest["timer"] = threading.Timer(CFG["threads"]["digest_seconds"],
+                                           lambda: enqueue("owner", coordinator_digest))
+        _digest["timer"].daemon = True
+        _digest["timer"].start()
+
+
+def coordinator_digest():
+    """Runs in the owner queue. An owner turn in between already read the news: nothing to do."""
+    own = lambda who: who in (CFG["owner"]["name"].upper(), "COORDINATOR")
+    if not _digest["due"] or not THREAD_RESULT_RE.search(main_since("coordinator", own, peek=True)):
+        return
+    _digest["due"] = False
+    listing = thread_list()
+    head = (f"OPEN THREADS:\n{listing}\n\n" if listing else "") + \
+        f"THREAD NEWS (since your last turn):\n{main_since('coordinator', own)}\n\n"
+    answer, _ = take_react(apply_fixes(OWNER, ask_owner_claude(
+        head + DIGEST_PROMPT.format(name=CFG["owner"]["name"]))))
+    coordinator_send(answer, "")
 
 
 def thread_recover():
