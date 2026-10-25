@@ -21,7 +21,7 @@ class ThreadTests(unittest.TestCase):
         relay.CFG.clear(), relay.CFG.update(cfg)
         relay.OWNER = cfg["owner"]["jid"]
         self.sent, self.jobs = [], []
-        self.p = [mock.patch.object(relay, "send_text", lambda c, t, quote=None: self.sent.append(t)),
+        self.p = [mock.patch.object(relay, "send_text", lambda c, t, quote=None, mentions=None: self.sent.append(t)),
                   mock.patch.object(relay, "enqueue", lambda k, fn: self.jobs.append((k, fn))),
                   mock.patch.object(relay, "quoted_text", lambda c, m: ""),
                   mock.patch.object(relay, "digest_soon", lambda: self.digests.append(1) or relay._digest.update(due=True))]
@@ -187,6 +187,34 @@ class ThreadTests(unittest.TestCase):
             self.assertFalse(relay._digest["due"])
             with self.assertRaises(SystemExit):
                 relay.restart_if_changed()
+
+    def test_agent_notes_go_to_the_coordinator(self):
+        a = dict(name="lara", trust="reply", checkins=True, ask_contact=False, mentions=False, gifs=False,
+                 home=self.tmp.name, timezone="Europe/Amsterdam")
+        with mock.patch.object(relay, "apply_fixes", lambda c, t: t), \
+                mock.patch.object(relay, "pick_react", lambda c, e: None), \
+                mock.patch.object(relay, "add_reminder", lambda a, r: False), \
+                mock.patch.object(relay, "flag", lambda *x: None):
+            relay.deliver("lara@s", a, "Hi Lara!\n@@OWNER: hotel is €626, over the €400 plan\n"
+                                     "@@REMIND: bad", False)
+            self.assertEqual(self.digests, [1])
+            self.assertIn("Hi Lara!", self.sent)  # her message still goes to her
+            self.assertIn("reminder NOT set", self.sent[0])  # stays direct to the owner
+            self.assertFalse(any("€626" in t for t in self.sent))
+            relay.deliver("lara@s", dict(a, trust="draft"), "Draft for her\n@@OWNER: fyi", False)
+            self.assertIn("held for your OK", self.sent[-1])  # a held draft stays direct
+            relay.deliver("lara@s", a, "x\n@@OWNER: dry note", True)
+            self.assertIn("🔔 lara: dry note", self.sent)  # a dry run shows it to the owner
+        prompts = []
+        with mock.patch.object(relay, "ask_owner_claude", lambda p: prompts.append(p) or "Lara's hotel is over plan."), \
+                mock.patch.object(relay, "apply_fixes", lambda c, t: t):
+            relay.coordinator_digest()
+        self.assertIn("€626", prompts[0])
+        self.assertIn(relay.UNTRUSTED_OPEN, prompts[0])  # an agent note is data, not instructions
+        self.assertEqual(self.sent[-1], "Lara's hotel is over plan.")
+        relay.CFG["threads"]["enabled"] = False
+        relay.agent_note("lara", "old way")
+        self.assertEqual(self.sent[-1], "🔔 lara: old way")
 
     def test_digest_waits_and_batches(self):
         self.p[-1].stop()  # the real digest_soon

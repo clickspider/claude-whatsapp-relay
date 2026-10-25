@@ -1001,7 +1001,9 @@ COORDINATOR_RULES = (
     "to pick it ('@@TO #<n>: effort=high' changes it). Pick high for work where a mistake is costly{high}. "
     "When you and the owner agree on something that touches an open thread, also send it there "
     "with '@@TO #<n>: <decision>'. Threads never write to the owner: their reports reach only you, "
-    "as THREAD NEWS, and you pass on what matters.")
+    "as THREAD NEWS, and you pass on what matters. Notes from the contact agents come the same way, "
+    "as '🔔 <agent>' entries: handle them yourself (for example with an inbox note to that agent) "
+    "and tell the owner only what the owner must know or decide.")
 THREAD_RULES = (
     "\nTHREAD: you work on ONE thread (#{n}: {title}) of the owner's project. Other sessions handle "
     "the main chat and the other threads. Work until the task is done or you need the owner. Reply "
@@ -1244,11 +1246,11 @@ def thread_run(n, prompt):
 # Thread results go to the coordinator, not the owner: threads.digest_seconds after the first one,
 # the coordinator gets a turn of its own and sends ONE short message for all of them.
 DIGEST_PROMPT = (
-    "NO MESSAGE FROM {name}. Threads reported (THREAD NEWS above). Send {name} ONE short message for "
+    "NO MESSAGE FROM {name}. Threads or agents reported (THREAD NEWS above). Send {name} ONE short message for "
     "all of it: the bottom line first, what {name} must do (or that nothing is needed), and why it was "
     "decided. Plain words, no thread transcripts. A thread question for {name}: ask it with @@ASK. "
     "A file a thread sent: one line about it. Nothing worth telling: reply with only @@SKIP.")
-THREAD_RESULT_RE = re.compile(r"\*\*\S+ \S+ #\d+ .*\((?:blocked|review|done)\):\*\*")
+THREAD_RESULT_RE = re.compile(r"\*\*\S+ \S+ (?:#\d+ .*\((?:blocked|review|done)\)|🔔 [^:*\n]+):\*\*")
 _digest = {"due": False, "timer": None}
 
 
@@ -1536,6 +1538,15 @@ def log_thread(a, who, text, en="", dry=False):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def agent_note(name, note, dry=False):
+    """An agent's note for the owner. With threads on it goes to the coordinator (THREAD NEWS,
+    in the next digest), not to the owner; a dry run still shows it to the owner."""
+    if CFG["threads"]["enabled"] and not dry:
+        main_log(f"🔔 {name}", untrusted(note))
+        return digest_soon()
+    send_text(OWNER, f"🔔 {name}: {note}")
+
+
 def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     """Route the agent's answer: to the chat, or held for the owner, plus notes to the owner."""
     out, emoji = take_react(apply_fixes(OWNER if dry else jid, out))
@@ -1545,7 +1556,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     if not held:  # a held draft is not reviewed yet: its reaction never goes out
         pick_react(OWNER if dry else jid, emoji)
     for note in m["NOTE"]:
-        send_text(OWNER, f"🔔 {name}: {note}")
+        agent_note(name, note, dry)
     if m["NEXT_CHECKIN"]:
         flag(a, "next-checkin", m["NEXT_CHECKIN"])
     for r in m.get("REMIND", []):
