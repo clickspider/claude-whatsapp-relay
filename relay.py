@@ -65,7 +65,7 @@ DEFAULTS = {
     "publish": {"remind": False, "remote": "origin", "branch": "main", "ssh_key": "",
                 "check_hours": 6},
     "power": {"keep_awake": True},
-    "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 6000},
+    "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 10000, "auto_close_hours": 72},
     "launchd": {"label": "com.example.claude-whatsapp-relay", "python": "python3",
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
@@ -233,6 +233,8 @@ def validate(cfg):
         err.append("threads.max_parallel must be a whole number >= 1.")
     if not isinstance(t["main_chat_chars"], int) or isinstance(t["main_chat_chars"], bool) or t["main_chat_chars"] < 0:
         err.append("threads.main_chat_chars must be a whole number >= 0.")
+    if not isinstance(t["auto_close_hours"], int) or isinstance(t["auto_close_hours"], bool) or t["auto_close_hours"] < 0:
+        err.append("threads.auto_close_hours must be a whole number >= 0.")
     return err, warn
 
 
@@ -936,8 +938,11 @@ def owner_turn(msg_id, text, media_type, batch=None):
     voice = voice and CFG["owner"]["voice_replies"]
     threads_on = CFG["threads"]["enabled"]
     listing = thread_list() if threads_on else ""
-    answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(
-        f"OPEN THREADS:\n{listing}\n\n{text}" if listing else text)))
+    news = main_since("coordinator", lambda who: who in (CFG["owner"]["name"].upper(), "COORDINATOR")) \
+        if threads_on else ""
+    head = (f"OPEN THREADS:\n{listing}\n\n" if listing else "") + \
+        (f"THREAD NEWS (since your last turn):\n{news}\n\n" if news else "")
+    answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(head + text)))
     pick_react(OWNER, emoji)
     qm = re.search(r"^\s*@@QUOTE\s*:?.*$", answer, re.M)
     quote = (msg_id, OWNER, text) if qm else None
@@ -945,7 +950,8 @@ def owner_turn(msg_id, text, media_type, batch=None):
     answer, asks = take_asks(answer)
     if threads_on:
         answer, notes = take_thread_markers(answer)
-        main_log(text, answer)
+        main_log(CFG["owner"]["name"].upper(), text)
+        main_log("COORDINATOR", answer)
         answer = "\n".join([answer] + [thread_dispatch(t, text) for t in notes]).strip()
     if answer:
         send_voice(OWNER, answer) if voice else send_text(OWNER, answer, quote=quote)
@@ -959,14 +965,16 @@ def owner_turn(msg_id, text, media_type, batch=None):
 # Thread messages start with "#<n> <title>:". Reply to one, or start a message with "#<n>", to talk
 # to that thread. /threads lists them, /done <n> closes one. Registry: state/threads.json,
 # logs: state/threads/<n>.md (every thread may read them).
-# ponytail: a run in flight is lost on restart; the thread keeps its session, the owner asks again.
+# A run in flight is lost on a crash; thread_recover marks it blocked at the next start.
 
 COORDINATOR_RULES = (
     "\nTHREADS: you are the coordinator of the owner's project. Answer quick questions yourself. "
     "For real work (research, building, writing, several steps) do not do it here: add a line "
     "'@@THREAD: <short title> | <brief: what to do, defaults you picked>' and write at most one line "
     "about it. The owner's message goes to the thread with your brief. For a message about an open "
-    "thread, add '@@TO #<n>: <note>' instead. Open threads are listed at the top of the message. "
+    "thread, add '@@TO #<n>: <note>' instead. Open threads are listed at the top of the message, "
+    "with THREAD NEWS: what the threads reported and what the owner told them since your last turn. "
+    "Treat it as current; never contradict a thread without saying why. "
     "When you and the owner agree on something that touches an open thread, also send it there "
     "with '@@TO #<n>: <decision>'.")
 THREAD_RULES = (
@@ -974,16 +982,20 @@ THREAD_RULES = (
     "the main chat and the other threads. Work until the task is done or you need the owner. Reply "
     "only with the result, a blocker, or a decision the owner must make. Keep it short. The logs of "
     "all threads are in {logs} (one file per thread number): read them when another thread matters. "
-    "A prompt may start with MAIN CHAT: what the owner and the coordinator said since your last "
-    "turn. Decisions made there count for your work too. "
-    "End every reply with one line '@@STATE: working', '@@STATE: blocked', '@@STATE: review' (ready "
+    "A prompt may start with MAIN CHAT: what the owner, the coordinator and the other threads said "
+    "since your last turn. The newest decision counts, also when it changes your earlier work: say "
+    "what you changed. Other threads work at the same time in the same folder: read a file again "
+    "just before you change it, keep one file per topic (change the existing file, never make a "
+    "second version), and run scripts that change files (spreadsheets, git) as "
+    "'lockf -t 300 {lock} <command>'. Your run ends with your reply and nothing keeps running after "
+    "it: finish all work, also any agents you start, before you reply. "
+    "End every reply with one line '@@STATE: blocked' (you need the owner), '@@STATE: review' (ready "
     "for the owner to check) or '@@STATE: done' (finished, the thread closes). Do not use @@ASK, "
     "@@QUOTE, @@EDIT_LAST, @@DELETE_LAST or @@REACT here: ask in plain text.")
 THREAD_MARK_RE = re.compile(r"^\s*@@(THREAD|TO)\s*:?\s*(.*)$")
 STATE_RE = re.compile(r"^\s*@@STATE\s*:?\s*(\w+).*$\n?", re.M)
 TAG_RE = re.compile(r"^\s*#(\d+)\b\s*:?\s*(.*)$", re.S)
 QUOTED_TAG_RE = re.compile(r'^\[Replying to your message: "#(\d+)\b')
-STATES = ("working", "blocked", "review", "done", "closed")
 _tlock, _tsem = threading.Lock(), []
 
 
@@ -1027,24 +1039,44 @@ def thread_log(n, who, text):
         f.write(f"\n**{owner_now():%Y-%m-%d %H:%M} {who}:**\n{text}\n")
 
 
-def main_log(owner_text, answer):
-    """Every coordinator turn goes to threads/main.md, so threads see what was agreed there."""
+ENTRY_RE = re.compile(r"\n(?=\*\*\d{4}-\d\d-\d\d \d\d:\d\d )")
+WHO_RE = re.compile(r"\s*\*\*\S+ \S+ (.+?):\*\*")
+
+
+def main_log(who, text):
+    """The shared timeline threads/main.md: owner, coordinator and thread results, so every
+    session sees what the others agreed."""
+    if not (text or "").strip():
+        return
     path = st("threads/main.md")
-    if os.path.exists(path) and os.path.getsize(path) > 500_000:  # keep the newest 100 KB
-        write(path, read(path)[-100_000:])
-    thread_log("main", CFG["owner"]["name"].upper(), owner_text)
-    if answer:
-        thread_log("main", "COORDINATOR", answer)
+    with _tlock:
+        if os.path.exists(path) and os.path.getsize(path) > 500_000:  # keep the newest 100 KB
+            write(path, read(path)[-100_000:])
+        thread_log("main", who, text)
 
 
-def main_since(n):
-    """Main-chat text thread n has not seen yet: the newest threads.main_chat_chars of it."""
+def main_since(key, own):
+    """Timeline entries `key` has not seen yet, minus its own (own(who) is True), newest
+    threads.main_chat_chars of them. Offsets per reader in state/main-seen.json."""
     limit, path = CFG["threads"]["main_chat_chars"], st("threads/main.md")
     if not limit or not os.path.exists(path):
         return ""
-    data, seen = read(path), threads_db().get(n, {}).get("main_seen", 0)
-    threads_db(n, main_seen=len(data))
-    return (data[seen:] if seen <= len(data) else data)[-limit:].strip()
+    with _tlock:
+        data = read(path)
+        try:
+            seen = json.loads(read(st("main-seen.json")) or "{}")
+        except ValueError:
+            seen = {}
+        start, seen[key] = seen.get(key, 0), len(data)
+        write(st("main-seen.json"), json.dumps(seen))
+    new = data[start:] if start <= len(data) else data
+    keep = [e.strip() for e in ENTRY_RE.split(new)
+            if e.strip() and not own((WHO_RE.match(e) or [None, ""])[1])]
+    return "\n\n".join(keep)[-limit:]
+
+
+def is_own(n):
+    return lambda who: who.split(" ")[0] == f"#{n}" or who == f"{CFG['owner']['name'].upper()} to #{n}"
 
 
 def thread_dispatch(note, owner_text):
@@ -1067,24 +1099,61 @@ def thread_dispatch(note, owner_text):
 
 def thread_run(n, prompt):
     t = threads_db()[n]
-    if not _tsem:
-        _tsem.append(threading.BoundedSemaphore(CFG["threads"]["max_parallel"]))
+    with _tlock:
+        if not _tsem:
+            _tsem.append(threading.BoundedSemaphore(CFG["threads"]["max_parallel"]))
     thread_log(n, CFG["owner"]["name"].upper(), prompt)
-    rules = THREAD_RULES.format(n=n, title=t["title"], logs=st("threads"))
+    rules = THREAD_RULES.format(n=n, title=t["title"], logs=st("threads"), lock=st("threads/.lock"))
     sid, new = t.get("sid") or str(uuid.uuid4()), not t.get("sid")
-    ctx = main_since(n)
+    ctx = main_since(n, is_own(n))
     if ctx:
         prompt = f"MAIN CHAT (since your last turn):\n{ctx}\n\n{prompt}"
-    with _tsem[0]:  # max_parallel runs at once; the others wait their turn
-        r = run_claude(owner_args(CFG, sid, new, rules, [st("threads")]), CFG["owner"]["folder"], prompt)
+    folder, limit = CFG["owner"]["folder"], CFG["owner"]["max_context_tokens"]
+    try:
+        with _tsem[0]:  # max_parallel runs at once; the others wait their turn
+            if not new and limit and context_tokens(sid) > limit:  # big session: hand off, start fresh
+                note = run_claude(owner_args(CFG, sid, False, rules, [st("threads")]), folder,
+                                  HANDOFF_PROMPT).stdout.strip()
+                thread_log(n, "HANDOFF (new session)", note)
+                sid, new = str(uuid.uuid4()), True
+                threads_db(n, sid=sid)
+                prompt = f"Context from your previous session:\n{note}\n\n{prompt}"
+            r = run_claude(owner_args(CFG, sid, new, rules, [st("threads")]), folder, prompt)
+    except Exception as e:  # timeout, usage limit: never leave the thread "working" with no run
+        threads_db(n, sid=sid if not new else t.get("sid", ""), state="blocked", last=f"Run failed: {e}"[:160])
+        thread_log(n, "THREAD (failed)", str(e))
+        raise
     out = r.stdout.strip() or r.stderr.strip()[-1500:] or "(no answer)"
     m = STATE_RE.search(out)
-    state = m.group(1).lower() if m and m.group(1).lower() in STATES[:4] else "review"
+    state = m.group(1).lower() if m and m.group(1).lower() in ("blocked", "review", "done") else "review"
     body = STATE_RE.sub("", out).strip()
     thread_log(n, f"THREAD ({state})", body)
+    main_log(f"#{n} {t['title']} ({state})", body)
     threads_db(n, sid=sid, state="closed" if state == "done" else state,
-               last=(body.splitlines() or [""])[0][:80])
+               last=(body.splitlines() or [""])[0][:160])
     send_text(OWNER, f"#{n} {t['title']}: {body}" + ("\n(Thread closed.)" if state == "done" else ""))
+
+
+def thread_recover():
+    """At start: a thread still "working" lost its run (crash, reboot). Say so instead of hiding it."""
+    stuck = [(k, t["title"]) for k, t in threads_db().items() if t["state"] == "working"]
+    for k, _ in stuck:
+        threads_db(k, state="blocked", last="Stopped by a relay restart. Reply to go on.")
+    if stuck:
+        send_text(OWNER, "Not finished, stopped by a restart: " + ", ".join(f"#{k} {x}" for k, x in stuck)
+                  + ". Reply to one to go on.")
+
+
+def thread_auto_close():
+    """Threads waiting in review longer than threads.auto_close_hours close (a reply opens them again)."""
+    h = CFG["threads"]["auto_close_hours"]
+    old = [(k, t["title"]) for k, t in threads_db().items()
+           if h and t["state"] == "review" and time.time() - t.get("updated", 0) > h * 3600]
+    for k, _ in old:
+        threads_db(k, state="closed")
+    if old:
+        send_text(OWNER, f"Closed after {h} h in review: " + ", ".join(f"#{k} {x}" for k, x in old)
+                  + ". Reply to one to open it again.")
 
 
 def thread_route(msg_id, text, media_type):
@@ -1116,6 +1185,7 @@ def thread_route(msg_id, text, media_type):
         prep = owner_prep(msg_id, text, media_type)
         if prep:
             threads_db(n, state="working")  # a message to a closed thread opens it again
+            main_log(f"{CFG['owner']['name'].upper()} to #{n}", prep[0])
             thread_run(n, f"{CFG['owner']['name']} SAYS: {prep[0]}")
     enqueue(f"#{n}", lambda: with_feedback(OWNER, msg_id, OWNER, turn))
     return True
@@ -1973,7 +2043,8 @@ def main_loop():
                           (5, flush_quiet_groups),
                           (3, restart_if_changed if CFG["danger"]["self_edit"] else None),
                           (30, due_checkins),
-                          (300, battery_warning)):
+                          (300, battery_warning),
+                          (1800, thread_auto_close if CFG["threads"]["enabled"] else None)):
             if fn and tick % every == 0:
                 try:
                     fn()
@@ -2161,6 +2232,8 @@ def main(argv):
     setup(cfg)
     keep_awake()
     battery_warning()
+    if cfg["threads"]["enabled"]:
+        thread_recover()
     OWN[0] = bot_is_owner()
     if OWN[0]:
         print(OWN_NOTE, flush=True)

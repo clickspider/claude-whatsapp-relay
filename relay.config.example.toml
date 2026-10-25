@@ -206,9 +206,12 @@ keep_awake = true
 enabled = false
 # Max threads that run Claude at the same time. The others wait their turn.
 max_parallel = 3
-# Each thread run starts with what you and the coordinator said since that thread's last turn,
-# so a decision made in your chat reaches the threads. Max characters; 0 = off.
-main_chat_chars = 6000
+# Shared timeline (state/threads/main.md): your chat, the coordinator and every thread result.
+# Each thread run starts with the part it has not seen, and the coordinator sees the thread news,
+# so a decision made in one place reaches the others. Max characters per run; 0 = off.
+main_chat_chars = 10000
+# Threads waiting in review this many hours close by themselves (a reply opens them again). 0 = never.
+auto_close_hours = 72
 
 [launchd]
 # Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.

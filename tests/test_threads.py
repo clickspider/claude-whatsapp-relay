@@ -36,8 +36,8 @@ class ThreadTests(unittest.TestCase):
 
     def test_config(self):
         self.assertEqual(relay.validate(relay.CFG)[0], [])
-        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1})
-        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 3)
+        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1, "auto_close_hours": -1})
+        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 4)
         self.assertIn("THREADS:", relay.owner_system(relay.CFG))
 
     def test_markers(self):
@@ -69,14 +69,69 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(relay.thread_list(), "")
         self.assertIn("closed", relay.thread_list(closed=True))
 
-    def test_main_chat_reaches_threads(self):
-        relay.threads_db("5", title="x", state="working", sid="", last="")
-        relay.main_log("split the cost 50/50", "Noted: 50/50.")
+    def test_context_flows_everywhere(self):
+        # main chat -> thread, thread -> other thread, thread -> coordinator; nobody gets their own back
+        relay.threads_db("5", title="money", state="working", sid="", last="")
+        relay.threads_db("6", title="house", state="working", sid="", last="")
+        relay.main_log("OWNER", "split the cost 50/50")
+        relay.main_log("COORDINATOR", "Noted: 50/50.")
+        with mock.patch.object(relay, "run_claude", return_value=R("insulation cancelled\n@@STATE: review")) as rc:
+            relay.thread_run("6", "go")
+            self.assertIn("50/50", rc.call_args[0][2])
         with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
             relay.thread_run("5", "go")
-            self.assertIn("50/50", rc.call_args[0][2])
-            relay.thread_run("5", "again")  # already seen: not sent twice
+            p = rc.call_args[0][2]
+            self.assertIn("insulation cancelled", p)
+            self.assertIn("50/50", p)
+            relay.thread_run("5", "again")  # seen already, and its own answer never comes back
             self.assertNotIn("MAIN CHAT", rc.call_args[0][2])
+        news = relay.main_since("coordinator", lambda w: w in ("OWNER", "COORDINATOR"))
+        self.assertIn("#6 house (review)", news)
+        self.assertNotIn("50/50", news)
+
+    def test_failure_and_restart_never_hide_a_thread(self):
+        relay.threads_db("7", title="x", state="working", sid="", last="")
+        with mock.patch.object(relay, "run_claude", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(TimeoutError):
+                relay.thread_run("7", "go")
+        self.assertEqual(relay.threads_db()["7"]["state"], "blocked")
+        relay.threads_db("8", title="y", state="working", sid="", last="")
+        relay.thread_recover()
+        self.assertEqual(relay.threads_db()["8"]["state"], "blocked")
+        self.assertIn("#8 y", self.sent[-1])
+
+    def test_working_means_a_run_and_old_reviews_close(self):
+        relay.threads_db("9", title="z", state="working", sid="", last="")
+        with mock.patch.object(relay, "run_claude", return_value=R("agents started\n@@STATE: working")):
+            relay.thread_run("9", "go")
+        self.assertEqual(relay.threads_db()["9"]["state"], "review")  # nothing runs after a reply
+        relay.thread_auto_close()
+        self.assertEqual(relay.threads_db()["9"]["state"], "review")
+        with mock.patch.object(relay.time, "time", return_value=relay.time.time() + 73 * 3600):
+            relay.thread_auto_close()
+        self.assertEqual(relay.threads_db()["9"]["state"], "closed")
+
+    def test_big_session_hands_off(self):
+        relay.threads_db("3", title="w", state="working", sid="old", last="")
+        with mock.patch.object(relay, "context_tokens", return_value=10**9), \
+                mock.patch.object(relay, "run_claude", side_effect=[R("open: X"), R("ok\n@@STATE: review")]) as rc:
+            relay.thread_run("3", "go")
+        self.assertIn("--session-id", rc.call_args[0][0])
+        self.assertIn("open: X", rc.call_args[0][2])
+        self.assertNotEqual(relay.threads_db()["3"]["sid"], "old")
+
+    def test_coordinator_gets_thread_news(self):
+        relay.main_log("#4 trip (review)", "both trips fit")
+        prompts = []
+        with mock.patch.object(relay, "ask_owner_claude", lambda p: prompts.append(p) or "Fine."), \
+                mock.patch.object(relay, "pick_react", lambda c, e: None), \
+                mock.patch.object(relay, "apply_fixes", lambda c, t: t):
+            relay.owner_turn("m1", "and the trips?", None)
+            relay.owner_turn("m2", "ok", None)
+        self.assertIn("THREAD NEWS", prompts[0])
+        self.assertIn("both trips fit", prompts[0])
+        self.assertNotIn("THREAD NEWS", prompts[1])  # its own turn is not news
+        self.assertEqual(self.sent[-1], "Fine.")
 
     def test_routing(self):
         relay.threads_db("4", title="x", state="working", sid="", last="")
