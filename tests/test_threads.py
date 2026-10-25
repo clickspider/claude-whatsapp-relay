@@ -147,15 +147,27 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "xhigh")
         self.assertNotIn("effort=", rc.call_args[0][2])  # the marker is not part of the brief
 
-    def test_decisions_reach_new_threads(self):
-        relay.threads_db("2", title="a", state="working", sid="", last="")
-        with mock.patch.object(relay, "run_claude", return_value=R("Done.\n@@DECISION: no insulation\n@@STATE: review")):
-            relay.thread_run("2", "go")
-        self.assertEqual(self.sent[-1], "#2 a: Done.")  # the marker never reaches the chat
-        relay.threads_db("3", title="b", state="working", sid="", last="")
+    def test_decisions_by_topic(self):
+        relay.thread_dispatch(("new", "a", "plan | topic=budget"), "x")
+        relay.thread_dispatch(("new", "b", "plan | topic=mom"), "x")
+        self.assertIn("topic=budget", relay.thread_list())
+        with mock.patch.object(relay, "run_claude",
+                               return_value=R("Done.\n@@DECISION: no insulation\n@@DECISION [general]: Mac on power\n@@STATE: review")):
+            self.jobs[0][1]()  # #1 budget
+        self.assertEqual(self.sent[-1], "#1 a: Done.")  # markers never reach the chat
+        for i in range(50):  # lots of other news must not push it out
+            relay.take_decisions("#2", f"@@DECISION: mom item {i}", "mom")
+        relay.threads_db("3", title="c", state="working", sid="", last="", topic="budget")
         with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
             relay.thread_run("3", "go")
-        self.assertIn("(#2): no insulation", rc.call_args[0][2])
+            p = rc.call_args[0][2]
+            self.assertIn("[budget]: no insulation", p)
+            self.assertIn("[general]: Mac on power", p)
+            self.assertNotIn("mom item", p.split("MAIN CHAT")[0])  # other topics stay out of DECISIONS
+            relay.take_decisions("#1", "@@DECISION: Lara 1729", "budget")
+            relay.thread_run("3", "again")  # running session: only what is new
+            self.assertIn("Lara 1729", rc.call_args[0][2])
+            self.assertNotIn("no insulation", rc.call_args[0][2].split("MAIN CHAT")[0])
 
     def test_routing(self):
         relay.threads_db("4", title="x", state="working", sid="", last="")
