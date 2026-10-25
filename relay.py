@@ -961,6 +961,7 @@ def owner_turn(msg_id, text, media_type, batch=None):
     if threads_on:
         answer, notes = take_thread_markers(answer)
         main_log(CFG["owner"]["name"].upper(), text)
+        answer = take_decisions("coordinator", answer)
         main_log("COORDINATOR", answer)
         answer = "\n".join([answer] + [thread_dispatch(t, text) for t in notes]).strip()
     if answer:
@@ -985,6 +986,7 @@ COORDINATOR_RULES = (
     "thread, add '@@TO #<n>: <note>' instead. Open threads are listed at the top of the message, "
     "with THREAD NEWS: what the threads reported and what the owner told them since your last turn. "
     "Treat it as current; never contradict a thread without saying why. "
+    "When the owner decides something, add a line '@@DECISION: <the decision>'. "
     "Each thread runs at an effort level: end the brief with ' | effort=<low|medium|high|xhigh|max>' "
     "to pick it ('@@TO #<n>: effort=high' changes it). Pick high for work where a mistake is costly{high}. "
     "When you and the owner agree on something that touches an open thread, also send it there "
@@ -996,7 +998,8 @@ THREAD_RULES = (
     "all threads are in {logs} (one file per thread number): read them when another thread matters. "
     "A prompt may start with MAIN CHAT: what the owner, the coordinator and the other threads said "
     "since your last turn. The newest decision counts, also when it changes your earlier work: say "
-    "what you changed. Other threads work at the same time in the same folder: read a file again "
+    "what you changed. When the owner decides something, add a line '@@DECISION: <the decision>'; "
+    "a new session also gets the latest decisions. Other threads work at the same time in the same folder: read a file again "
     "just before you change it, keep one file per topic (change the existing file, never make a "
     "second version), and run scripts that change files (spreadsheets, git) as "
     "'lockf -t 300 {lock} <command>'. Your run ends with your reply and nothing keeps running after "
@@ -1004,6 +1007,7 @@ THREAD_RULES = (
     "End every reply with one line '@@STATE: blocked' (you need the owner), '@@STATE: review' (ready "
     "for the owner to check) or '@@STATE: done' (finished, the thread closes). Do not use @@ASK, "
     "@@QUOTE, @@EDIT_LAST, @@DELETE_LAST or @@REACT here: ask in plain text.")
+DECISION_RE = re.compile(r"^\s*@@DECISION\s*:?\s*(.+)$", re.M)
 THREAD_MARK_RE = re.compile(r"^\s*@@(THREAD|TO)\s*:?\s*(.*)$")
 STATE_RE = re.compile(r"^\s*@@STATE\s*:?\s*(\w+).*$\n?", re.M)
 TAG_RE = re.compile(r"^\s*#(\d+)\b\s*:?\s*(.*)$", re.S)
@@ -1065,6 +1069,21 @@ def main_log(who, text):
         if os.path.exists(path) and os.path.getsize(path) > 500_000:  # keep the newest 100 KB
             write(path, read(path)[-100_000:])
         thread_log("main", who, text)
+
+
+def take_decisions(who, text):
+    """'@@DECISION: x' lines -> appended to threads/decisions.md (kept forever, one line each) and
+    to the timeline. Returns the text without them."""
+    found = [d.strip() for d in DECISION_RE.findall(text or "")]
+    if found:
+        with _tlock, open(st("threads/decisions.md"), "a") as f:
+            f.writelines(f"- {owner_now():%Y-%m-%d %H:%M} ({who}): {d}\n" for d in found)
+        main_log(f"DECISION by {who}", "\n".join(found))
+    return DECISION_RE.sub("", text or "").strip()
+
+
+def decisions(n=40):
+    return "\n".join(read(st("threads/decisions.md")).splitlines()[-n:])
 
 
 def main_since(key, own):
@@ -1147,6 +1166,8 @@ def thread_run(n, prompt):
     ctx = main_since(n, is_own(n))
     if ctx:
         prompt = f"MAIN CHAT (since your last turn):\n{ctx}\n\n{prompt}"
+    if new and decisions():
+        prompt = f"DECISIONS SO FAR (newest last; a newer one wins):\n{decisions()}\n\n{prompt}"
     folder, limit = CFG["owner"]["folder"], CFG["owner"]["max_context_tokens"]
     effort = t.get("effort", auto_effort(t["title"]))
     try:
@@ -1158,6 +1179,8 @@ def thread_run(n, prompt):
                 sid, new = str(uuid.uuid4()), True
                 threads_db(n, sid=sid)
                 prompt = f"Context from your previous session:\n{note}\n\n{prompt}"
+                if decisions():
+                    prompt = f"DECISIONS SO FAR (newest last; a newer one wins):\n{decisions()}\n\n{prompt}"
             r = run_claude(owner_args(CFG, sid, new, rules, [st("threads")], effort), folder, prompt)
     except Exception as e:  # timeout, usage limit: never leave the thread "working" with no run
         threads_db(n, sid=sid if not new else t.get("sid", ""), state="blocked", last=f"Run failed: {e}"[:160])
@@ -1166,7 +1189,7 @@ def thread_run(n, prompt):
     out = r.stdout.strip() or r.stderr.strip()[-1500:] or "(no answer)"
     m = STATE_RE.search(out)
     state = m.group(1).lower() if m and m.group(1).lower() in ("blocked", "review", "done") else "review"
-    body = STATE_RE.sub("", out).strip()
+    body = take_decisions(f"#{n}", STATE_RE.sub("", out).strip())
     thread_log(n, f"THREAD ({state})", body)
     main_log(f"#{n} {t['title']} ({state})", body)
     threads_db(n, sid=sid, state="closed" if state == "done" else state,

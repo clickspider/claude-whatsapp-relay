@@ -147,6 +147,16 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "xhigh")
         self.assertNotIn("effort=", rc.call_args[0][2])  # the marker is not part of the brief
 
+    def test_decisions_reach_new_threads(self):
+        relay.threads_db("2", title="a", state="working", sid="", last="")
+        with mock.patch.object(relay, "run_claude", return_value=R("Done.\n@@DECISION: no insulation\n@@STATE: review")):
+            relay.thread_run("2", "go")
+        self.assertEqual(self.sent[-1], "#2 a: Done.")  # the marker never reaches the chat
+        relay.threads_db("3", title="b", state="working", sid="", last="")
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            relay.thread_run("3", "go")
+        self.assertIn("(#2): no insulation", rc.call_args[0][2])
+
     def test_routing(self):
         relay.threads_db("4", title="x", state="working", sid="", last="")
         self.assertFalse(relay.thread_route("m", "hello", None))  # coordinator
