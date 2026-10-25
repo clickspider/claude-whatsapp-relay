@@ -36,8 +36,8 @@ class ThreadTests(unittest.TestCase):
 
     def test_config(self):
         self.assertEqual(relay.validate(relay.CFG)[0], [])
-        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1, "auto_close_hours": -1})
-        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 4)
+        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1, "auto_close_hours": -1, "effort_default": "huge", "effort_high": "", "effort_high_words": []})
+        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 5)
         self.assertIn("THREADS:", relay.owner_system(relay.CFG))
 
     def test_markers(self):
@@ -132,6 +132,20 @@ class ThreadTests(unittest.TestCase):
         self.assertIn("both trips fit", prompts[0])
         self.assertNotIn("THREAD NEWS", prompts[1])  # its own turn is not news
         self.assertEqual(self.sent[-1], "Fine.")
+
+    def test_effort_marked_or_automatic(self):
+        relay.CFG["threads"].update(effort_default="medium", effort_high_words=["budget"])
+        self.assertIn("effort=", relay.owner_system(relay.CFG))
+        relay.thread_dispatch(("new", "a", "plan it | effort=xhigh"), "x")
+        relay.thread_dispatch(("new", "Trip budget", "check"), "x")
+        relay.thread_dispatch(("new", "skills", "install"), "x")
+        db = relay.threads_db()
+        self.assertEqual([db[k]["effort"] for k in ("1", "2", "3")], ["xhigh", "high", "medium"])
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            self.jobs[0][1]()
+        args = rc.call_args[0][0]
+        self.assertEqual(args[args.index("--effort") + 1], "xhigh")
+        self.assertNotIn("effort=", rc.call_args[0][2])  # the marker is not part of the brief
 
     def test_routing(self):
         relay.threads_db("4", title="x", state="working", sid="", last="")

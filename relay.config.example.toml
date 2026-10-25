@@ -18,6 +18,8 @@ jid = "31600000000@s.whatsapp.net"
 name = "Owner"
 # The folder Claude works in (your dossier). MED: Claude reads and edits everything here from WhatsApp.
 folder = "~/dossier"
+# Effort of your main chat: "" (the CLI default) or low, medium, high, xhigh, max.
+effort = ""
 # Your timezone (IANA name). Used for the daily new session.
 timezone = "Europe/Amsterdam"
 # Automatic /new: start a fresh Claude session every day at this hour. Context is not lost: the old
@@ -212,6 +214,12 @@ max_parallel = 3
 main_chat_chars = 10000
 # Threads waiting in review this many hours close by themselves (a reply opens them again). 0 = never.
 auto_close_hours = 72
+# Effort (claude --effort low|medium|high|xhigh|max; "" = the CLI default). The coordinator may end a
+# brief with "| effort=high"; else effort_high when a word below is in the title, brief or your
+# message (substring, any case), else effort_default. Higher effort = better answers, more usage.
+effort_default = ""
+effort_high = "high"
+effort_high_words = []
 
 [launchd]
 # Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.
