@@ -250,6 +250,7 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # self_per_day = 0                       # max check-ins/reminders a day it starts itself, unless the contact wrote after the last one (0 = no cap)
 # quiet_hours = true                     # false = this agent ignores [quiet_hours] (check-ins + inbox notes any time)
 # gifs = false                           # true = it may add @@GIF: <words> or @@STICKER: <words> (needs ui.giphy_api_key)
+# mentions = false                       # true = it may tag a person from members with @@MENTION: <name> (groups; tag only, no DMs)
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
 # use_owner_voice = true                 # write like you (owner.voice_file). Not set = on only in own-number
 #                                        # mode, where its replies come from your own number; with a second

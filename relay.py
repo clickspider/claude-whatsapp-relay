@@ -74,7 +74,7 @@ AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigg
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
                   "unrestricted": False, "load_claude_connectors": False, "plugin_dirs": [], "max_context_tokens": 200_000, "inbox": False,
-                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False,
+                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False, "mentions": False,
                   "self_per_day": 0}
 
 
@@ -500,10 +500,13 @@ def db(name):
     return sqlite3.connect(f"file:{os.path.join(CFG['bridge']['store'], name)}?mode=ro", uri=True)
 
 
-def send_text(chat, text, quote=None):
-    """quote = (message_id, sender_jid, text) of the message this reply answers."""
+def send_text(chat, text, quote=None, mentions=None):
+    """quote = (message_id, sender_jid, text) of the message this reply answers.
+    mentions = phone numbers tagged with "@<number>" in the text (see add_mentions)."""
     for i in range(0, len(text), 3500):
         payload = {"recipient": chat, "message": text[i:i + 3500]}
+        if mentions and i == 0:
+            payload["mentions"] = mentions
         if quote and i == 0:
             payload.update(quoted_message_id=quote[0], quoted_sender_jid=quote[1],
                            quoted_content=(quote[2] or "")[:500])
@@ -1242,8 +1245,8 @@ def write_history(a):
 
 def parse(out):
     note = CFG["prompts"]["owner_note_marker"]
-    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "REMIND": [], "QUOTE": "", "GIF": "", "STICKER": ""}
-    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|REMIND|QUOTE|GIF|STICKER)\s*:?\s*(.*)$")  # OWNER = template name, always private
+    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "REMIND": [], "QUOTE": "", "GIF": "", "STICKER": "", "MENTION": []}
+    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|REMIND|QUOTE|GIF|STICKER|MENTION)\s*:?\s*(.*)$")  # OWNER = template name, always private
     for line in out.splitlines():
         m = rx.match(line)
         if not m:
@@ -1252,8 +1255,8 @@ def parse(out):
             marks["NOTE"].append(m.group(2))
         elif m.group(1) == "HOLD":
             marks["HOLD"] = True
-        elif m.group(1) == "REMIND":
-            marks["REMIND"].append(m.group(2).strip())
+        elif m.group(1) in ("REMIND", "MENTION"):
+            marks[m.group(1)].append(m.group(2).strip())
         else:
             marks[m.group(1)] = m.group(2).strip()
     return "\n".join(body).strip(), marks
@@ -1319,9 +1322,35 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         return
     log_thread(a, "AGENT", body, m["EN"], dry)
     quote = (refs or {}).get(m["QUOTE"].split()[0] if m["QUOTE"] else "")
-    send_text(OWNER if dry else jid, (f"[dry run → {name}]\n" if dry else "") + body, quote=quote)
+    tags = []
+    if a["mentions"] and m["MENTION"] and not dry:
+        body, tags = add_mentions(a, body, m["MENTION"])
+    send_text(OWNER if dry else jid, (f"[dry run → {name}]\n" if dry else "") + body, quote=quote, mentions=tags)
     if a["gifs"] and (m["GIF"] or m["STICKER"]):
         send_gif(OWNER if dry else jid, m["STICKER"] or m["GIF"], sticker=bool(m["STICKER"]))
+
+
+def add_mentions(a, body, names):
+    """@@MENTION: <name> -> a real WhatsApp tag. Only people in [agent] members can be tagged: the
+    name's phone number (not its LID) goes in the text as "@<number>" (WhatsApp shows the name) and
+    in the mention list. The first "@Name" or "Name" in the text becomes the tag, else it goes first."""
+    try:
+        c = db("whatsapp.db")
+        lids = {r[0] for r in c.execute("SELECT lid FROM whatsmeow_lid_map")}
+        c.close()
+    except Exception:
+        lids = set()
+    tags = []
+    for name in names:
+        nums = [n for n, who in a["members"].items() if who.lower() == name.lstrip("@").strip().lower()]
+        phone = next((n for n in nums if n not in lids), None)
+        if not phone or phone in tags:
+            continue
+        tags.append(phone)
+        body, hit = re.subn(rf"@?\b{re.escape(a['members'][phone])}\b", "@" + phone, body, count=1, flags=re.I)
+        if not hit:
+            body = f"@{phone} {body}"
+    return body, tags
 
 
 def member(a, sender):
