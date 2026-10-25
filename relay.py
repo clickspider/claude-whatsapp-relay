@@ -65,7 +65,7 @@ DEFAULTS = {
     "publish": {"remind": False, "remote": "origin", "branch": "main", "ssh_key": "",
                 "check_hours": 6},
     "power": {"keep_awake": True},
-    "threads": {"enabled": False, "max_parallel": 3},
+    "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 6000},
     "launchd": {"label": "com.example.claude-whatsapp-relay", "python": "python3",
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
@@ -231,6 +231,8 @@ def validate(cfg):
         err.append("threads.enabled must be true or false.")
     if not isinstance(t["max_parallel"], int) or isinstance(t["max_parallel"], bool) or t["max_parallel"] < 1:
         err.append("threads.max_parallel must be a whole number >= 1.")
+    if not isinstance(t["main_chat_chars"], int) or isinstance(t["main_chat_chars"], bool) or t["main_chat_chars"] < 0:
+        err.append("threads.main_chat_chars must be a whole number >= 0.")
     return err, warn
 
 
@@ -943,6 +945,7 @@ def owner_turn(msg_id, text, media_type, batch=None):
     answer, asks = take_asks(answer)
     if threads_on:
         answer, notes = take_thread_markers(answer)
+        main_log(text, answer)
         answer = "\n".join([answer] + [thread_dispatch(t, text) for t in notes]).strip()
     if answer:
         send_voice(OWNER, answer) if voice else send_text(OWNER, answer, quote=quote)
@@ -963,12 +966,16 @@ COORDINATOR_RULES = (
     "For real work (research, building, writing, several steps) do not do it here: add a line "
     "'@@THREAD: <short title> | <brief: what to do, defaults you picked>' and write at most one line "
     "about it. The owner's message goes to the thread with your brief. For a message about an open "
-    "thread, add '@@TO #<n>: <note>' instead. Open threads are listed at the top of the message.")
+    "thread, add '@@TO #<n>: <note>' instead. Open threads are listed at the top of the message. "
+    "When you and the owner agree on something that touches an open thread, also send it there "
+    "with '@@TO #<n>: <decision>'.")
 THREAD_RULES = (
     "\nTHREAD: you work on ONE thread (#{n}: {title}) of the owner's project. Other sessions handle "
     "the main chat and the other threads. Work until the task is done or you need the owner. Reply "
     "only with the result, a blocker, or a decision the owner must make. Keep it short. The logs of "
     "all threads are in {logs} (one file per thread number): read them when another thread matters. "
+    "A prompt may start with MAIN CHAT: what the owner and the coordinator said since your last "
+    "turn. Decisions made there count for your work too. "
     "End every reply with one line '@@STATE: working', '@@STATE: blocked', '@@STATE: review' (ready "
     "for the owner to check) or '@@STATE: done' (finished, the thread closes). Do not use @@ASK, "
     "@@QUOTE, @@EDIT_LAST, @@DELETE_LAST or @@REACT here: ask in plain text.")
@@ -1020,6 +1027,26 @@ def thread_log(n, who, text):
         f.write(f"\n**{owner_now():%Y-%m-%d %H:%M} {who}:**\n{text}\n")
 
 
+def main_log(owner_text, answer):
+    """Every coordinator turn goes to threads/main.md, so threads see what was agreed there."""
+    path = st("threads/main.md")
+    if os.path.exists(path) and os.path.getsize(path) > 500_000:  # keep the newest 100 KB
+        write(path, read(path)[-100_000:])
+    thread_log("main", CFG["owner"]["name"].upper(), owner_text)
+    if answer:
+        thread_log("main", "COORDINATOR", answer)
+
+
+def main_since(n):
+    """Main-chat text thread n has not seen yet: the newest threads.main_chat_chars of it."""
+    limit, path = CFG["threads"]["main_chat_chars"], st("threads/main.md")
+    if not limit or not os.path.exists(path):
+        return ""
+    data, seen = read(path), threads_db().get(n, {}).get("main_seen", 0)
+    threads_db(n, main_seen=len(data))
+    return (data[seen:] if seen <= len(data) else data)[-limit:].strip()
+
+
 def thread_dispatch(note, owner_text):
     """A coordinator marker -> start or feed a thread. Returns the line for the owner."""
     kind, a, b = note
@@ -1045,6 +1072,9 @@ def thread_run(n, prompt):
     thread_log(n, CFG["owner"]["name"].upper(), prompt)
     rules = THREAD_RULES.format(n=n, title=t["title"], logs=st("threads"))
     sid, new = t.get("sid") or str(uuid.uuid4()), not t.get("sid")
+    ctx = main_since(n)
+    if ctx:
+        prompt = f"MAIN CHAT (since your last turn):\n{ctx}\n\n{prompt}"
     with _tsem[0]:  # max_parallel runs at once; the others wait their turn
         r = run_claude(owner_args(CFG, sid, new, rules, [st("threads")]), CFG["owner"]["folder"], prompt)
     out = r.stdout.strip() or r.stderr.strip()[-1500:] or "(no answer)"

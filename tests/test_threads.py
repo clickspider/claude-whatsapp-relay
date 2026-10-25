@@ -36,8 +36,8 @@ class ThreadTests(unittest.TestCase):
 
     def test_config(self):
         self.assertEqual(relay.validate(relay.CFG)[0], [])
-        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0})
-        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 2)
+        bad = dict(relay.CFG, threads={"enabled": "yes", "max_parallel": 0, "main_chat_chars": -1})
+        self.assertEqual(len([e for e in relay.validate(bad)[0] if "threads." in e]), 3)
         self.assertIn("THREADS:", relay.owner_system(relay.CFG))
 
     def test_markers(self):
@@ -68,6 +68,15 @@ class ThreadTests(unittest.TestCase):
         self.assertIn("SAYS: book the cheapest", rc.call_args[0][2])
         self.assertEqual(relay.thread_list(), "")
         self.assertIn("closed", relay.thread_list(closed=True))
+
+    def test_main_chat_reaches_threads(self):
+        relay.threads_db("5", title="x", state="working", sid="", last="")
+        relay.main_log("split the cost 50/50", "Noted: 50/50.")
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            relay.thread_run("5", "go")
+            self.assertIn("50/50", rc.call_args[0][2])
+            relay.thread_run("5", "again")  # already seen: not sent twice
+            self.assertNotIn("MAIN CHAT", rc.call_args[0][2])
 
     def test_routing(self):
         relay.threads_db("4", title="x", state="working", sid="", last="")
