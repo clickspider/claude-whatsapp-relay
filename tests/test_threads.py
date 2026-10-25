@@ -24,7 +24,7 @@ class ThreadTests(unittest.TestCase):
         self.p = [mock.patch.object(relay, "send_text", lambda c, t, quote=None: self.sent.append(t)),
                   mock.patch.object(relay, "enqueue", lambda k, fn: self.jobs.append((k, fn))),
                   mock.patch.object(relay, "quoted_text", lambda c, m: ""),
-                  mock.patch.object(relay, "digest_soon", lambda: self.digests.append(1))]
+                  mock.patch.object(relay, "digest_soon", lambda: self.digests.append(1) or relay._digest.update(due=True))]
         self.digests = []
         relay._digest.update(due=False, timer=None)
         for p in self.p:
@@ -178,6 +178,15 @@ class ThreadTests(unittest.TestCase):
             relay.coordinator_digest()
             self.assertEqual(len(self.sent), n)  # @@SKIP sends nothing
         self.assertIn("never write to the owner", relay.owner_system(relay.CFG))
+        relay._digest["due"] = True  # a waiting digest holds a restart back; an empty one clears it
+        with mock.patch.object(relay.os.path, "getmtime", return_value=0), \
+                mock.patch.object(relay.os, "_exit", side_effect=SystemExit) as ex:
+            relay.restart_if_changed()
+            ex.assert_not_called()
+            relay.coordinator_digest()
+            self.assertFalse(relay._digest["due"])
+            with self.assertRaises(SystemExit):
+                relay.restart_if_changed()
 
     def test_digest_waits_and_batches(self):
         self.p[-1].stop()  # the real digest_soon

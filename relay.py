@@ -1266,9 +1266,11 @@ def digest_soon():
 def coordinator_digest():
     """Runs in the owner queue. An owner turn in between already read the news: nothing to do."""
     own = lambda who: who in (CFG["owner"]["name"].upper(), "COORDINATOR")
-    if not _digest["due"] or not THREAD_RESULT_RE.search(main_since("coordinator", own, peek=True)):
+    if not _digest["due"]:
         return
-    _digest["due"] = False
+    _digest["due"] = False  # also when there is nothing to send: a restart waits on this flag
+    if not THREAD_RESULT_RE.search(main_since("coordinator", own, peek=True)):
+        return
     listing = thread_list()
     head = (f"OPEN THREADS:\n{listing}\n\n" if listing else "") + \
         f"THREAD NEWS (since your last turn):\n{main_since('coordinator', own)}\n\n"
@@ -1959,7 +1961,7 @@ def fix_last(a, prompt):
 def restart_if_changed():
     """Opt-in (danger.self_edit): relay.py changed, restart when idle and the new code compiles."""
     me = os.path.abspath(__file__)
-    if os.path.getmtime(me) == START_MTIME or busy[0] or any(not q.empty() for q in workers.values()):
+    if os.path.getmtime(me) == START_MTIME or busy[0] or _digest["due"] or any(not q.empty() for q in workers.values()):
         return
     r = subprocess.run([sys.executable, "-m", "py_compile", me], capture_output=True, text=True)
     if r.returncode != 0:
