@@ -293,6 +293,8 @@ def owner_system(cfg):
         "to the message. Only when several messages came in a row; not for every reply.\n"
         "FIXING MISTAKES: to correct your previous WhatsApp reply, put '@@EDIT_LAST: <full new "
         "text>' at the end (works within 15 minutes), or '@@DELETE_LAST' to delete it.")
+    base += ("\nFILES: to send the owner a file (PDF, image, document), add a line '@@FILE: <path>' "
+             "(absolute, or relative to the owner's folder; only files inside that folder).")
     if cfg["ui"]["polls"]:
         base += ("\nCHOICES: when you need a decision, add a line '@@ASK: <question> | <option> | <option>' "
                  "(2 to 12 options). It arrives as a WhatsApp poll. The vote comes back as your next message, "
@@ -358,6 +360,8 @@ def agent_args(cfg, a, sid, new):
                                          + [f"{t}(/{d}/**)" for d in a["write_also"] for t in ("Edit", "Write")]),
                 "--disallowedTools", ",".join(a["extra_disallowed_tools"]),
                 "--append-system-prompt-file", rules, "--add-dir", a["home"]]
+        if a["extra_mcp_config"]:
+            args += ["--mcp-config", a["extra_mcp_config"]]
         if con:
             args += ["--permission-mode", "default"]
             settings.update(disableAllHooks=True, autoMemoryEnabled=False)
@@ -957,6 +961,8 @@ def owner_turn(msg_id, text, media_type, batch=None):
         if threads_on else ""
     head = (f"OPEN THREADS:\n{listing}\n\n" if listing else "") + \
         (f"THREAD NEWS (since your last turn):\n{news}\n\n" if news else "")
+    # The marker lets the daylog readers (night-draft.py) split the owner's words from the thread news.
+    head += f"{CFG['owner']['name']} SAYS:\n" if head else ""
     answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(head + text)))
     pick_react(OWNER, emoji)
     coordinator_send(answer, text, msg_id, voice)
@@ -968,16 +974,38 @@ def coordinator_send(answer, text, msg_id=None, voice=False):
     quote = (msg_id, OWNER, text) if qm and msg_id else None
     answer = re.sub(r"^\s*@@(QUOTE|SKIP)\s*:?.*$\n?", "", answer, flags=re.M).strip()
     answer, asks = take_asks(answer)
+    files = re.findall(r"^\s*@@FILE\s*:?\s*(.+?)\s*$", answer, re.M)
+    answer = re.sub(r"^\s*@@FILE\s*:?.*$\n?", "", answer, flags=re.M).strip()
     if CFG["threads"]["enabled"]:
         answer, notes = take_thread_markers(answer)
         main_log(CFG["owner"]["name"].upper(), text)
         answer = take_decisions("coordinator", answer)
         main_log("COORDINATOR", answer)
-        answer = "\n".join([answer] + [thread_dispatch(t, text) for t in notes]).strip()
+        acks = [thread_dispatch(t, text) for t in notes]  # the owner sees only problems, not "Sent to #n"
+        answer = "\n".join([answer] + [x for x in acks if x.startswith("(")]).strip()
     if answer:
         send_voice(OWNER, answer) if voice else send_text(OWNER, answer, quote=quote)
     for q, opts in asks:
         ask(OWNER, q, opts, kind="ask")
+    for f in files:
+        send_owner_file(f)
+
+
+def send_owner_file(path):
+    """@@FILE: <path> -> that file, sent as a document to the OWNER only (never a contact).
+    Only files inside the owner's folder; anything else is refused with a note to the owner."""
+    root = os.path.realpath(os.path.expanduser(CFG["owner"]["folder"]))
+    p = os.path.realpath(os.path.join(root, os.path.expanduser(path.strip().strip("'\""))))
+    if not (p.startswith(root + os.sep) and os.path.isfile(p)):
+        send_text(OWNER, f"(file not sent: {path} is not a file in {CFG['owner']['folder']})")
+        return
+    out = os.path.join(CFG["bridge"]["outbox"], f"{uuid.uuid4().hex[:8]}-{os.path.basename(p)}")
+    try:
+        os.makedirs(CFG["bridge"]["outbox"], exist_ok=True)
+        shutil.copyfile(p, out)
+        api("send", {"recipient": OWNER, "message": "", "media_path": out})
+    except Exception as e:
+        send_text(OWNER, f"(file not sent: {os.path.basename(p)}: {e})")
 
 
 # ---------- threads (opt-in: [threads]): the owner chat works like a Claude Project ----------
@@ -1055,15 +1083,22 @@ def thread_list(closed=False):
 
 def take_thread_markers(text):
     """'@@THREAD: title | brief' and '@@TO #n: note' lines -> (rest, [(kind, a, b)])."""
-    keep, out = [], []
+    keep, out, in_note = [], [], False
     for line in (text or "").splitlines():
         m = THREAD_MARK_RE.match(line)
+        if in_note and not m and line.strip() and not line.lstrip().startswith("@@"):
+            kind, a, b = out[-1]  # a note runs on until the first blank line, never shown to the owner
+            out[-1] = (kind, a, f"{b}\n{line.rstrip()}")
+            continue
+        in_note = False
         if m and m.group(1) == "THREAD" and m.group(2).strip():
             title, _, brief = m.group(2).partition("|")
             out.append(("new", title.strip()[:60], brief.strip()))
+            in_note = True
         elif m and m.group(1) == "TO" and re.match(r"#?(\d+)\s*:?\s*(.*)$", m.group(2), re.S):
             n, note = re.match(r"#?(\d+)\s*:?\s*(.*)$", m.group(2), re.S).groups()
             out.append(("to", n, note.strip()))
+            in_note = True
         else:
             keep.append(line)
     return "\n".join(keep).strip(), out
@@ -1248,10 +1283,11 @@ def thread_run(n, prompt):
 # Thread results go to the coordinator, not the owner: threads.digest_seconds after the first one,
 # the coordinator gets a turn of its own and sends ONE short message for all of them.
 DIGEST_PROMPT = (
-    "NO MESSAGE FROM {name}. Threads or agents reported (THREAD NEWS above). Send {name} ONE short message for "
-    "all of it: the bottom line first, what {name} must do (or that nothing is needed), and why it was "
-    "decided. Plain words, no thread transcripts. A thread question for {name}: ask it with @@ASK. "
-    "A file a thread sent: one line about it. Nothing worth telling: reply with only @@SKIP.")
+    "NO MESSAGE FROM {name}. Threads or agents reported (THREAD NEWS above). {name}'s rule (26 Oct 2026): "
+    "write ONLY when {name} must decide or do something, or something is urgent. Then ONE short message: "
+    "what {name} must do or decide, and why. A thread question for {name}: ask it with @@ASK. Plain words, "
+    "no thread transcripts. Everything else (done, progress, FYI): reply with only @@SKIP; mention it in one "
+    "line in your next normal reply if it matters.")
 THREAD_RESULT_RE = re.compile(r"\*\*\S+ \S+ (?:#\d+ .*\((?:blocked|review|done)\)|🔔 [^:*\n]+):\*\*")
 _digest = {"due": False, "timer": None}
 
@@ -1496,11 +1532,19 @@ def parse(out):
     note = CFG["prompts"]["owner_note_marker"]
     body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "REMIND": [], "QUOTE": "", "GIF": "", "STICKER": "", "MENTION": []}
     rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|REMIND|QUOTE|GIF|STICKER|MENTION)\s*:?\s*(.*)$")  # OWNER = template name, always private
+    cont = None  # lines after a note/EN marker belong to it: a multi-line owner note once leaked to the contact
     for line in out.splitlines():
         m = rx.match(line)
         if not m:
-            body.append(line)
-        elif m.group(1) in (note, "OWNER"):
+            if cont == "NOTE":
+                marks["NOTE"][-1] = (marks["NOTE"][-1] + "\n" + line).strip()
+            elif cont == "EN":
+                marks["EN"] = (marks["EN"] + "\n" + line).strip()
+            else:
+                body.append(line)
+            continue
+        cont = "NOTE" if m.group(1) in (note, "OWNER") else "EN" if m.group(1) == "EN" else None
+        if m.group(1) in (note, "OWNER"):
             marks["NOTE"].append(m.group(2))
         elif m.group(1) == "HOLD":
             marks["HOLD"] = True

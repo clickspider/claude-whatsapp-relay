@@ -10,6 +10,13 @@ class ParseTests(unittest.TestCase):
             body, marks = relay.parse(f"Hi Lara\n\n@@{marker}: private note\n@@EN: gist")
             self.assertEqual(body, "Hi Lara")
             self.assertEqual(marks["NOTE"], ["private note"])
+    def test_multi_line_owner_note_never_reaches_contact(self):
+        # 27 Oct 2026: a numbered @@DANIEL note leaked lines 2+ to mom in English
+        relay.CFG = {"prompts": {"owner_note_marker": "DANIEL"}}
+        body, marks = relay.parse("Понимаю ♥️\n\n@@DANIEL: She is upset:\n1) light broke\n2) boiler\n@@EN: I understand.\nSecond line.")
+        self.assertEqual(body, "Понимаю ♥️")
+        self.assertEqual(marks["NOTE"], ["She is upset:\n1) light broke\n2) boiler"])
+        self.assertEqual(marks["EN"], "I understand.\nSecond line.")
 
     def test_gif_and_sticker_markers_are_stripped(self):
         relay.CFG = {"prompts": {"owner_note_marker": "OWNER"}}
