@@ -814,10 +814,23 @@ def limit_hit(r):
     return m.group(1).strip() if m else ""
 
 
+_procs = set()  # running claude processes: an update stops them (see restart_if_changed)
+
+
 def run_claude(args, cwd, prompt):
     # The prompt goes in on stdin, never as an argument.
-    r = subprocess.run(args, cwd=cwd, input=prompt, capture_output=True, text=True,
-                       timeout=CFG["limits"]["run_timeout_seconds"] or None)
+    p = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    _procs.add(p)
+    try:
+        out, err = p.communicate(prompt, timeout=CFG["limits"]["run_timeout_seconds"] or None)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise
+    finally:
+        _procs.discard(p)
+    r = subprocess.CompletedProcess(args, p.returncode, out, err)
     when = limit_hit(r)
     if when is not None:
         raise ClaudeLimit(when)
@@ -946,7 +959,7 @@ def owner_prep(msg_id, text, media_type):
             path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
     text = quoted_text(OWNER, msg_id) + text
-    return text, voice or text.lower().startswith("voice")
+    return (RESUME_NOTE if msg_id in RESUMED else "") + text, voice or text.lower().startswith("voice")
 
 
 def owner_turn(msg_id, text, media_type, batch=None):
@@ -1241,7 +1254,7 @@ def thread_dispatch(note, owner_text):
         threads_db(n, title=a, state="working", sid="", last="", topic=topic,
                    effort=effort or auto_effort(a, b, owner_text))
         prompt = f"BRIEF FROM THE COORDINATOR: {b}" + (f"\n\n{name} SAID:\n{owner_text}" if owner_text else "")
-        enqueue(f"#{n}", lambda: thread_run(n, prompt))
+        thread_job(n, prompt)
         return f"Started #{n}: {a}"
     if a not in threads_db():
         return f"(No thread #{a}.)"
@@ -1249,8 +1262,14 @@ def thread_dispatch(note, owner_text):
     b, topic = take_topic(b)
     threads_db(a, state="working", **({"effort": effort} if effort else {}), **({"topic": topic} if topic else {}))
     prompt = f"NOTE FROM THE COORDINATOR: {b}" + (f"\n\n{name} SAID:\n{owner_text}" if owner_text else "")
-    enqueue(f"#{a}", lambda: thread_run(a, prompt))
+    thread_job(a, prompt)
     return f"Sent to #{a}."
+
+
+def thread_job(n, prompt):
+    key = f"thread-{n}-{time.time()}"
+    inflight(key, {"thread": [n, prompt]})
+    enqueue_job(f"#{n}", lambda: thread_run(n, prompt), key)
 
 
 def thread_run(n, prompt):
@@ -1386,7 +1405,7 @@ def thread_route(msg_id, text, media_type):
             threads_db(n, state="working")  # a message to a closed thread opens it again
             main_log(f"{CFG['owner']['name'].upper()} to #{n}", prep[0])
             thread_run(n, f"{CFG['owner']['name']} SAYS: {prep[0]}")
-    enqueue(f"#{n}", lambda: with_feedback(OWNER, msg_id, OWNER, turn))
+    enqueue_job(f"#{n}", lambda: with_feedback(OWNER, msg_id, OWNER, turn), msg_id)
     return True
 
 
@@ -1714,7 +1733,8 @@ def contact_turn(jid, a, msg_id, text, media_type, dry=False, sender=""):
     label = a["name"].upper() + (f" (from {who})" if who else "")
     log_thread(a, label, text, dry=dry)
     refs = {"#1": (msg_id, OWNER if dry else full_jid(sender or jid.split("@")[0]), text)}
-    deliver(jid, a, run_agent_told(jid, a, f"{label} #1: {untrusted(text)}", not dry), dry, refs=refs)
+    note = RESUME_NOTE if msg_id in RESUMED else ""
+    deliver(jid, a, run_agent_told(jid, a, f"{note}{label} #1: {untrusted(text)}", not dry), dry, refs=refs)
 
 
 def owner_command(name, arg):
@@ -1890,6 +1910,7 @@ owner_buf, owner_lock, owner_sched = [], threading.Lock(), [False]
 
 def owner_add(msg_id, content, media_type):
     """Owner messages that arrive close together (or while Claude is busy) become ONE turn."""
+    _claimed.add(msg_id)
     with owner_lock:
         owner_buf.append((msg_id, content, media_type, time.time()))
         if owner_sched[0]:
@@ -1910,6 +1931,14 @@ def owner_drain():
         items = [m[:3] for m in owner_buf]
         owner_buf.clear()
         owner_sched[0] = False
+    try:
+        owner_batch(items)
+    finally:  # an update kills the process before this: the batch then runs again after it
+        for m in items:
+            done_job(m[0])
+
+
+def owner_batch(items):
     commands = [m for m in items if (m[1] or "").strip().lower() in ("/new", "/publish")]
     rest = [m for m in items if m not in commands]
     for m in commands:  # commands run on their own, in order
@@ -1991,6 +2020,63 @@ def publish_now():
     send_text(OWNER, f"Published {len(commits)} change(s) to GitHub.")
 
 
+# ---------- updates: stop at once, go on after the restart ----------
+# Every message being handled (and every thread run) is in state/inflight.json until its job ends.
+# An update to relay.py stops all claude runs and restarts at once; the new process runs those jobs
+# again with RESUME_NOTE, in the same Claude sessions, so they go on from where they stopped.
+# ponytail: group digests ('listen') are not resumed; their buffer is lost on a restart.
+
+RESUME_NOTE = ("(The relay restarted for an update while you worked on this. Look at what you already "
+               "did in this session and go on from there. Do not redo finished steps and do not send "
+               "a message again that you already sent.)\n")
+RESUMED = set()  # message IDs handled again after an update
+_inflight, _claimed, _ilock = {}, set(), threading.Lock()
+
+
+def inflight(key, rec=None):
+    """Remember (rec) or forget (None) one job in state/inflight.json."""
+    with _ilock:
+        if rec is None:
+            if _inflight.pop(key, None) is None:
+                return
+        else:
+            _inflight[key] = rec
+        try:
+            write(st("inflight.json"), json.dumps(_inflight))
+        except (OSError, KeyError):  # no state folder (tests, broken setup): routing must go on
+            pass
+
+
+def done_job(key):
+    _claimed.discard(key)
+    inflight(key)
+
+
+def resume_jobs():
+    """After a restart: run again what the old process did not finish."""
+    try:
+        old = json.loads(read(st("inflight.json")) or "{}")
+    except ValueError:
+        old = {}
+    write(st("inflight.json"), "{}")
+    for key, rec in old.items():
+        if "route" in rec:
+            RESUMED.add(rec["route"][0])
+            route(*rec["route"])
+        elif "thread" in rec:
+            n, prompt = rec["thread"]
+            if n in threads_db():
+                thread_job(n, RESUME_NOTE + prompt)
+    if old:
+        print(f"{owner_now():%H:%M} resumed {len(old)} job(s) after the update", flush=True)
+
+
+def enqueue_job(key, fn, done):
+    """enqueue, and forget the in-flight key `done` when the job ends (also on an error)."""
+    _claimed.add(done)
+    enqueue(key, lambda: _finish(fn, done))
+
+
 def enqueue(key, fn):
     if key not in workers:  # one worker per chat, so nobody waits behind another
         q = workers[key] = queue.Queue()
@@ -2013,11 +2099,17 @@ def enqueue(key, fn):
     workers[key].put(fn)
 
 
+def _finish(job, done):
+    try:
+        job()
+    finally:
+        done_job(done)
+
+
 _limit_noted = set()
 
 
 def route(msg_id, chat, sender, content, media_type):
-    text = content or ""
     a = None if chat == OWNER else by_jid(chat)
     if chat != OWNER and (not a or not a["live"] or flag(a, "paused")):
         return  # unknown chats are ignored: never counted, never reported
@@ -2028,16 +2120,26 @@ def route(msg_id, chat, sender, content, media_type):
                              "Messages are ignored until it resets (see limits in the config).")
         return
     _limit_noted.discard(chat)
+    inflight(msg_id, {"route": [msg_id, chat, sender, content, media_type]})
+    try:
+        dispatch(msg_id, chat, sender, content, media_type, a)
+    finally:
+        if msg_id not in _claimed:  # handled at once (a command) or not at all: nothing to resume
+            inflight(msg_id)
+
+
+def dispatch(msg_id, chat, sender, content, media_type, a):
+    text = content or ""
     if chat == OWNER:
         m = re.match(r"^/(as)?([a-z]+)\b\s*(.*)$", text.strip(), re.S)
         if m and by_name(m.group(2))[1]:
             as_, name, arg = m.groups()
             jid, a = by_name(name)
             if as_:
-                return enqueue(name, lambda: with_feedback(OWNER, msg_id, OWNER, lambda: contact_turn(
-                    jid, a, msg_id, arg, media_type if not arg else None, dry=True)))
-            return enqueue(name, lambda: with_feedback(OWNER, msg_id, OWNER,
-                                                       lambda: owner_command(name, arg)))
+                return enqueue_job(name, lambda: with_feedback(OWNER, msg_id, OWNER, lambda: contact_turn(
+                    jid, a, msg_id, arg, media_type if not arg else None, dry=True)), msg_id)
+            return enqueue_job(name, lambda: with_feedback(OWNER, msg_id, OWNER,
+                                                       lambda: owner_command(name, arg)), msg_id)
         if CFG.get("threads", {}).get("enabled") and thread_route(msg_id, text, media_type):
             return
         return owner_add(msg_id, content, media_type)
@@ -2048,8 +2150,8 @@ def route(msg_id, chat, sender, content, media_type):
         return
     who = sender if "@" in (sender or "") else f"{sender}@s.whatsapp.net"
     flag(a, "last-in", f"{agent_now(a):{REMIND_FMT}}")  # self_per_day: they wrote, so the cap opens
-    enqueue(a["name"], lambda: with_feedback(chat, msg_id, who, lambda: contact_turn(
-        chat, a, msg_id, content, media_type, sender=sender)))
+    enqueue_job(a["name"], lambda: with_feedback(chat, msg_id, who, lambda: contact_turn(
+        chat, a, msg_id, content, media_type, sender=sender)), msg_id)
 
 
 def deliver_inbox(a, fixes_only=False):
@@ -2088,16 +2190,24 @@ def fix_last(a, prompt):
 
 
 def restart_if_changed():
-    """Opt-in (danger.self_edit): relay.py changed, restart when idle and the new code compiles."""
+    """Opt-in (danger.self_edit): relay.py changed and the new code compiles -> stop every claude run
+    and restart at once. Unfinished jobs go on after the restart (see resume_jobs)."""
     me = os.path.abspath(__file__)
-    if os.path.getmtime(me) == START_MTIME or busy[0] or _digest["due"] or any(not q.empty() for q in workers.values()):
+    if os.path.getmtime(me) == START_MTIME or _digest["due"]:
         return
     r = subprocess.run([sys.executable, "-m", "py_compile", me], capture_output=True, text=True)
     if r.returncode != 0:
         globals()["START_MTIME"] = os.path.getmtime(me)  # report once, keep running old code
         send_text(OWNER, "relay.py has a syntax error, so I did NOT restart:\n" + r.stderr[-800:])
         return
-    print(f"{owner_now():%H:%M} relay.py changed: restarting", flush=True)
+    print(f"{owner_now():%H:%M} relay.py changed: restarting, {len(_procs)} run(s) stopped", flush=True)
+    for p in list(_procs):
+        p.terminate()
+    for p in list(_procs):
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
     os._exit(0)  # launchd KeepAlive starts it again
 
 
@@ -2291,6 +2401,10 @@ def main_loop():
         last = c.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
     tick, grace = 0, CFG["limits"]["history_grace_seconds"]
     cutoff = time.time() - grace if grace else 0
+    try:
+        resume_jobs()
+    except Exception as e:
+        print(f"resume failed: {e}", flush=True)
     while True:
         rows, seen = new_rows(c, last, cutoff)
         for rowid, msg_id, chat, sender, content, media_type, filename in rows:
