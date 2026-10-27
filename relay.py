@@ -292,7 +292,7 @@ def owner_system(cfg):
         "QUOTING: add the line '@@QUOTE: #1' at the end to send your answer as a WhatsApp reply "
         "to the message. Only when several messages came in a row; not for every reply.\n"
         "FIXING MISTAKES: to correct your previous WhatsApp reply, put '@@EDIT_LAST: <full new "
-        "text>' at the end (works within 15 minutes), or '@@DELETE_LAST' to delete it.")
+        "text>' at the end (works within 15 minutes), or '@@DELETE_LAST' to delete it ('@@DELETE_LAST: 2' deletes the one before).")
     base += ("\nFILES: to send the owner a file (PDF, image, document), add a line '@@FILE: <path>' "
              "(absolute, or relative to the owner's folder; only files inside that folder).")
     if cfg["ui"]["polls"]:
@@ -621,11 +621,11 @@ def transcribe(path):
         return r.stdout.strip()
 
 
-def last_own(chat):
-    """ID of the newest message WE sent in this chat."""
+def last_own(chat, n=1):
+    """ID of the n-th newest message WE sent in this chat (1 = newest)."""
     c = db("messages.db")
     row = c.execute("SELECT id FROM messages WHERE chat_jid = ? AND is_from_me "
-                    "AND COALESCE(media_type, '') != 'poll' ORDER BY timestamp DESC LIMIT 1", (chat,)).fetchone()
+                    "AND COALESCE(media_type, '') != 'poll' ORDER BY timestamp DESC LIMIT 1 OFFSET ?", (chat, n - 1)).fetchone()
     c.close()
     return row[0] if row else None
 
@@ -674,7 +674,8 @@ def apply_fixes(chat, text):
             edit_lines.append(line)
         else:
             keep.append(line)
-    mid = last_own(chat) if mode else None
+    back = "".join(edit_lines).strip()  # '@@DELETE_LAST: 2' = our 2nd newest message (a newer one must stay)
+    mid = last_own(chat, int(back) if mode == "DELETE_LAST" and back.isdigit() else 1) if mode else None
     if mode == "DELETE_LAST" and mid:
         api("revoke", {"recipient": chat, "message_id": mid})
     elif mode == "EDIT_LAST" and mid and edit_lines:
