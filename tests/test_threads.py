@@ -178,15 +178,14 @@ class ThreadTests(unittest.TestCase):
             relay.coordinator_digest()
             self.assertEqual(len(self.sent), n)  # @@SKIP sends nothing
         self.assertIn("never write to the owner", relay.owner_system(relay.CFG))
-        relay._digest["due"] = True  # a waiting digest holds a restart back; an empty one clears it
+        relay._digest["due"] = True  # an update does not wait for a digest: it runs after the restart
         with mock.patch.object(relay.os.path, "getmtime", return_value=0), \
-                mock.patch.object(relay.os, "_exit", side_effect=SystemExit) as ex:
-            relay.restart_if_changed()
-            ex.assert_not_called()
-            relay.coordinator_digest()
-            self.assertFalse(relay._digest["due"])
+                mock.patch.object(relay.os, "_exit", side_effect=SystemExit):
             with self.assertRaises(SystemExit):
                 relay.restart_if_changed()
+        self.assertIn("digest", relay._inflight)
+        relay.STOPPING.clear()
+        relay.inflight("digest")
 
     def test_agent_notes_go_to_the_coordinator(self):
         a = dict(name="lara", trust="reply", checkins=True, ask_contact=False, mentions=False, gifs=False,

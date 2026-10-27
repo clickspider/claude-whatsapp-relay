@@ -508,6 +508,7 @@ def pace():
 
 
 def api(path, payload=None):
+    hold_if_stopping()  # an update is stopping the relay: nobody sees anything from a stopped run
     if path in ("send", "poll"):
         pace()
     guard = path == "send" and OWN[0] and payload["recipient"] == OWNER
@@ -815,6 +816,15 @@ def limit_hit(r):
 
 
 _procs = set()  # running claude processes: an update stops them (see restart_if_changed)
+STOPPING = threading.Event()  # set by an update; the process exits a few seconds later
+NO_SESSION = "No conversation found with session ID"
+
+
+def hold_if_stopping():
+    """A run that was stopped by an update must not answer, send an error or react: wait for the
+    exit. The job is still in state/inflight.json and runs again after the restart."""
+    if STOPPING.is_set():
+        threading.Event().wait()
 
 
 def run_claude(args, cwd, prompt):
@@ -830,7 +840,12 @@ def run_claude(args, cwd, prompt):
         raise
     finally:
         _procs.discard(p)
+        hold_if_stopping()
     r = subprocess.CompletedProcess(args, p.returncode, out, err)
+    if "--resume" in args and NO_SESSION in (out or "") + (err or ""):
+        # stopped before its first turn was saved: start that session after all
+        i = args.index("--resume")
+        return run_claude(args[:i] + ["--session-id"] + args[i + 1:], cwd, prompt)
     when = limit_hit(r)
     if when is not None:
         raise ClaudeLimit(when)
@@ -1297,6 +1312,7 @@ def thread_run(n, prompt):
             dec = decisions_for(n, t.get("topic", ""), new)
             if dec:
                 prompt = f"DECISIONS (newest last; a newer one wins):\n{dec}\n\n{prompt}"
+            threads_db(n, sid=sid)  # saved first: a run stopped by an update goes on in this session
             r = run_claude(owner_args(CFG, sid, new, rules, [st("threads")], effort), folder, prompt)
     except Exception as e:  # timeout, usage limit: never leave the thread "working" with no run
         threads_db(n, sid=sid if not new else t.get("sid", ""), state="blocked", last=f"Run failed: {e}"[:160])
@@ -2067,6 +2083,8 @@ def resume_jobs():
             n, prompt = rec["thread"]
             if n in threads_db():
                 thread_job(n, RESUME_NOTE + prompt)
+        elif "digest" in rec:
+            digest_soon()
     if old:
         print(f"{owner_now():%H:%M} resumed {len(old)} job(s) after the update", flush=True)
 
@@ -2193,7 +2211,7 @@ def restart_if_changed():
     """Opt-in (danger.self_edit): relay.py changed and the new code compiles -> stop every claude run
     and restart at once. Unfinished jobs go on after the restart (see resume_jobs)."""
     me = os.path.abspath(__file__)
-    if os.path.getmtime(me) == START_MTIME or _digest["due"]:
+    if os.path.getmtime(me) == START_MTIME:
         return
     r = subprocess.run([sys.executable, "-m", "py_compile", me], capture_output=True, text=True)
     if r.returncode != 0:
@@ -2201,6 +2219,9 @@ def restart_if_changed():
         send_text(OWNER, "relay.py has a syntax error, so I did NOT restart:\n" + r.stderr[-800:])
         return
     print(f"{owner_now():%H:%M} relay.py changed: restarting, {len(_procs)} run(s) stopped", flush=True)
+    if _digest["due"]:  # thread news waiting for the coordinator: report it after the restart
+        inflight("digest", {"digest": True})
+    STOPPING.set()
     for p in list(_procs):
         p.terminate()
     for p in list(_procs):
