@@ -1283,6 +1283,7 @@ def thread_dispatch(note, owner_text):
 
 def thread_job(n, prompt):
     key = f"thread-{n}-{time.time()}"
+    threads_db(n, state="working")  # /threads shows it runs, also after a resume
     inflight(key, {"thread": [n, prompt]})
     enqueue_job(f"#{n}", lambda: thread_run(n, prompt), key)
 
