@@ -283,6 +283,18 @@ def agent_voice(a):
     return OWN[0] if a.get("use_owner_voice") is None else bool(a["use_owner_voice"])
 
 
+# A turn that waits in the foreground for the relay (its restart, a later message, an inbox note
+# being sent) deadlocks: the relay only restarts or moves on after the turn ends. 27 Oct 2026: the
+# owner chat hung 30 min on a script that waited for the relay PID to exit.
+WAIT_RULE = (
+    "\nWAITING: the relay runs your turn and only restarts, sends your reply or handles the next "
+    "message AFTER your turn ends. So never wait in the foreground for the relay (its restart, its "
+    "PID, a reply, a later message or an inbox note being sent): it deadlocks the chat until the "
+    "timeout. If something must happen later or after a restart, start it detached "
+    "('nohup <script> >/dev/null 2>&1 &'), say so in your reply and end your turn. Waiting for a "
+    "build, test or download that finishes on its own is fine.")
+
+
 def owner_system(cfg):
     o = cfg["owner"]
     base = o["system_prompt"] or (
@@ -300,6 +312,7 @@ def owner_system(cfg):
                  "(2 to 12 options). It arrives as a WhatsApp poll. The vote comes back as your next message, "
                  "'ANSWER: <option>'.")
     base += react_prompt(cfg)
+    base += WAIT_RULE
     if cfg["threads"]["enabled"]:
         base += coordinator_rules(cfg)
     voice = owner_voice(cfg)
