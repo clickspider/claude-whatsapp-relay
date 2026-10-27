@@ -98,10 +98,14 @@ class ThreadTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 relay.thread_run("7", "go")
         self.assertEqual(relay.threads_db()["7"]["state"], "blocked")
-        relay.threads_db("8", title="y", state="working", sid="", last="")
-        relay.thread_recover()
-        self.assertEqual(relay.threads_db()["8"]["state"], "blocked")
-        self.assertIn("#8 y", self.sent[-1])
+        relay.threads_db("8", title="y", state="working", sid="", last="")  # lost run: goes on, silently
+        relay.threads_db("6", title="w", state="blocked", sid="", last=relay.LOST_NOTE)
+        n = len(self.sent)
+        with mock.patch.object(relay, "thread_job") as tj:
+            relay.resume_jobs()
+        self.assertEqual(sorted(c[0][0] for c in tj.call_args_list), ["6", "8"])
+        self.assertTrue(all(c[0][1].startswith(relay.RESUME_NOTE) for c in tj.call_args_list))
+        self.assertEqual(len(self.sent), n)
 
     def test_working_means_a_run_and_old_reviews_close(self):
         relay.threads_db("9", title="z", state="working", sid="", last="")

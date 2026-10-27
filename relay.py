@@ -1056,7 +1056,7 @@ def send_owner_file(path):
 # Thread messages start with "#<n> <title>:". Reply to one, or start a message with "#<n>", to talk
 # to that thread. /threads lists them, /done <n> closes one. Registry: state/threads.json,
 # logs: state/threads/<n>.md (every thread may read them).
-# A run in flight is lost on a crash; thread_recover marks it blocked at the next start.
+# A run in flight that a crash or update stops goes on at the next start (resume_jobs).
 
 COORDINATOR_RULES = (
     "\nTHREADS: you are the coordinator of the owner's project. Answer quick questions yourself. "
@@ -1366,16 +1366,6 @@ def coordinator_digest():
     answer, _ = take_react(apply_fixes(OWNER, ask_owner_claude(
         head + DIGEST_PROMPT.format(name=CFG["owner"]["name"]))))
     coordinator_send(answer, "")
-
-
-def thread_recover():
-    """At start: a thread still "working" lost its run (crash, reboot). Say so instead of hiding it."""
-    stuck = [(k, t["title"]) for k, t in threads_db().items() if t["state"] == "working"]
-    for k, _ in stuck:
-        threads_db(k, state="blocked", last="Stopped by a relay restart. Reply to go on.")
-    if stuck:
-        send_text(OWNER, "Not finished, stopped by a restart: " + ", ".join(f"#{k} {x}" for k, x in stuck)
-                  + ". Reply to one to go on.")
 
 
 def thread_auto_close():
@@ -2085,8 +2075,18 @@ def resume_jobs():
                 thread_job(n, RESUME_NOTE + prompt)
         elif "digest" in rec:
             digest_soon()
-    if old:
-        print(f"{owner_now():%H:%M} resumed {len(old)} job(s) after the update", flush=True)
+    # A thread left "working" (crash, reboot, kill) or parked by the old restart notice: go on too.
+    queued = {r["thread"][0] for r in old.values() if "thread" in r}
+    lost = [k for k, t in threads_db().items() if k not in queued and (
+        t["state"] == "working" or t["state"] == "blocked" and t.get("last") == LOST_NOTE)] \
+        if CFG.get("threads", {}).get("enabled") else []
+    for k in lost:
+        thread_job(k, RESUME_NOTE + "Go on with your task from where you stopped.")
+    if old or lost:
+        print(f"{owner_now():%H:%M} resumed {len(old) + len(lost)} job(s) after a restart", flush=True)
+
+
+LOST_NOTE = "Stopped by a relay restart. Reply to go on."  # old notice, now resumed automatically
 
 
 def enqueue_job(key, fn, done):
@@ -2107,8 +2107,10 @@ def enqueue(key, fn):
                     job()
                 except Exception as e:  # report to the owner, never stop the worker
                     try:
+                        why = (f"Claude run timed out after {e.timeout:.0f} s"
+                               if isinstance(e, subprocess.TimeoutExpired) else str(e)[:300])
                         send_text(OWNER, (f"{key}: {e}" if key != "owner" else str(e))
-                                  if isinstance(e, ClaudeLimit) else f"Error ({key}): {e}")
+                                  if isinstance(e, ClaudeLimit) else f"Error ({key}): {why}")
                     except Exception:
                         pass
                 finally:
@@ -2641,8 +2643,6 @@ def main(argv):
     setup(cfg)
     keep_awake()
     battery_warning()
-    if cfg["threads"]["enabled"]:
-        thread_recover()
     OWN[0] = bot_is_owner()
     if OWN[0]:
         print(OWN_NOTE, flush=True)
