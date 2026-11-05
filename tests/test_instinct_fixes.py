@@ -178,7 +178,8 @@ class InstinctFixes(unittest.TestCase):
                 mock.patch.object(relay, "media_text", lambda a, c, m, t, mt: t), \
                 mock.patch.object(relay, "log_thread"), mock.patch.object(relay, "full_jid", lambda x: x), \
                 mock.patch.object(relay, "run_agent_told", return_value="yes"), \
-                mock.patch.object(relay, "deliver") as dv:
+                mock.patch.object(relay, "deliver", side_effect=lambda j, a, out, dry, refs=None, **k:
+                                  relay.sending_text(refs, out)) as dv:
             relay.contact_turn("9@s.whatsapp.net", a, "c1", "is 8 ok?", "")
         dv.assert_called_once()
         self.assertTrue(relay._inflight["c1"]["sending"])

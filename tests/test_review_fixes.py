@@ -64,9 +64,9 @@ class ReviewFixes(unittest.TestCase):
         self.assertTrue(relay.read(relay.st("threads/main.md")).startswith("**"))
 
     # 4. a contact answer cut by a restart: the bridge decides, never a blind re-run
-    def contact_cut(self, got):
+    def contact_cut(self, got, text="see you at 8"):
         relay.write(relay.st("inflight.json"), json.dumps({"m1": {
-            "route": ["m1", "c@s.whatsapp.net", "c", "hi", ""], "sending": True, "after": 5}}))
+            "route": ["m1", "c@s.whatsapp.net", "c", "hi", ""], "sending": True, "after": 5, "text": text}}))
         relay._inflight.clear()
         with mock.patch.object(relay, "landed", return_value=got), mock.patch.object(relay, "route") as r:
             relay.resume_jobs()
@@ -79,6 +79,21 @@ class ReviewFixes(unittest.TestCase):
 
     def test_contact_send_that_never_landed_runs_again(self):
         self.contact_cut(False).assert_called_once()
+
+    def test_contact_answer_that_never_reached_the_send_runs_again(self):
+        self.contact_cut(True, text=None).assert_called_once()  # deliver() never got to a contact send
+
+    def test_held_or_silent_contact_answer_is_never_run_again(self):  # review B4: "" = nothing went to them
+        self.contact_cut(False, text="").assert_not_called()
+
+    def test_old_record_without_a_receipt_is_unknown_not_rerun(self):
+        relay.write(relay.st("inflight.json"), json.dumps({"m1": {
+            "route": ["m1", "c@s.whatsapp.net", "c", "hi", ""], "sending": True, "after": 5}}))
+        relay._inflight.clear()
+        with mock.patch.object(relay, "route") as r:
+            relay.resume_jobs()
+        r.assert_not_called()
+        self.assertIn("uncertain", self.sent[-1])
 
     # 5. a crash inside resume_jobs loses no record
     def test_resume_keeps_records_until_their_next_step_is_registered(self):
@@ -107,6 +122,11 @@ class ReviewFixes(unittest.TestCase):
             relay.thread_auto_close()
         self.assertIn("@@TO #9", notes[0])
 
+    def test_a_note_to_the_thread_clears_the_still_needed_clock(self):
+        relay.threads_db("9", title="z", state="blocked", reported=time.time() - 8 * 86400, asked=time.time())
+        relay.thread_job("9", "still needed, go on")
+        self.assertEqual(relay.threads_db()["9"]["asked"], 0)
+
     # 12. an inbox note whose turn never ended goes back to the inbox
     def test_inbox_note_cut_by_a_restart_is_delivered_again(self):
         d = os.path.join(self.tmp.name, "mom")
@@ -118,6 +138,66 @@ class ReviewFixes(unittest.TestCase):
         with mock.patch.object(relay, "by_name", return_value=("j", {"dir": d})):
             relay.resume_jobs()
         self.assertTrue(os.path.exists(os.path.join(d, "inbox", "n.md")))
+
+
+class SecondReview(unittest.TestCase):
+    """Bugs an independent review found in the first fix round (B1-B8)."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+    digest = ReviewFixes.digest
+
+    def test_b1_a_page_without_a_result_does_not_stall_the_digest(self):
+        relay.CFG["threads"]["main_chat_chars"] = 300
+        relay.main_log("DANIEL to #4", "long note " + "z" * 400)  # not a result, bigger than one page
+        relay.threads_db("4", title="t4", state="review", reported=time.time() - 60)
+        relay.main_log("#4 t4 (review)", "the result")
+        for _ in range(3):
+            self.digest()
+        self.assertNotIn("the result", relay.main_since("coordinator", lambda w: False, peek=True))  # it went out
+
+    def test_b2_inbox_job_on_the_limit_never_takes_the_digest_slot(self):
+        self.assertNotEqual(relay.job_id({"inbox": ["mom", "n.md"]}), relay.job_id({"digest": True}))
+        self.assertEqual(relay.job_name({"inbox": ["mom", "n.md"]}), "a note to mom")
+
+    def test_b3_receipt_is_the_part_that_goes_out_last(self):
+        a = "#4 is done.\n@@DRAFT\nhi vendor\n@@END\nsend it?\n@@TO #4: do this:\n- step a"
+        self.assertEqual(relay.last_sent(a).splitlines()[-1], "send it?")
+        self.assertEqual(relay.last_sent("@@DRAFT\nonly a draft\n@@END"), "only a draft")
+
+    def test_b5_digest_retry_backs_off_stops_and_never_after_the_send(self):
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["fails"] = 0
+        delays = []
+        with mock.patch.object(relay.threading, "Timer", lambda d, f: delays.append(d) or mock.Mock()):
+            for _ in range(6):
+                with self.assertRaises(RuntimeError):
+                    self.digest(side_effect=RuntimeError("timeout"))
+            self.assertEqual(delays, [300, 600, 1200, 2400, 3600])  # then it waits for the next news
+            relay._digest["fails"] = 0
+            with mock.patch.object(relay, "main_mark", side_effect=RuntimeError("disk full")):
+                with self.assertRaises(RuntimeError):
+                    self.digest()  # it went out, then failed: no second digest
+        self.assertEqual(len(delays), 5)
+
+    def test_b6_one_bad_record_never_stops_the_rest(self):
+        relay.threads_db("3", title="a", state="working")
+        relay.write(relay.st("inflight.json"), json.dumps({
+            "m2": {"route": ["m2", relay.OWNER, "o", "hi", ""]}, "thread-3-1": {"thread": ["3", "go"]}}))
+        relay._inflight.clear()
+        with mock.patch.object(relay, "route", side_effect=ValueError("bad")), \
+                mock.patch.object(relay, "thread_job") as tj:
+            relay.resume_jobs()
+        tj.assert_called()  # the thread after the bad record still goes on
+        self.assertTrue(any("could not go on" in t for t in self.sent))
+
+    def test_b7_stop_in_the_owner_chat_keeps_inbox_jobs(self):
+        self.assertEqual(relay.job_worker({"inbox": ["mom", "n.md"]}), "mom")
+
+    def test_b8_a_cut_entry_says_so(self):
+        relay.CFG["threads"]["main_chat_chars"] = 100
+        relay.main_log("#4 t (review)", "x" * 300)
+        news, _ = relay.main_since("coordinator", lambda w: False, peek=True, offset=True)
+        self.assertIn("(cut here", news)
 
 
 class JobDedupThreadsOff(unittest.TestCase):

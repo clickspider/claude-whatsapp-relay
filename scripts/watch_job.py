@@ -53,17 +53,19 @@ def main(argv):
     title = argv[0].strip()
     pid = os.getpid() if run else int(argv[1])
     started = proc_start(pid)
-    if not title or not started:
-        sys.exit(f"NOT REGISTERED: {'no title' if not title else f'no running process with pid {pid}'}")
     log = os.path.abspath(os.path.expanduser(argv[2])) if len(argv) == 3 else ""
-    try:
-        d = jobs_dir(conf)
-    except (OSError, ValueError) as e:  # under nohup ... >/dev/null stderr is lost: put it in the job's log too
-        msg = f"NOT REGISTERED: relay config {conf}: {e}"
+
+    def refuse(msg):  # under nohup ... >/dev/null stderr is lost: the job's log says it too
         if log:
             with open(log, "a") as f:
-                f.write(msg + "\n")
-        sys.exit(msg)
+                f.write(f"NOT REGISTERED: {msg}\n")
+        sys.exit(f"NOT REGISTERED: {msg}")
+    if not title or not started:
+        refuse("no title" if not title else f"no running process with pid {pid}")
+    try:
+        d = jobs_dir(conf)
+    except (OSError, ValueError) as e:
+        refuse(f"relay config {conf}: {e}")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"{pid}.json")
     rec = {"title": title, "pid": pid, "started": started, "log": log, "mode": "run" if run else "watch"}

@@ -147,6 +147,11 @@ class JobWatch(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         with open(log) as f:
             self.assertIn("NOT REGISTERED", f.read())  # under nohup >/dev/null the log still says why
+        dead = os.path.join(self.dir, "dead.log")
+        subprocess.run([sys.executable, "-I", os.path.join(HERE, "scripts/watch_job.py"), "#1 x", "999999", dead,
+                        "--config", self.conf], capture_output=True, text=True)
+        with open(dead) as f:
+            self.assertIn("NOT REGISTERED: no running process", f.read())
         r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "scripts/watch_job.py"), "#1 x", "123", "--config"],
                            capture_output=True, text=True)
         self.assertIn("Give a detached job an owner", r.stderr)  # usage, not an IndexError
@@ -257,7 +262,6 @@ class DigestCrashGaps(unittest.TestCase):
         c.commit(), c.close()
         self.assertFalse(relay.landed("me", after, "1. #7 is done.\n2. #8 waits for you."))  # first bubble only: cut
         self.assertTrue(relay.landed("me", after, "1. #7 is done."))
-        self.assertTrue(relay.landed("me", after))  # no text (a contact): anything of ours counts
         self.assertIsNone(relay.landed("me", None, "x"))
         c = sqlite3.connect(os.path.join(store, "messages.db"))
         mid = c.execute("SELECT max(rowid) FROM messages").fetchone()[0]

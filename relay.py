@@ -1141,6 +1141,8 @@ def job_worker(rec):
         return f"#{rec['thread'][0]}"
     if "route" in rec and rec["route"][1] != OWNER:
         return (by_jid(rec["route"][1]) or {}).get("name")
+    if "inbox" in rec:
+        return rec["inbox"][0]
     return "owner"
 
 
@@ -1448,12 +1450,12 @@ def bridge_rowid():
     return row[0] if row else None
 
 
-def landed(chat, after, text=None):
+def landed(chat, after, text):
     """Did our answer reach `chat` after row `after`? True/False, None = unknown (no anchor or no store).
-    The receipt for an answer a restart cut off (Instinct, 5 Nov 2026). With `text`: its LAST line must be
-    there (the first bubble alone is a cut send, not a delivery); without: any message of ours counts."""
+    The receipt for an answer a restart cut off (Instinct, 5 Nov 2026): the LAST line of `text` must be
+    there (the first bubble alone is a cut send, not a delivery)."""
     lines = [l.strip() for l in (text or "").splitlines() if l.strip() and not l.strip().startswith("@@")]
-    if after is None or text is not None and not lines:
+    if after is None or not lines:
         return None
     try:
         c = db("messages.db")
@@ -1462,8 +1464,6 @@ def landed(chat, after, text=None):
         c.close()
     except sqlite3.Error:
         return None
-    if text is None:
-        return bool(rows)
     tail = lines[-1][-120:]
     return any(r[0] and tail in r[0] for r in rows)
 
@@ -1487,7 +1487,16 @@ def mark_sending(*msg_ids):
     for mid in msg_ids:
         rec = _inflight.get(mid)
         if rec:
-            inflight(mid, dict(rec, sending=True, after=after))
+            inflight(mid, dict(rec, sending=True, after=after, text=None))
+
+
+def sending_text(refs, text):
+    """deliver() records what goes to the contact ("" = nothing does: held, silent): the receipt a restart
+    checks (resume_jobs). No record = it never got this far, so nothing went out yet."""
+    mid = refs["#1"][0] if refs and "#1" in refs else None
+    rec = _inflight.get(mid)
+    if rec and rec.get("sending"):
+        inflight(mid, dict(rec, text=text[-4000:]))
 
 
 def coordinator_send(answer, text, voice=False, refs=None):
@@ -1745,7 +1754,7 @@ def news_page(data, start, own, limit):
         if e and not own((WHO_RE.match(e) or [None, ""])[1]):
             if keep and size + len(e) > limit:
                 return keep, pos
-            keep.append(e[:limit])
+            keep.append(e if len(e) <= limit else e[:limit] + "\n(cut here: the full entry is in threads/main.md)")
             size += len(e) + 2
         pos = b
     return keep, len(data)
@@ -1839,7 +1848,7 @@ def thread_dispatch(note, owner_text):
 
 def thread_job(n, prompt):
     key = f"thread-{n}-{time.time()}"
-    threads_db(n, state="working")  # /threads shows it runs, also after a resume
+    threads_db(n, state="working", asked=0)  # /threads shows it runs; a new note = an answer to "still needed?"
     inflight(key, {"thread": [n, prompt]})
 
     def run():
@@ -1956,20 +1965,26 @@ def coordinator_digest():
     if not _digest["due"]:
         return
     _digest["due"] = False  # also when there is nothing to send: a restart waits on this flag
+    _digest["sent"] = False
     try:
         _coordinator_digest()
+        _digest["fails"] = 0
     except (ClaudeLimit, StopRun):  # the limit parks it; /stop is the owner's choice
         raise
     except Exception:  # timeout, network: the news is still unread, try again (Instinct review)
-        threading.Timer(300, digest_soon).start()
+        n = _digest["fails"] = _digest.get("fails", 0) + 1
+        if not _digest["sent"] and n <= 5:  # after the send: never again (no repeat digest); 5 m .. 1 h
+            t = threading.Timer(min(300 * 2 ** (n - 1), 3600), digest_soon)
+            t.daemon = True
+            t.start()
         raise
 
 
 def _coordinator_digest():
     t0 = time.time()
     news, upto = main_since("coordinator", coordinator_own, peek=True, offset=True)
-    if not THREAD_RESULT_RE.search(news):
-        return
+    if not THREAD_RESULT_RE.search(news) and not unread_result():  # a page without a result still goes out
+        return  # when a result waits behind it: else the digest stalls on that page (review B1)
     night = owner_night()
     listing = thread_list()
     head = (f"OPEN THREADS:\n{listing}\n\n" if listing else "") + f"THREAD NEWS (since your last turn):\n{news}\n\n"
@@ -1985,8 +2000,9 @@ def _coordinator_digest():
         if not SKIP_RE.sub("", answer).strip():  # silence is a recorded choice, never a lost event
             main_log("COORDINATOR", "Chose silence (it already reached the owner) for: " + "; ".join(items))
     inflight("digest", {"digest": True, "sending": True, "upto": upto, "after": bridge_rowid(),
-                        "text": SKIP_RE.sub("", answer)[-4000:]})  # a restart now: check the receipt, never blind
+                        "text": last_sent(answer)[-4000:]})  # a restart now: check the receipt, never blind
     coordinator_send(answer, "")
+    _digest["sent"] = True
     main_mark("coordinator", upto)
     mark_delivered(t0, news)
     more_news()
@@ -2006,6 +2022,14 @@ def finished_items(news):
             if FINISHED_WHO.match(w)]
 
 
+def last_sent(answer):
+    """The part of a coordinator answer that goes out LAST (coordinator_send: drafts first, markers and @@TO
+    blocks never reach the owner): what the restart receipt must find."""
+    rest, drafts = take_drafts(SKIP_RE.sub("", answer))
+    rest = take_thread_markers(rest)[0] if CFG["threads"]["enabled"] else rest
+    return rest.strip() or (drafts[-1] if drafts else "")
+
+
 def mark_delivered(t0, news):
     """Thread results reported before t0 whose entry was in the news of an answer that went out: delivered
     now. Only those: a result that did not fit in the news is not delivered (auto-close waits on this)."""
@@ -2016,9 +2040,16 @@ def mark_delivered(t0, news):
             threads_db(k, delivered=now)
 
 
+def unread_result():
+    """A thread result or job note anywhere in the coordinator's unread timeline (not only the newest part)."""
+    with _tlock:
+        data, start = read(st("threads/main.md")), seen_offsets().get("coordinator", 0)
+    return bool(THREAD_RESULT_RE.search(data[start if start <= len(data) else 0:]))
+
+
 def more_news():
     """News left over (it did not fit in one message): the next digest pages on."""
-    if THREAD_RESULT_RE.search(main_since("coordinator", coordinator_own, peek=True)):
+    if unread_result():
         digest_soon()
 
 
@@ -2466,7 +2497,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     images = m["IMAGE"] if a.get("images") and not held else []  # a held draft sends no images
     files = m["FILE"] if a.get("files") and not held else []
     if not body and not images and not files:
-        return
+        return sending_text(refs, "")
     if held:
         flag(a, "pending", body)
         log_thread(a, f"AGENT (held for {owner})", body, m["EN"], dry)
@@ -2474,13 +2505,14 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
                          f"{body}\n\nReply /{name} ok to send it, or /{name} <your words>.")
         if CFG["ui"]["polls"]:
             ask(OWNER, f"{name} draft: send it?", DRAFT_OPTIONS, kind="draft", agent=name, draft=digest(body))
-        return
+        return sending_text(refs, "")
+    sending_text(refs, body)  # before the pictures: from here a restart checks the receipt, never re-runs blind
     for spec in images:  # before the text: the question comes after the pictures
         send_agent_image(a, OWNER if dry else jid, spec)
     for spec in files:
         send_agent_image(a, OWNER if dry else jid, spec, exts=(".pdf",))
     if not body:
-        return
+        return sending_text(refs, "")
     log_thread(a, "AGENT", body, m["EN"], dry)
     if a.get("trial_hours") and not dry and not flag(a, "trial-start"):
         flag(a, "trial-start", f"{agent_now(a):{REMIND_FMT}}")  # the trial clock starts at the first message
@@ -2488,6 +2520,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     tags = []
     if a["mentions"] and m["MENTION"] and not dry:
         body, tags = add_mentions(a, body, m["MENTION"])
+    sending_text(refs, body)
     send_text(OWNER if dry else jid, (f"[dry run → {name}]\n" if dry else "") + body, quote=quote, mentions=tags)
     if a["gifs"] and (m["GIF"] or m["STICKER"]):
         send_gif(OWNER if dry else jid, m["STICKER"] or m["GIF"], sticker=bool(m["STICKER"]))
@@ -2963,41 +2996,12 @@ def resume_jobs():
     notes = {}  # thread -> [(prompt, ran)], in the order they were queued
     unsure = []
     for key, rec in old.items():
-        chat = rec["route"][1] if "route" in rec else ""
-        got = landed(chat, rec.get("after")) if "route" in rec and rec.get("sending") and chat != OWNER else None
-        if "route" in rec and rec.get("sending") and got is not False:  # never send it twice
-            if got is None:  # the owner chat (own messages look the same) or no anchor: say so
-                text = rec["route"][3] or f"({rec['route'][4]})"
-                unsure.append(text if chat == OWNER else (by_jid(chat) or {}).get("name", "an agent") + ": " + text)
+        try:
+            resume_one(key, rec, notes, unsure)
+        except Exception as e:  # one bad record never stops the rest: it is dropped and the owner told
+            print(f"resume of {key} failed: {e}", flush=True)
             inflight(key)
-        elif "route" in rec:  # not sent yet, or the bridge shows nothing of ours landed: run it again
-            RESUMED.add(rec["route"][0])
-            route(*rec["route"])
-            if key not in _claimed:
-                inflight(key)
-        elif "inbox" in rec:  # an inbox note moved to done/ but its turn never ended: deliver it again
-            _, a = by_name(rec["inbox"][0])
-            src = os.path.join(a["dir"], "inbox", "done", rec["inbox"][1]) if a else ""
-            if src and os.path.exists(src):
-                os.replace(src, os.path.join(a["dir"], "inbox", rec["inbox"][1]))
-            inflight(key)
-        elif "thread" in rec:
-            n, prompt = rec["thread"]
-            notes.setdefault(n, []).append((key, prompt, rec.get("ran") or prompt.startswith((RESUME_NOTE, LIMIT_NOTE, TIMEOUT_NOTE))))
-        elif "digest" in rec and rec.get("sending"):  # stopped while it went out: ask the bridge what landed
-            got = landed(OWNER, rec.get("after"), rec.get("text", ""))
-            if got is False:  # nothing landed: the news stays unread and goes out again
-                inflight(key)
-                digest_soon()
-            else:  # landed (no copy), or the bridge cannot tell (delivery unknown: say so, no blind copy)
-                main_mark("coordinator", rec["upto"])
-                inflight(key)
-                if got is None:
-                    unsure.append("a thread update")
-        elif "digest" in rec:
-            digest_soon()
-        else:  # a kind this version does not know: never kept forever
-            inflight(key)
+            unsure.append(f"{job_name(rec)} (it could not go on: {e})")
     for n, jobs in notes.items():
         if n in threads_db():
             thread_job(n, merged_prompt([j[1:] for j in jobs]))
@@ -3006,7 +3010,7 @@ def resume_jobs():
     for text in unsure:  # Instinct: delivery uncertain = say so, never a copy "to be safe"
         send_text(OWNER, f"(The relay restarted while the answer to \"{text[:80]}\" went out. Delivery is "
                          "uncertain. It was not sent again; ask again if something is missing.)")
-    if CFG["threads"]["enabled"] and THREAD_RESULT_RE.search(main_since("coordinator", coordinator_own, peek=True)):
+    if CFG["threads"]["enabled"] and unread_result():
         digest_soon()  # news logged just before a crash lost its digest timer: the recovery path reports it
     # A thread left "working" (crash, reboot, kill) or parked by the old restart notice: go on too.
     queued = {r["thread"][0] for r in old.values() if "thread" in r} | {  # parked on the usage limit: wait
@@ -3018,6 +3022,53 @@ def resume_jobs():
         thread_job(k, RESUME_NOTE + "Go on with your task from where you stopped.")
     if old or lost:
         print(f"{owner_now():%H:%M} resumed {len(old) + len(lost)} job(s) after a restart", flush=True)
+
+
+def resume_one(key, rec, notes, unsure):
+    """One record of inflight.json after a restart (resume_jobs)."""
+    chat = rec["route"][1] if "route" in rec else ""
+    got = None
+    if "route" in rec and rec.get("sending") and chat != OWNER:  # deliver() wrote what went to the contact
+        t = rec.get("text", "?")  # "?" = a record from before this check: unknown, never a blind re-run
+        got = None if t == "?" else False if t is None else True if not t else landed(chat, rec.get("after"), t)
+    if "route" in rec and rec.get("sending") and got is not False:  # never send it twice
+        if got is None:  # the owner chat (own messages look the same) or no anchor: say so
+            text = rec["route"][3] or f"({rec['route'][4]})"
+            unsure.append(text if chat == OWNER else (by_jid(chat) or {}).get("name", "an agent") + ": " + text)
+        inflight(key)
+    elif "route" in rec:  # not sent yet, or the bridge shows nothing of ours landed: run it again
+        RESUMED.add(rec["route"][0])
+        route(*rec["route"])
+        if key not in _claimed:
+            inflight(key)
+    elif "inbox" in rec:  # an inbox note moved to done/ but its turn never ended: deliver it again
+        inbox_back(rec)
+        inflight(key)
+    elif "thread" in rec:
+        n, prompt = rec["thread"]
+        notes.setdefault(n, []).append((key, prompt, rec.get("ran") or prompt.startswith((RESUME_NOTE, LIMIT_NOTE, TIMEOUT_NOTE))))
+    elif "digest" in rec and rec.get("sending"):  # stopped while it went out: ask the bridge what landed
+        got = landed(OWNER, rec.get("after"), rec.get("text", ""))
+        if got is False:  # nothing landed: the news stays unread and goes out again
+            inflight(key)
+            digest_soon()
+        else:  # landed (no copy), or the bridge cannot tell (delivery unknown: say so, no blind copy)
+            main_mark("coordinator", rec["upto"])
+            inflight(key)
+            if got is None:
+                unsure.append("a thread update")
+    elif "digest" in rec:
+        digest_soon()
+    else:  # a kind this version does not know: never kept forever
+        inflight(key)
+
+
+def inbox_back(rec):
+    """An inbox note whose turn never ended (restart, usage limit): back to the inbox, the scan delivers it."""
+    _, a = by_name(rec["inbox"][0])
+    src = os.path.join(a["dir"], "inbox", "done", rec["inbox"][1]) if a else ""
+    if src and os.path.exists(src):
+        os.replace(src, os.path.join(a["dir"], "inbox", rec["inbox"][1]))
 
 
 def merged_prompt(jobs):
@@ -3119,6 +3170,8 @@ def job_id(rec):
     if "thread" in rec:
         n, prompt = rec["thread"]
         return f"thread:{n}:" + hashlib.sha1(bare_prompt(prompt).encode()).hexdigest()[:12]
+    if "inbox" in rec:
+        return "inbox:" + ":".join(rec["inbox"])
     return "digest"
 
 
@@ -3175,6 +3228,8 @@ def job_name(rec):
     if "route" in rec:
         return "your message" if rec["route"][1] == OWNER else \
             f"a message to {(by_jid(rec['route'][1]) or {}).get('name', 'an agent')}"
+    if "inbox" in rec:
+        return f"a note to {rec['inbox'][0]}"
     return "the thread news"
 
 
@@ -3202,6 +3257,8 @@ def resume_parked(now=None):
             if n not in threads_db():
                 continue
             thread_job(n, LIMIT_NOTE + bare_prompt(prompt))
+        elif "inbox" in rec:
+            inbox_back(rec)
         elif "digest" in rec:
             digest_soon()
         names.append(job_name(rec))
