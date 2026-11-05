@@ -2065,7 +2065,9 @@ def write_history(a):
         c.close()
     except sqlite3.Error:
         return None
-    lines = [f"{str(t)[:16]} {'me' if me else member(a, s) or s}: {(text or '(' + (mt or 'empty') + ')')[:500]}"
+    # our own old leaks stay out: the agent copied the 'I sent Yakov ...' shape from its history
+    lines = [f"{str(t)[:16]} {'me' if me else member(a, s) or s}: "
+             f"{((split_report(text)[0] if me and text else text) or '(' + (mt or 'empty') + ')')[:500]}"
              for t, s, me, text, mt in reversed(rows)]
     path = os.path.join(a["home"], "history.md")
     write(path, f"# Last {len(rows)} messages of this chat, oldest first\n" + untrusted("\n".join(lines)) + "\n")
@@ -2097,6 +2099,28 @@ def parse(out):
         else:
             marks[m.group(1)] = m.group(2).strip()
     return "\n".join(body).strip(), marks
+
+
+NON_LATIN_RE = re.compile(r"[Ѐ-ӿ֐-׿؀-ۿ]")  # Cyrillic, Hebrew, Arabic
+URL_RE = re.compile(r"\S*://\S+|www\.\S+")
+
+
+def split_report(body):
+    """Unmarked text goes to the chat, so a report the agent writes to the owner's side ('I sent Yakov
+    the split as one message.') once reached the contact (Yakov, 8 times on 4-5 Nov 2026). In a Hebrew,
+    Russian or Arabic message, a first or last paragraph with only Latin words (4+, links not counted)
+    is that report: -> (body without it, [cut paragraphs]). Same-script leaks (English chats) are not
+    caught here; the inbox prompt line covers those."""
+    if not NON_LATIN_RE.search(body):
+        return body, []
+    paras = [p for p in re.split(r"\n[ \t]*\n", body) if p.strip()]
+    report = lambda p: not NON_LATIN_RE.search(p) and len(re.findall(r"[A-Za-z]{2,}", URL_RE.sub("", p))) >= 4
+    head, tail = [], []
+    while paras and report(paras[0]):
+        head.append(paras.pop(0).strip())
+    while paras and report(paras[-1]):
+        tail.insert(0, paras.pop().strip())
+    return "\n\n".join(paras).strip(), head + tail
 
 
 def agent_now(a):
@@ -2142,6 +2166,8 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     out, emoji = take_react(apply_fixes(OWNER if dry else jid, out))
     out = SKIP_RE.sub("", out).strip()
     body, m = parse(out)
+    body, cut = split_report(body)
+    m["NOTE"] += [f"held back from the chat (an English report in the message text): {p}" for p in cut]
     name, owner = a["name"], CFG["owner"]["name"]
     held = (m["HOLD"] or a["trust"] == "draft" or hold) and allow_hold
     if not held:  # a held draft is not reviewed yet: its reaction never goes out
@@ -3006,6 +3032,13 @@ def on_edit(msg_id, chat, sender, target_id, text):
                                 f"repeat your answer.)\n{text}", "")
 
 
+# A note from the owner's side reads like a task, so the agent once answered it with a report
+# ('I sent Yakov ...') in plain text, and plain text goes to the chat (4-5 Nov 2026).
+INBOX_REPLY_RULE = ("\n\n(Your reply is sent to the chat word for word. Write only the message for them, "
+                    "in their language. What you did, what you checked and what is still open goes on an "
+                    "@@OWNER line, never in the message text.)")
+
+
 def deliver_inbox(a, fixes_only=False):
     """Opt-in (agent inbox = true): the owner's Claude leaves notes in <agent dir>/inbox/*.md.
     'FIX:' notes (edit/delete the agent's last message) run any hour; others outside quiet hours."""
@@ -3022,7 +3055,7 @@ def deliver_inbox(a, fixes_only=False):
         if not note:
             continue
         log_thread(a, f"FROM {CFG['owner']['name'].upper()}'S CLAUDE", note)
-        prompt = CFG["prompts"]["from_owner_claude"] + note
+        prompt = CFG["prompts"]["from_owner_claude"] + note + INBOX_REPLY_RULE
         if note.upper().startswith("FIX:"):
             enqueue(a["name"], lambda a=a, prompt=prompt: fix_last(a, prompt))
         else:
