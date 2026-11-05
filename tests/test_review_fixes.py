@@ -197,7 +197,132 @@ class SecondReview(unittest.TestCase):
         relay.CFG["threads"]["main_chat_chars"] = 100
         relay.main_log("#4 t (review)", "x" * 300)
         news, _ = relay.main_since("coordinator", lambda w: False, peek=True, offset=True)
-        self.assertIn("(cut here", news)
+        self.assertIn(relay.PAGE_CUT, news)
+
+
+class ThirdReview(unittest.TestCase):
+    """Instinct's re-review of 7f37b23 (N1-N4 and its test gaps)."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+    digest = ReviewFixes.digest
+
+    def shown(self):
+        return relay.main_since("coordinator", lambda w: False, peek=True)
+
+    def test_n1_an_entry_bigger_than_a_page_is_paged_inside_and_delivered_at_its_end(self):
+        relay.CFG["threads"]["main_chat_chars"] = 300
+        relay.threads_db("4", title="t4", state="review", reported=time.time() - 60)
+        relay.main_log("#4 t4 (review)", "START " + "x" * 5000 + " THE-END")
+        prompts = []
+        for _ in range(40):
+            relay._digest["due"] = True
+            with mock.patch.object(relay, "owner_night", return_value=False), \
+                    mock.patch.object(relay, "ask_owner_claude", side_effect=lambda p: prompts.append(p) or "ok"), \
+                    mock.patch.object(relay, "coordinator_send"):
+                relay.coordinator_digest()
+            if len(prompts) == 1:
+                self.assertIn(relay.PAGE_CUT, prompts[0])  # the cut is said
+                self.assertFalse(relay.threads_db()["4"].get("delivered"))  # its end was not shown yet
+                self.assertIn("THE-END", self.shown())  # the tail is still unread
+            if not relay.unread_result():
+                break
+        self.assertIn("THE-END", prompts[-1])
+        self.assertIn("#4 t4 (review)", prompts[-1])  # every piece carries its header
+        self.assertTrue(relay.threads_db()["4"].get("delivered"))  # delivered once the end went out
+
+    def pages(self, n=40):
+        prompts = []
+        for _ in range(n):
+            relay._digest["due"] = True
+            with mock.patch.object(relay, "owner_night", return_value=False), \
+                    mock.patch.object(relay, "ask_owner_claude", side_effect=lambda p: prompts.append(p) or "ok"), \
+                    mock.patch.object(relay, "coordinator_send"):
+                relay.coordinator_digest()
+            yield prompts[-1] if prompts else None
+            if not relay.unread_result():
+                break
+
+    def test_n1_a_bold_line_in_the_first_piece_is_not_its_end(self):  # independent review, round 3
+        relay.CFG["threads"]["main_chat_chars"] = 300
+        relay.threads_db("4", title="t4", state="review", reported=time.time() - 60)
+        relay.main_log("#4 t4 (review)", "Intro\n\n**Summary**\nabc\n" + "x" * 2000 + " THE-END")
+        next(self.pages())
+        self.assertFalse(relay.threads_db()["4"].get("delivered"))
+
+    def test_n1_a_bold_line_is_never_taken_for_the_header(self):
+        relay.CFG["threads"]["main_chat_chars"] = 300
+        relay.threads_db("4", title="t4", state="review", reported=time.time() - 60)
+        relay.main_log("#4 t4 (review)", "x" * 250 + "\n**Next steps**\n" + "y" * 2000 + " THE-END")
+        last = list(self.pages())[-1]
+        self.assertIn("#4 t4 (review)", last)
+        self.assertTrue(relay.threads_db()["4"].get("delivered"))
+
+    def test_n1_the_delivery_check_runs_once_per_result_not_per_piece(self):
+        relay.CFG["threads"]["main_chat_chars"] = 300
+        relay.main_log("#4 t4 (review)", "x" * 2000 + " THE-END")
+        n = 0
+        for _ in range(40):
+            relay._digest["due"] = True
+            with mock.patch.object(relay, "owner_night", return_value=False), \
+                    mock.patch.object(relay, "ask_owner_claude", return_value="@@SKIP") as ac, \
+                    mock.patch.object(relay, "coordinator_send"):
+                relay.coordinator_digest()
+            n += sum("DELIVERY CHECK" in c.args[0] for c in ac.call_args_list)
+            if not relay.unread_result():
+                break
+        self.assertEqual(n, 1)
+
+    def test_the_timeline_cut_keeps_offsets_exact(self):  # independent review: the cut was off by one
+        relay.main_log("#1 t (review)", "a" * 450_000)
+        relay.main_log("#2 t (review)", "MARK" + "b" * 200)
+        relay.main_mark("coordinator", relay.read(relay.st("threads/main.md")).index("MARK"))  # inside #2
+        relay.main_log("#3 t (review)", "c" * 60_000)  # > 500 KB: the front is cut
+        news, _ = relay.main_since("coordinator", lambda w: False, peek=True, offset=True)
+        self.assertIn("(continued)\nMARK", news)
+
+    def test_n2_a_result_in_the_middle_of_a_big_backlog_is_not_stalled(self):
+        relay.CFG["threads"]["main_chat_chars"] = 300
+        relay.main_log("#4 t (review)", "first")
+        for i in range(3):
+            relay.main_log("DANIEL to #9", f"note {i} " + "n" * 250)
+        relay.main_log("#5 t (review)", "middle result")
+        for i in range(5):
+            relay.main_log("DANIEL to #9", f"later {i} " + "n" * 250)  # more than one window after it
+        self.digests.clear()
+        self.digest()
+        self.assertTrue(self.digests)  # the next page is armed
+
+    def test_n3_a_reaction_or_first_chunk_is_not_a_receipt(self):
+        import sqlite3
+        store = relay.CFG["bridge"]["store"]
+        os.makedirs(store, exist_ok=True)
+        c = sqlite3.connect(os.path.join(store, "messages.db"))
+        c.execute("CREATE TABLE messages (id TEXT, chat_jid TEXT, content TEXT, is_from_me BOOLEAN)")
+        c.execute("INSERT INTO messages VALUES ('0', 'c', 'before', 1)")
+        c.commit()
+        after = relay.bridge_rowid()
+        c.execute("INSERT INTO messages VALUES ('1', 'c', '👍', 1)")
+        c.execute("INSERT INTO messages VALUES ('2', 'c', 'part one of the answer', 1)")
+        c.commit(), c.close()
+        self.assertFalse(relay.landed("c", after, "part one of the answer\npart two, the end"))
+
+    def test_n4_a_digest_ending_in_a_draft_anchors_on_its_body(self):
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["due"] = True
+        with mock.patch.object(relay, "owner_night", return_value=False), \
+                mock.patch.object(relay, "ask_owner_claude", return_value="#4 is done, forward this:\n@@DRAFT\nhi vendor\n@@END"), \
+                mock.patch.object(relay, "coordinator_send", side_effect=relay.StopRun()):
+            with self.assertRaises(relay.StopRun):
+                relay.coordinator_digest()
+        self.assertEqual(relay._inflight["digest"]["text"], "#4 is done, forward this:")
+        relay.inflight("digest")
+
+    def test_a_digest_that_sent_nothing_is_no_uncertain_case(self):
+        relay.write(relay.st("inflight.json"), json.dumps({"digest": {
+            "digest": True, "sending": True, "upto": 0, "after": 1, "text": ""}}))
+        relay._inflight.clear()
+        relay.resume_jobs()
+        self.assertFalse(any("uncertain" in t for t in self.sent))
 
 
 class JobDedupThreadsOff(unittest.TestCase):

@@ -1673,7 +1673,7 @@ def main_log(who, text):
             data = read(path)
             drop = max(0, len(data) - 100_000)
             m = ENTRY_RE.search(data, drop)  # on an entry boundary: never half an entry
-            drop = m.start() if m else drop
+            drop = m.start() + 1 if m else drop  # +1: the kept file starts at "**" (read() would strip the "\n")
             write(path, data[drop:])
             seen = seen_offsets()  # every reader's offset moves with the cut (else old news comes back)
             seen.update({k: max(0, v - drop) for k, v in seen.items() if not k.startswith(("dec:", "_"))})
@@ -1743,18 +1743,40 @@ def main_since(key, own, peek=False, offset=False):
     return "\n\n".join(keep)[-limit:]
 
 
+PAGE_CUT = "(continues in the next update: this entry is longer than one message)"
+
+
+def mid_entry(data, start):
+    """True when offset `start` lies inside an entry (a page cut one that was longer than a page)."""
+    return 0 < start < len(data) and not ENTRY_HEAD_RE.match(data, start)
+
+
+ENTRY_HEAD_RE = re.compile(r"\s*\*\*\d{4}-\d\d-\d\d \d\d:\d\d ")  # an offset at an entry (read() strips the end)
+
+
 def news_page(data, start, own, limit):
     """The oldest unread entries of the timeline that fit in `limit` characters, and where they end.
     Instinct review 5 Nov 2026: the newest 10 KB were shown and the read mark moved past all of it, so an
-    older result above the cut was marked read and delivered unseen. Now the rest waits for the next turn."""
-    keep, size, pos = [], 0, start
+    older result above the cut was marked read and delivered unseen. Now the rest waits for the next turn.
+    One entry longer than a page is paged inside (re-review N1): its header goes in front of every piece,
+    and only the piece with its end counts as delivered (mark_delivered skips a PAGE_CUT piece)."""
+    keep, size, pos, head = [], 0, start, ""
+    if mid_entry(data, start):
+        h = max((m.start() + 1 for m in ENTRY_RE.finditer(data, 0, start)), default=0)  # a real header, never
+        end = data.find("\n", h)  # a **bold** line in the body; 0 = the first entry (read() strips its newline)
+        head = (data[h:end] + "\n(continued)\n") if data.startswith("**", h) and 0 < end < start else ""
     bounds = [m.start() for m in ENTRY_RE.finditer(data, start)] + [len(data)]
     for b in bounds:
-        e = data[pos:b].strip()
+        pre = head if pos == start else ""
+        e = (pre + data[pos:b].strip()) if data[pos:b].strip() else ""
         if e and not own((WHO_RE.match(e) or [None, ""])[1]):
             if keep and size + len(e) > limit:
                 return keep, pos
-            keep.append(e if len(e) <= limit else e[:limit] + "\n(cut here: the full entry is in threads/main.md)")
+            if len(e) > limit:  # bigger than a page: this piece now, the rest on the next page
+                cut = min(b, pos + max(limit // 2, limit - len(pre), 1))
+                keep.append(pre + data[pos:cut].strip() + ("\n" + PAGE_CUT if cut < b else ""))
+                return keep, cut
+            keep.append(e)
             size += len(e) + 2
         pos = b
     return keep, len(data)
@@ -1993,7 +2015,7 @@ def _coordinator_digest():
         + (MORNING_PROMPT if _digest.pop("morning", False) and not night else ""))))
     if night and not SKIP_RE.sub("", answer).strip():
         return digest_after_night()  # the news stays unread: the morning digest sends it
-    items = finished_items(news)
+    items = [] if news.endswith(PAGE_CUT) else finished_items(news)  # one line per result, at its last piece
     if items and not SKIP_RE.sub("", answer).strip():  # delivery check: finished work never vanishes in a @@SKIP
         answer, _ = take_react(apply_fixes(OWNER, ask_owner_claude(
             head + DELIVERY_PROMPT.format(name=CFG["owner"]["name"], items="\n".join(f"- {i}" for i in items)))))
@@ -2033,6 +2055,8 @@ def last_sent(answer):
 def mark_delivered(t0, news):
     """Thread results reported before t0 whose entry was in the news of an answer that went out: delivered
     now. Only those: a result that did not fit in the news is not delivered (auto-close waits on this)."""
+    if news.endswith(PAGE_CUT):  # a cut piece (always alone on its page): its end was not shown yet
+        news = ""
     now, shown = time.time(), {w.split(" ")[0][1:] for w in finished_items(news) if w.startswith("#")}
     for k, t in threads_db().items():
         if k in shown and t["state"] in ("review", "blocked") and t.get("reported", 0) < t0 \
@@ -2044,7 +2068,8 @@ def unread_result():
     """A thread result or job note anywhere in the coordinator's unread timeline (not only the newest part)."""
     with _tlock:
         data, start = read(st("threads/main.md")), seen_offsets().get("coordinator", 0)
-    return bool(THREAD_RESULT_RE.search(data[start if start <= len(data) else 0:]))
+    start = start if start <= len(data) else 0
+    return mid_entry(data, start) or bool(THREAD_RESULT_RE.search(data[start:]))  # mid-entry: its rest waits
 
 
 def more_news():
@@ -3048,7 +3073,7 @@ def resume_one(key, rec, notes, unsure):
         n, prompt = rec["thread"]
         notes.setdefault(n, []).append((key, prompt, rec.get("ran") or prompt.startswith((RESUME_NOTE, LIMIT_NOTE, TIMEOUT_NOTE))))
     elif "digest" in rec and rec.get("sending"):  # stopped while it went out: ask the bridge what landed
-        got = landed(OWNER, rec.get("after"), rec.get("text", ""))
+        got = landed(OWNER, rec.get("after"), rec["text"]) if rec.get("text") else True  # "" = it sent nothing
         if got is False:  # nothing landed: the news stays unread and goes out again
             inflight(key)
             digest_soon()
@@ -4101,7 +4126,9 @@ def main_loop():
                     send_text(OWNER, f"Error routing a message: {e}")
                 except Exception:
                     pass
-            finally:  # after route registered it (inflight): a crash in between re-reads it, never loses it
+            finally:  # after route registered it (inflight): a crash in between re-reads it, never loses it.
+                # At-least-once by choice: a crash after route() ended but before this write runs the message
+                # again after the restart (route already forgot it). Duplicate beats loss; the window is tiny.
                 write(cur, str(last))
         if seen != last:
             last = seen

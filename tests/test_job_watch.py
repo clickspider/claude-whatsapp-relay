@@ -286,7 +286,7 @@ class DigestCrashGaps(unittest.TestCase):
         self.assertIn("new news", self.unread())
         relay.main_mark("coordinator", upto)  # the in-flight digest from before the cut ends
         self.assertIn("new news", self.unread())
-        for _ in range(3):  # paged: the long entry, then the rest
+        for _ in range(12):  # paged: the long entry piece by piece, then the rest
             relay.main_mark("coordinator", relay.main_since("coordinator", lambda w: False, peek=True, offset=True)[1])
         self.assertEqual(self.unread(), "")
 
