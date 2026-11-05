@@ -518,6 +518,15 @@ def write(path, text):
         f.write(text)
 
 
+def write_atomic(path, text):
+    """write() for files a crash must never leave half-written (the timeline, read offsets, in-flight jobs)."""
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+
+
 def token():
     if _token[0] is None:
         _token[0] = (os.environ.get("WHATSAPP_BRIDGE_TOKEN", "").strip()
@@ -1431,7 +1440,7 @@ def landed(chat, after, text):
         c.close()
     except sqlite3.Error:
         return None
-    return any(r[0] and r[0].strip() and r[0].strip()[:200] in text for r in rows)
+    return any(r[0] and r[0].strip() and r[0].strip().splitlines()[0][:120] in text for r in rows)
 
 
 def sent_id(chat, text):
@@ -1629,7 +1638,13 @@ def main_log(who, text):
     path = st("threads/main.md")
     with _tlock:
         if os.path.exists(path) and os.path.getsize(path) > 500_000:  # keep the newest 100 KB
-            write(path, read(path)[-100_000:])
+            data = read(path)
+            drop = max(0, len(data) - 100_000)
+            write_atomic(path, data[drop:])
+            seen = seen_offsets()  # every reader's offset moves with the cut (else old news comes back)
+            seen.update({k: max(0, v - drop) for k, v in seen.items() if not k.startswith(("dec:", "_"))})
+            seen["_cut"] = seen.get("_cut", 0) + drop  # offsets handed out before the cut stay valid (main_mark)
+            write_atomic(st("main-seen.json"), json.dumps(seen))
         thread_log("main", who, text)
 
 
@@ -1650,18 +1665,25 @@ def decisions_for(n, topic, new):
     No topic: the newest 40 of all."""
     with _tlock:
         lines = read(st("threads/decisions.md")).splitlines()
-        try:
-            seen = json.loads(read(st("main-seen.json")) or "{}")
-        except ValueError:
-            seen = {}
+        seen = seen_offsets()
         start, seen[f"dec:{n}"] = (0 if new else seen.get(f"dec:{n}", len(lines))), len(lines)
-        write(st("main-seen.json"), json.dumps(seen))
+        write_atomic(st("main-seen.json"), json.dumps(seen))
     pick = lines[start:] if start <= len(lines) else lines
     if not topic:
         return "\n".join(pick[-40:])
     mine = [x for x in pick if f"[{topic}]:" in x][-200:]
     rest = [x for x in pick if "[general]:" in x][-20:]
     return "\n".join(sorted(mine + rest))  # lines start with the date: sorted = in time order
+
+
+def seen_offsets():
+    """state/main-seen.json: read offsets per reader in threads/main.md (call with _tlock held).
+    "_cut" = characters cut off the front of main.md so far: offsets handed out by main_since(offset=True)
+    and kept for unread() count from the first byte ever written, so a cut in between never moves them."""
+    try:
+        return json.loads(read(st("main-seen.json")) or "{}")
+    except ValueError:
+        return {}
 
 
 def main_since(key, own, peek=False, offset=False):
@@ -1673,30 +1695,26 @@ def main_since(key, own, peek=False, offset=False):
         return ("", 0) if offset else ""
     with _tlock:
         data = read(path)
-        try:
-            seen = json.loads(read(st("main-seen.json")) or "{}")
-        except ValueError:
-            seen = {}
+        seen = seen_offsets()
+        cut = seen.get("_cut", 0)
         start, seen[key] = seen.get(key, 0), len(data)
         if not peek:
-            write(st("main-seen.json"), json.dumps(seen))
-            _read.__dict__.setdefault("undo", {}).setdefault(key, start)
+            write_atomic(st("main-seen.json"), json.dumps(seen))
+            _read.__dict__.setdefault("undo", {}).setdefault(key, start + cut)
     new = data[start:] if start <= len(data) else data
     keep = [e.strip() for e in ENTRY_RE.split(new)
             if e.strip() and not own((WHO_RE.match(e) or [None, ""])[1])]
     text = "\n\n".join(keep)[-limit:]
-    return (text, len(data)) if offset else text
+    return (text, len(data) + cut) if offset else text
 
 
 def main_mark(key, upto):
     """`key` has seen the timeline up to `upto` (an offset from main_since(offset=True))."""
     with _tlock:
-        try:
-            seen = json.loads(read(st("main-seen.json")) or "{}")
-        except ValueError:
-            seen = {}
+        seen = seen_offsets()
+        upto = max(0, upto - seen.get("_cut", 0))
         seen[key] = max(seen.get(key, 0), upto)  # monotonic: a late recovery never rewinds a newer read
-        write(st("main-seen.json"), json.dumps(seen))
+        write_atomic(st("main-seen.json"), json.dumps(seen))
 
 
 _read = threading.local()  # main_since offsets this worker read: given back when its run hits the limit
@@ -1708,12 +1726,10 @@ def unread():
     if not undo:
         return
     with _tlock:
-        try:
-            seen = json.loads(read(st("main-seen.json")) or "{}")
-        except ValueError:
-            seen = {}
-        seen.update({k: min(v, seen.get(k, v)) for k, v in undo.items()})
-        write(st("main-seen.json"), json.dumps(seen))
+        seen = seen_offsets()
+        cut = seen.get("_cut", 0)
+        seen.update({k: min(max(0, v - cut), seen.get(k, v)) for k, v in undo.items()})
+        write_atomic(st("main-seen.json"), json.dumps(seen))
 
 
 def is_own(n):
@@ -2867,7 +2883,7 @@ def inflight(key, rec=None):
         else:
             _inflight[key] = rec
         try:
-            write(st("inflight.json"), json.dumps(_inflight))
+            write_atomic(st("inflight.json"), json.dumps(_inflight))
         except (OSError, KeyError):  # no state folder (tests, broken setup): routing must go on
             pass
 

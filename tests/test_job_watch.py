@@ -246,11 +246,30 @@ class DigestCrashGaps(unittest.TestCase):
         c.commit(), c.close()
         self.assertTrue(relay.landed("me", after, "1. #7 is done.\n2. #8 waits for you."))
         self.assertIsNone(relay.landed("me", None, "x"))
+        c = sqlite3.connect(os.path.join(store, "messages.db"))
+        mid = c.execute("SELECT max(rowid) FROM messages").fetchone()[0]
+        c.execute("INSERT INTO messages VALUES ('3', 'me', '1. #9 is done.\n2. #10 waits.', 1)")
+        c.commit(), c.close()
+        # a marker line between two lines was removed before the send: the sent text is still found
+        self.assertTrue(relay.landed("me", mid, "1. #9 is done.\n@@TO #9: thanks\n2. #10 waits."))
 
     def test_read_offsets_never_go_back(self):
         relay.main_log("🔔 job", "#7 run ended")
         relay.main_since("coordinator", lambda w: False)  # a newer read
         relay.main_mark("coordinator", 5)  # a late recovery with an old offset
+        self.assertEqual(self.unread(), "")
+
+    def test_the_500kb_cut_never_brings_old_news_back(self):
+        relay.main_log("#3 film (review)", "old news " + "x" * 450_000)
+        relay.main_since("coordinator", lambda w: False)  # all read
+        _, upto = relay.main_since("coordinator", lambda w: False, peek=True, offset=True)  # a digest in flight
+        relay.main_log("#3 film (review)", "y" * 60_000)  # > 500 KB: the front is cut
+        relay.main_log("#4 cv (done)", "new news")
+        self.assertNotIn("x" * 50, self.unread())  # before: the whole file came back, every turn
+        self.assertIn("new news", self.unread())
+        relay.main_mark("coordinator", upto)  # the in-flight digest from before the cut ends
+        self.assertIn("new news", self.unread())
+        relay.main_mark("coordinator", relay.main_since("coordinator", lambda w: False, peek=True, offset=True)[1])
         self.assertEqual(self.unread(), "")
 
     def test_restart_during_an_owner_turn_keeps_the_news(self):
