@@ -117,7 +117,7 @@ class ThreadTests(unittest.TestCase):
         with mock.patch.object(relay.time, "time", return_value=relay.time.time() + 73 * 3600):
             relay.thread_auto_close()
         self.assertEqual(relay.threads_db()["9"]["state"], "review")  # the owner never got the result: stays
-        relay.mark_delivered(relay.time.time() + 1)
+        relay.mark_delivered(relay.time.time() + 1, "**2026-11-05 10:00 #9 z (review):**\nagents started")
         relay.thread_auto_close()
         self.assertEqual(relay.threads_db()["9"]["state"], "review")
         with mock.patch.object(relay.time, "time", return_value=relay.time.time() + 25 * 3600):

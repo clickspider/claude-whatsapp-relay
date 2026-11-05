@@ -140,6 +140,17 @@ class JobWatch(unittest.TestCase):
         relay.job_watch()
         self.assertIn("args: --config model.toml", self.notes[0][1])
 
+    def test_registration_errors_are_never_silent(self):
+        log = os.path.join(self.dir, "r.log")
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "scripts/watch_job.py"), "#1 x", "--run", log,
+                            "--config", os.path.join(self.dir, "missing.toml"), "--", "true"], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        with open(log) as f:
+            self.assertIn("NOT REGISTERED", f.read())  # under nohup >/dev/null the log still says why
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "scripts/watch_job.py"), "#1 x", "123", "--config"],
+                           capture_output=True, text=True)
+        self.assertIn("Give a detached job an owner", r.stderr)  # usage, not an IndexError
+
     def test_log_tail_reads_from_the_end(self):
         log = os.path.join(self.dir, "big.log")
         with open(log, "w") as f:
@@ -244,7 +255,9 @@ class DigestCrashGaps(unittest.TestCase):
         self.assertFalse(relay.landed("me", after, "1. #7 is done.\n2. #8 waits for you."))
         c.execute("INSERT INTO messages VALUES ('2', 'me', '1. #7 is done.', 1)")
         c.commit(), c.close()
-        self.assertTrue(relay.landed("me", after, "1. #7 is done.\n2. #8 waits for you."))
+        self.assertFalse(relay.landed("me", after, "1. #7 is done.\n2. #8 waits for you."))  # first bubble only: cut
+        self.assertTrue(relay.landed("me", after, "1. #7 is done."))
+        self.assertTrue(relay.landed("me", after))  # no text (a contact): anything of ours counts
         self.assertIsNone(relay.landed("me", None, "x"))
         c = sqlite3.connect(os.path.join(store, "messages.db"))
         mid = c.execute("SELECT max(rowid) FROM messages").fetchone()[0]
@@ -269,7 +282,8 @@ class DigestCrashGaps(unittest.TestCase):
         self.assertIn("new news", self.unread())
         relay.main_mark("coordinator", upto)  # the in-flight digest from before the cut ends
         self.assertIn("new news", self.unread())
-        relay.main_mark("coordinator", relay.main_since("coordinator", lambda w: False, peek=True, offset=True)[1])
+        for _ in range(3):  # paged: the long entry, then the rest
+            relay.main_mark("coordinator", relay.main_since("coordinator", lambda w: False, peek=True, offset=True)[1])
         self.assertEqual(self.unread(), "")
 
     def test_restart_during_an_owner_turn_keeps_the_news(self):

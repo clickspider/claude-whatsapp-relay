@@ -514,17 +514,39 @@ def read(path, default=""):
 
 
 def write(path, text):
-    with open(path, "w") as f:
-        f.write(text)
-
-
-def write_atomic(path, text):
-    """write() for files a crash must never leave half-written (the timeline, read offsets, in-flight jobs)."""
-    with open(path + ".tmp", "w") as f:
+    """Atomic: a temp file in the same folder, fsync, rename. A restart or crash never leaves half a file
+    (Instinct review 5 Nov 2026: a torn state file was read as empty). A .json file keeps its last version
+    as .bak, for load_state."""
+    path = os.path.realpath(path)
+    if path.endswith(".json") and os.path.exists(path):
+        shutil.copyfile(path, path + ".bak")
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(path + ".tmp", path)
+    os.replace(tmp, path)
+
+
+def load_state(name):
+    """A JSON state file -> dict. A broken file is never read as empty without a word: it is kept aside,
+    its .bak (the version before) comes back, and the owner gets one line."""
+    path = st(name)
+    try:
+        return json.loads(read(path) or "{}")
+    except ValueError:
+        pass
+    keep = f"{path}.corrupt-{int(time.time())}"
+    os.replace(path, keep)
+    try:
+        data, how = json.loads(read(path + ".bak") or "{}"), "its previous version is back"
+    except ValueError:
+        data, how = {}, "its backup is broken too, so it starts empty"
+    write(path, json.dumps(data))
+    msg = f"⚠️ The relay found {name} broken; {how}. The broken file is kept: {keep}"
+    print(msg, flush=True)
+    threading.Timer(5, lambda: send_text(OWNER, msg)).start()  # later: callers hold state locks now
+    return data
 
 
 def token():
@@ -548,10 +570,7 @@ OWN = [False]  # own-number mode: the bridge is linked to the owner's own WhatsA
 
 def _sent_mem():
     if not _sent:
-        try:
-            d = json.loads(read(st("sent.json")) or "{}")
-        except ValueError:
-            d = {}
+        d = load_state("sent.json")
         _sent.update(ids=deque(d.get("ids", []), maxlen=500), texts=deque(d.get("texts", []), maxlen=200))
     return _sent
 
@@ -1393,7 +1412,8 @@ def owner_turn(msg_id, text, media_type, batch=None):
     coordinator_send(answer, text, voice=voice, refs=refs)
     if news and not night:
         main_mark("coordinator", upto)
-        mark_delivered(t0)
+        mark_delivered(t0, news)
+        more_news()
 
 
 SKIP_RE = re.compile(r"^\s*@@SKIP\s*:?.*$\n?", re.M)  # 'nothing to send': never sent as text
@@ -1428,10 +1448,12 @@ def bridge_rowid():
     return row[0] if row else None
 
 
-def landed(chat, after, text):
-    """Did a message of ours with a piece of `text` reach `chat` after row `after`? True/False, None = unknown
-    (no anchor or no store). The receipt for an answer a restart cut off (Instinct, 5 Nov 2026)."""
-    if after is None or not text.strip():
+def landed(chat, after, text=None):
+    """Did our answer reach `chat` after row `after`? True/False, None = unknown (no anchor or no store).
+    The receipt for an answer a restart cut off (Instinct, 5 Nov 2026). With `text`: its LAST line must be
+    there (the first bubble alone is a cut send, not a delivery); without: any message of ours counts."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip() and not l.strip().startswith("@@")]
+    if after is None or text is not None and not lines:
         return None
     try:
         c = db("messages.db")
@@ -1440,7 +1462,10 @@ def landed(chat, after, text):
         c.close()
     except sqlite3.Error:
         return None
-    return any(r[0] and r[0].strip() and r[0].strip().splitlines()[0][:120] in text for r in rows)
+    if text is None:
+        return bool(rows)
+    tail = lines[-1][-120:]
+    return any(r[0] and tail in r[0] for r in rows)
 
 
 def sent_id(chat, text):
@@ -1457,11 +1482,12 @@ def sent_id(chat, text):
 
 def mark_sending(*msg_ids):
     """The answer to these messages starts going out: a restart from here on must not run them again
-    (resume_jobs tells the owner delivery is uncertain instead)."""
+    blind. resume_jobs checks the bridge after the anchor `after` (contacts), else tells the owner."""
+    after = bridge_rowid()
     for mid in msg_ids:
         rec = _inflight.get(mid)
         if rec:
-            inflight(mid, dict(rec, sending=True))
+            inflight(mid, dict(rec, sending=True, after=after))
 
 
 def coordinator_send(answer, text, voice=False, refs=None):
@@ -1578,10 +1604,7 @@ _tlock, _tsem = threading.Lock(), []
 def threads_db(n=None, **change):
     """All threads by number (str), from state/threads.json. With n: update that thread first."""
     with _tlock:
-        try:
-            data = json.loads(read(st("threads.json")) or "{}")
-        except ValueError:
-            data = {}
+        data = load_state("threads.json")
         if n is not None:
             data[str(n)] = dict(data.get(str(n), {}), **change, updated=time.time())
             write(st("threads.json"), json.dumps(data))
@@ -1640,11 +1663,13 @@ def main_log(who, text):
         if os.path.exists(path) and os.path.getsize(path) > 500_000:  # keep the newest 100 KB
             data = read(path)
             drop = max(0, len(data) - 100_000)
-            write_atomic(path, data[drop:])
+            m = ENTRY_RE.search(data, drop)  # on an entry boundary: never half an entry
+            drop = m.start() if m else drop
+            write(path, data[drop:])
             seen = seen_offsets()  # every reader's offset moves with the cut (else old news comes back)
             seen.update({k: max(0, v - drop) for k, v in seen.items() if not k.startswith(("dec:", "_"))})
             seen["_cut"] = seen.get("_cut", 0) + drop  # offsets handed out before the cut stay valid (main_mark)
-            write_atomic(st("main-seen.json"), json.dumps(seen))
+            write(st("main-seen.json"), json.dumps(seen))
         thread_log("main", who, text)
 
 
@@ -1667,7 +1692,7 @@ def decisions_for(n, topic, new):
         lines = read(st("threads/decisions.md")).splitlines()
         seen = seen_offsets()
         start, seen[f"dec:{n}"] = (0 if new else seen.get(f"dec:{n}", len(lines))), len(lines)
-        write_atomic(st("main-seen.json"), json.dumps(seen))
+        write(st("main-seen.json"), json.dumps(seen))
     pick = lines[start:] if start <= len(lines) else lines
     if not topic:
         return "\n".join(pick[-40:])
@@ -1680,16 +1705,15 @@ def seen_offsets():
     """state/main-seen.json: read offsets per reader in threads/main.md (call with _tlock held).
     "_cut" = characters cut off the front of main.md so far: offsets handed out by main_since(offset=True)
     and kept for unread() count from the first byte ever written, so a cut in between never moves them."""
-    try:
-        return json.loads(read(st("main-seen.json")) or "{}")
-    except ValueError:
-        return {}
+    return load_state("main-seen.json")
 
 
 def main_since(key, own, peek=False, offset=False):
-    """Timeline entries `key` has not seen yet, minus its own (own(who) is True), newest
+    """Timeline entries `key` has not seen yet, minus its own (own(who) is True), at most
     threads.main_chat_chars of them. Offsets per reader in state/main-seen.json; peek = keep it.
-    offset = also return where this read ended, for main_mark after the news really went out."""
+    A thread's context (no offset) gets the newest part and is then up to date. offset = the coordinator:
+    the OLDEST unread entries that fit and where they end, for main_mark after the news really went out;
+    the rest stays unread for the next turn (Instinct review 5 Nov 2026)."""
     limit, path = CFG["threads"]["main_chat_chars"], st("threads/main.md")
     if not limit or not os.path.exists(path):
         return ("", 0) if offset else ""
@@ -1699,13 +1723,32 @@ def main_since(key, own, peek=False, offset=False):
         cut = seen.get("_cut", 0)
         start, seen[key] = seen.get(key, 0), len(data)
         if not peek:
-            write_atomic(st("main-seen.json"), json.dumps(seen))
+            write(st("main-seen.json"), json.dumps(seen))
             _read.__dict__.setdefault("undo", {}).setdefault(key, start + cut)
-    new = data[start:] if start <= len(data) else data
-    keep = [e.strip() for e in ENTRY_RE.split(new)
+    start = start if start <= len(data) else 0
+    if offset:
+        keep, end = news_page(data, start, own, limit)
+        return "\n\n".join(keep), end + cut
+    keep = [e.strip() for e in ENTRY_RE.split(data[start:])
             if e.strip() and not own((WHO_RE.match(e) or [None, ""])[1])]
-    text = "\n\n".join(keep)[-limit:]
-    return (text, len(data) + cut) if offset else text
+    return "\n\n".join(keep)[-limit:]
+
+
+def news_page(data, start, own, limit):
+    """The oldest unread entries of the timeline that fit in `limit` characters, and where they end.
+    Instinct review 5 Nov 2026: the newest 10 KB were shown and the read mark moved past all of it, so an
+    older result above the cut was marked read and delivered unseen. Now the rest waits for the next turn."""
+    keep, size, pos = [], 0, start
+    bounds = [m.start() for m in ENTRY_RE.finditer(data, start)] + [len(data)]
+    for b in bounds:
+        e = data[pos:b].strip()
+        if e and not own((WHO_RE.match(e) or [None, ""])[1]):
+            if keep and size + len(e) > limit:
+                return keep, pos
+            keep.append(e[:limit])
+            size += len(e) + 2
+        pos = b
+    return keep, len(data)
 
 
 def main_mark(key, upto):
@@ -1714,7 +1757,7 @@ def main_mark(key, upto):
         seen = seen_offsets()
         upto = max(0, upto - seen.get("_cut", 0))
         seen[key] = max(seen.get(key, 0), upto)  # monotonic: a late recovery never rewinds a newer read
-        write_atomic(st("main-seen.json"), json.dumps(seen))
+        write(st("main-seen.json"), json.dumps(seen))
 
 
 _read = threading.local()  # main_since offsets this worker read: given back when its run hits the limit
@@ -1729,7 +1772,7 @@ def unread():
         seen = seen_offsets()
         cut = seen.get("_cut", 0)
         seen.update({k: min(max(0, v - cut), seen.get(k, v)) for k, v in undo.items()})
-        write_atomic(st("main-seen.json"), json.dumps(seen))
+        write(st("main-seen.json"), json.dumps(seen))
 
 
 def is_own(n):
@@ -1913,6 +1956,16 @@ def coordinator_digest():
     if not _digest["due"]:
         return
     _digest["due"] = False  # also when there is nothing to send: a restart waits on this flag
+    try:
+        _coordinator_digest()
+    except (ClaudeLimit, StopRun):  # the limit parks it; /stop is the owner's choice
+        raise
+    except Exception:  # timeout, network: the news is still unread, try again (Instinct review)
+        threading.Timer(300, digest_soon).start()
+        raise
+
+
+def _coordinator_digest():
     t0 = time.time()
     news, upto = main_since("coordinator", coordinator_own, peek=True, offset=True)
     if not THREAD_RESULT_RE.search(news):
@@ -1932,10 +1985,11 @@ def coordinator_digest():
         if not SKIP_RE.sub("", answer).strip():  # silence is a recorded choice, never a lost event
             main_log("COORDINATOR", "Chose silence (it already reached the owner) for: " + "; ".join(items))
     inflight("digest", {"digest": True, "sending": True, "upto": upto, "after": bridge_rowid(),
-                        "text": SKIP_RE.sub("", answer)[:4000]})  # a restart now: check the receipt, never blind
+                        "text": SKIP_RE.sub("", answer)[-4000:]})  # a restart now: check the receipt, never blind
     coordinator_send(answer, "")
     main_mark("coordinator", upto)
-    mark_delivered(t0)
+    mark_delivered(t0, news)
+    more_news()
 
 
 # 5 Nov 2026 (#134): the digest prompt asks for one line per finished item, but a @@SKIP still hid them.
@@ -1952,12 +2006,20 @@ def finished_items(news):
             if FINISHED_WHO.match(w)]
 
 
-def mark_delivered(t0):
-    """Thread results reported before t0 were in the news of an answer that went out: delivered now."""
-    now = time.time()
+def mark_delivered(t0, news):
+    """Thread results reported before t0 whose entry was in the news of an answer that went out: delivered
+    now. Only those: a result that did not fit in the news is not delivered (auto-close waits on this)."""
+    now, shown = time.time(), {w.split(" ")[0][1:] for w in finished_items(news) if w.startswith("#")}
     for k, t in threads_db().items():
-        if t["state"] in ("review", "blocked") and t.get("reported", 0) < t0 and t.get("delivered", 0) < t.get("reported", 0):
+        if k in shown and t["state"] in ("review", "blocked") and t.get("reported", 0) < t0 \
+                and t.get("delivered", 0) < t.get("reported", 0):
             threads_db(k, delivered=now)
+
+
+def more_news():
+    """News left over (it did not fit in one message): the next digest pages on."""
+    if THREAD_RESULT_RE.search(main_since("coordinator", coordinator_own, peek=True)):
+        digest_soon()
 
 
 def coordinator_own(who):
@@ -2028,7 +2090,8 @@ def thread_auto_close(now=None):
     for k, t in asks:
         agent_note("threads", f"#{k} {t['title']} is blocked since {int((now - (t.get('reported') or t.get('updated', 0))) / 86400)} "
                    f"days. Its open question: {t.get('last') or '(none written)'}. Ask {name} ONCE: still needed? "
-                   f"With no answer it closes by itself in {th['blocked_close_hours']} h.")
+                   f"With no answer it closes by itself in {th['blocked_close_hours']} h. If {name} says it is still "
+                   f"needed, send that to it with '@@TO #{k}: ...': only that keeps it open.")
     for k, t in gone:
         agent_note("threads", f"Closed #{k} {t['title']}: blocked, asked once, no answer in {th['blocked_close_hours']} h. "
                    f"Open question kept: {t.get('last') or '(none written)'}")
@@ -2098,10 +2161,7 @@ def digest(text):
 def polls(update=None):
     """Open polls by poll message id, in state/polls.json (newest 200 kept)."""
     with _poll_lock:
-        try:
-            data = json.loads(read(st("polls.json"), "{}") or "{}")
-        except ValueError:
-            data = {}
+        data = load_state("polls.json")
         if update:
             data.update(update)
             data = dict(list(data.items())[-200:])
@@ -2351,7 +2411,7 @@ def _job_watch():
                                 or child and proc_start(child.get("pid", 0)) == child.get("started")):
             continue  # the wrapper or the command itself still runs
         key = f"[job {pid} {j.get('started')}]"
-        if key not in read(st("threads/main.md")):
+        if key not in read(st("threads/main.md")) and key not in read(st("jobs-done.log")):
             tail = ""
             if j.get("log"):
                 try:
@@ -2367,6 +2427,8 @@ def _job_watch():
                        + "; check the log end")
             agent_note("job", f"{title}: {how}. {key}"
                        + (f"\nLog {j['log']}, last lines:\n{tail}" if j.get("log") else ""))
+            with open(st("jobs-done.log"), "a") as f:  # the dedup key also with threads off (no timeline)
+                f.write(key + "\n")  # ponytail: never trimmed; ~40 bytes per job
         os.remove(path)  # after the note is in the timeline: a crash in between is caught by the key
 
 
@@ -2883,7 +2945,7 @@ def inflight(key, rec=None):
         else:
             _inflight[key] = rec
         try:
-            write_atomic(st("inflight.json"), json.dumps(_inflight))
+            write(st("inflight.json"), json.dumps(_inflight))
         except (OSError, KeyError):  # no state folder (tests, broken setup): routing must go on
             pass
 
@@ -2895,36 +2957,52 @@ def done_job(key):
 
 def resume_jobs():
     """After a restart: run again what the old process did not finish."""
-    try:
-        old = json.loads(read(st("inflight.json")) or "{}")
-    except ValueError:
-        old = {}
-    write(st("inflight.json"), "{}")
+    old = load_state("inflight.json")
+    with _ilock:  # each old record stays on disk until its next step is registered (a crash here loses none)
+        _inflight.update(old)
     notes = {}  # thread -> [(prompt, ran)], in the order they were queued
     unsure = []
     for key, rec in old.items():
-        if "route" in rec and rec.get("sending"):  # stopped while its answer went out: never send it twice
-            chat, text = rec["route"][1], rec["route"][3] or f"({rec['route'][4]})"
-            unsure.append(text if chat == OWNER else (by_jid(chat) or {}).get("name", "an agent") + ": " + text)
-        elif "route" in rec:
+        chat = rec["route"][1] if "route" in rec else ""
+        got = landed(chat, rec.get("after")) if "route" in rec and rec.get("sending") and chat != OWNER else None
+        if "route" in rec and rec.get("sending") and got is not False:  # never send it twice
+            if got is None:  # the owner chat (own messages look the same) or no anchor: say so
+                text = rec["route"][3] or f"({rec['route'][4]})"
+                unsure.append(text if chat == OWNER else (by_jid(chat) or {}).get("name", "an agent") + ": " + text)
+            inflight(key)
+        elif "route" in rec:  # not sent yet, or the bridge shows nothing of ours landed: run it again
             RESUMED.add(rec["route"][0])
             route(*rec["route"])
+            if key not in _claimed:
+                inflight(key)
+        elif "inbox" in rec:  # an inbox note moved to done/ but its turn never ended: deliver it again
+            _, a = by_name(rec["inbox"][0])
+            src = os.path.join(a["dir"], "inbox", "done", rec["inbox"][1]) if a else ""
+            if src and os.path.exists(src):
+                os.replace(src, os.path.join(a["dir"], "inbox", rec["inbox"][1]))
+            inflight(key)
         elif "thread" in rec:
             n, prompt = rec["thread"]
-            notes.setdefault(n, []).append((prompt, rec.get("ran") or prompt.startswith((RESUME_NOTE, LIMIT_NOTE, TIMEOUT_NOTE))))
+            notes.setdefault(n, []).append((key, prompt, rec.get("ran") or prompt.startswith((RESUME_NOTE, LIMIT_NOTE, TIMEOUT_NOTE))))
         elif "digest" in rec and rec.get("sending"):  # stopped while it went out: ask the bridge what landed
             got = landed(OWNER, rec.get("after"), rec.get("text", ""))
             if got is False:  # nothing landed: the news stays unread and goes out again
+                inflight(key)
                 digest_soon()
             else:  # landed (no copy), or the bridge cannot tell (delivery unknown: say so, no blind copy)
                 main_mark("coordinator", rec["upto"])
+                inflight(key)
                 if got is None:
                     unsure.append("a thread update")
         elif "digest" in rec:
             digest_soon()
+        else:  # a kind this version does not know: never kept forever
+            inflight(key)
     for n, jobs in notes.items():
         if n in threads_db():
-            thread_job(n, merged_prompt(jobs))
+            thread_job(n, merged_prompt([j[1:] for j in jobs]))
+        for k, *_ in jobs:  # after the new job is registered
+            inflight(k)
     for text in unsure:  # Instinct: delivery uncertain = say so, never a copy "to be safe"
         send_text(OWNER, f"(The relay restarted while the answer to \"{text[:80]}\" went out. Delivery is "
                          "uncertain. It was not sent again; ask again if something is missing.)")
@@ -3048,8 +3126,8 @@ def parked(change=None):
     """Read state/limit-paused.json; change(jobs) edits it under the lock and saves it."""
     with _plock:
         try:
-            jobs = json.loads(read(st("limit-paused.json")) or "{}")
-        except (ValueError, OSError, KeyError):
+            jobs = load_state("limit-paused.json")
+        except (OSError, KeyError):
             jobs = {}
         if change:
             out = change(jobs)
@@ -3282,16 +3360,19 @@ def deliver_inbox(a, fixes_only=False):
         if fixes_only and not note.upper().startswith("FIX:"):
             continue
         os.makedirs(os.path.join(inbox, "done"), exist_ok=True)
-        os.rename(path, os.path.join(inbox, "done", fn))  # move first: never deliver twice
+        key = f"inbox:{a['name']}:{fn}"  # tracked until its turn ends: a restart moves it back (never lost)
+        if note:
+            inflight(key, {"inbox": [a["name"], fn]})
+        os.rename(path, os.path.join(inbox, "done", fn))  # move first: the scan never delivers it twice
         if not note:
             continue
         log_thread(a, f"FROM {CFG['owner']['name'].upper()}'S CLAUDE", note)
         prompt = CFG["prompts"]["from_owner_claude"] + note + INBOX_REPLY_RULE
         if note.upper().startswith("FIX:"):
-            enqueue(a["name"], lambda a=a, prompt=prompt: fix_last(a, prompt))
+            enqueue_job(a["name"], lambda a=a, prompt=prompt: fix_last(a, prompt), key)
         else:
-            enqueue(a["name"], lambda a=a, prompt=prompt: deliver(
-                a["jid"], a, run_agent(a, prompt), False, allow_hold=False))
+            enqueue_job(a["name"], lambda a=a, prompt=prompt: deliver(
+                a["jid"], a, run_agent(a, prompt), False, allow_hold=False), key)
 
 
 def fix_last(a, prompt):
@@ -3608,10 +3689,7 @@ _mail = {"busy": False, "next": 0.0, "told": "", "token": ("", 0.0)}
 def mail_state(change=None):
     """state/mail.json: the last historyId, Gmail thread -> #n, reply watches, the morning digest list."""
     with _mlock:
-        try:
-            s = json.loads(read(st("mail.json")) or "{}")
-        except ValueError:
-            s = {}
+        s = load_state("mail.json")
         for k, v in (("threads", {}), ("watch", []), ("digest", [])):
             s.setdefault(k, v)
         if change:
@@ -3947,8 +4025,8 @@ def main_loop():
         rows, seen = new_rows(c, last, cutoff)
         for rowid, msg_id, chat, sender, content, media_type, filename in rows:
             last = rowid
-            write(cur, str(last))
-            if media_type == "poll":
+            if media_type == "poll" or msg_id in RESUMED:  # RESUMED: already run again by resume_jobs
+                write(cur, str(last))
                 continue
             try:
                 if media_type == "reaction":
@@ -3966,6 +4044,8 @@ def main_loop():
                     send_text(OWNER, f"Error routing a message: {e}")
                 except Exception:
                     pass
+            finally:  # after route registered it (inflight): a crash in between re-reads it, never loses it
+                write(cur, str(last))
         if seen != last:
             last = seen
             write(cur, str(last))

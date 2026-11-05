@@ -91,7 +91,7 @@ class AutoClose(unittest.TestCase):
         relay.threads_db("6", title="film", state="review", last="v4", reported=now - 30 * H)
         self.run_at(now)
         self.assertEqual(relay.threads_db()["6"]["state"], "review")  # never delivered: stays open
-        relay.mark_delivered(now)
+        relay.mark_delivered(now, "**2026-11-05 10:00 #6 film (review):**\nv4")
         self.run_at(time.time() + 23 * H)
         self.assertEqual(relay.threads_db()["6"]["state"], "review")
         notes = self.run_at(time.time() + 25 * H)
