@@ -44,6 +44,8 @@ def main(argv):
         argv, cmd = argv[:i], argv[i + 1:]
     if "--config" in argv:
         i = argv.index("--config")
+        if i + 1 >= len(argv):
+            sys.exit(__doc__)
         conf, argv = argv[i + 1], argv[:i] + argv[i + 2:]
     run = len(argv) == 3 and argv[1] == "--run" and cmd
     if not run and (cmd or len(argv) not in (2, 3) or not argv[1].isdigit()):
@@ -54,7 +56,14 @@ def main(argv):
     if not title or not started:
         sys.exit(f"NOT REGISTERED: {'no title' if not title else f'no running process with pid {pid}'}")
     log = os.path.abspath(os.path.expanduser(argv[2])) if len(argv) == 3 else ""
-    d = jobs_dir(conf)
+    try:
+        d = jobs_dir(conf)
+    except (OSError, ValueError) as e:  # under nohup ... >/dev/null stderr is lost: put it in the job's log too
+        msg = f"NOT REGISTERED: relay config {conf}: {e}"
+        if log:
+            with open(log, "a") as f:
+                f.write(msg + "\n")
+        sys.exit(msg)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"{pid}.json")
     rec = {"title": title, "pid": pid, "started": started, "log": log, "mode": "run" if run else "watch"}

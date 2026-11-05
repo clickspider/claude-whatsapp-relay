@@ -111,8 +111,8 @@ def main(argv):
     if cmd == "show":
         save(pending_path, {"draft": did, "hash": h, "time": time.time()})  # only the newest shown draft waits
         print(describe(msg))
-        print(f"\nShow the owner exactly this and ask. Send only after the owner's next message is a clear OK "
-              f"for it: gmail_send.py send {did}")
+        print(f"\nShow the owner exactly this and ask, naming the subject in the question. Send only after the "
+              f"owner's next message is a clear OK for it: gmail_send.py send {did}")
         return
     p = load(pending_path, {})
     ok = load(os.path.join(state, "owner-last.json"), {})
@@ -125,11 +125,19 @@ def main(argv):
     if why:
         sys.exit(f"NOT SENT: {why}.")
     save(pending_path, dict(p, used=ok["time"]))  # before the send: a crash can never send twice on one OK
-    sent = api(tok, "drafts/send", {"id": did})
-    line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "draft": did, "message": sent.get("id", ""),
-            "to": str(msg["To"] or ""), "cc": str(msg["Cc"] or ""), "subject": str(msg["Subject"] or ""),
-            "ok": ok.get("text", "")}
+    line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "draft": did, "to": str(msg["To"] or ""),
+            "cc": str(msg["Cc"] or ""), "subject": str(msg["Subject"] or ""), "ok": ok.get("text", "")}
     os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
+    # The hash was checked a moment ago; drafts.send sends the draft as it is now. An edit in another Gmail
+    # client inside that gap goes out: the API has no "send only this version" (Instinct review, known limit).
+    try:
+        sent = api(tok, "drafts/send", {"id": did})
+    except Exception as e:  # a timeout can come after Gmail accepted it: never say SENT, never retry here
+        with open(log_path, "a") as f:
+            f.write(json.dumps(dict(line, outcome=f"UNKNOWN: {e}"), ensure_ascii=False) + "\n")
+        sys.exit(f"OUTCOME UNKNOWN: the send of draft {did} failed ({e}). It may have gone out: check Sent in "
+                 "Gmail before you send it again (that needs a new show and a new OK).")
+    line["message"] = sent.get("id", "")
     with open(log_path, "a") as f:
         f.write(json.dumps(line, ensure_ascii=False) + "\n")
     print(f"SENT: draft {did} to {line['to']}, subject '{line['subject']}' (Gmail message {line['message']}).")

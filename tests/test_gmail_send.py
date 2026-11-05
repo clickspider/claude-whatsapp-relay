@@ -71,6 +71,17 @@ class SendGate(unittest.TestCase):
             line = json.loads(f.readline())
         self.assertEqual((line["draft"], line["to"], line["subject"]), (DRAFT, "vendor@example.nl", "Re: question"))
 
+    def test_a_failed_send_is_outcome_unknown_never_sent(self):
+        self.run_cmd("show")
+        self.owner_says("שלח")
+        with mock.patch.object(gs, "api", side_effect=[{"message": {"raw": raw(self.body)}}, TimeoutError("timed out")]):
+            out = self.run_cmd("send")
+        self.assertIn("OUTCOME UNKNOWN", out)
+        self.assertNotIn("SENT:", out)
+        with open(os.path.join(self.tmp, "mail-send", "sent.log")) as f:
+            self.assertIn("UNKNOWN", json.loads(f.readline())["outcome"])
+        self.assertIn("one OK = one mail", self.run_cmd("send"))  # and never sent again on the same OK
+
     def test_changed_draft_needs_a_new_show(self):
         self.run_cmd("show")
         self.body = "Hi, other text"
