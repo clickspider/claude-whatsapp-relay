@@ -1503,11 +1503,13 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
     """The coordinator's answer -> markers handled, the rest sent to the owner.
     refs = {"#1": (msg_id, OWNER, text), ...}: the owner messages this answer may quote.
     track = the in-flight key whose receipt covers this send: the questions and files after the body are
-    recorded there too, so a restart sends what did not go out yet (send_tail)."""
+    recorded there too, so a restart sends what did not go out yet (send_tail). An owner answer tracks on the
+    newest owner message it answers (Instinct round 4, O2)."""
     qm = re.search(r"^\s*@@QUOTE\s*:?\s*(.*)$", answer, re.M)
     quote = pick_quote(OWNER, qm.group(1) if qm else None, refs, auto_last=len(refs or {}) > 1)
     answer = re.sub(r"^\s*@@(QUOTE|SKIP)\s*:?.*$\n?", "", answer, flags=re.M).strip()
     mark_sending(*[mid for mid, _, _ in (refs or {}).values()])
+    track = track or next((mid for mid, _, _ in reversed(list((refs or {}).values())) if mid in _inflight), None)
     answer, drafts = take_drafts(answer)
     for d in drafts:  # the draft alone, so the owner can copy or forward it as is
         send_text(OWNER, d)
@@ -2018,7 +2020,7 @@ def coordinator_digest():
     except Exception:  # timeout, network: the news is still unread, try again (Instinct review)
         n = _digest["fails"] = _digest.get("fails", 0) + 1
         if not _digest["sent"] and n <= 5:  # after the send: never again (no repeat digest); 5 m .. 1 h
-            t = threading.Timer(min(300 * 2 ** (n - 1), 3600), digest_soon)
+            t = _digest["retry"] = threading.Timer(min(300 * 2 ** (n - 1), 3600), digest_soon)  # digest_sweep waits
             t.daemon = True
             t.start()
         raise
@@ -2097,8 +2099,8 @@ def unread_result():
 def digest_sweep():
     """Unread news, no digest timer and no digest queued: arm one (Instinct round 3, M3). The retries stop after
     5 backoffs; without this a long outage stalled the news until the next event or a restart."""
-    t = _digest["timer"]
-    if not (t and t.is_alive()) and "digest" not in _inflight and unread_result() \
+    t, r = _digest["timer"], _digest.get("retry")
+    if not (t and t.is_alive()) and not (r and r.is_alive()) and "digest" not in _inflight and unread_result() \
             and not any("digest" in j["rec"] for j in parked().values()):  # the limit resumes that one
         digest_soon()
 
@@ -3093,6 +3095,7 @@ def resume_one(key, rec, notes, unsure):
         if got is None:  # the owner chat (own messages look the same) or no anchor: say so
             text = rec["route"][3] or f"({rec['route'][4]})"
             unsure.append(text if chat == OWNER else (by_jid(chat) or {}).get("name", "an agent") + ": " + text)
+        resume_tail(key, rec, rec.get("tail_at") is not None)  # own messages look the same: only tail_at proves it
         inflight(key)
     elif "route" in rec:  # not sent yet, or the bridge shows nothing of ours landed: run it again
         RESUMED.add(rec["route"][0])
@@ -3116,15 +3119,34 @@ def resume_one(key, rec, notes, unsure):
             main_mark("coordinator", rec["upto"])
             if got is None:
                 unsure.append("a thread update")
-            tail, at = rec.get("tail") or [], rec.get("tail_at")
-            if at is not None and at < len(tail):  # on its way at the crash: maybe sent, so say so, no copy
-                unsure.append(f"the {'question' if tail[at][0] == 'ask' else 'file'} {tail[at][1]}")
-            send_tail(tail, key, 0 if at is None else at + 1)  # the rest never started: send it now
+            resume_tail(key, rec, got is True)
             inflight(key)
     elif "digest" in rec:
         digest_soon()
     else:  # a kind this version does not know: never kept forever
         inflight(key)
+
+
+def resume_tail(key, rec, body_out):
+    """The polls and files after a cut answer's body (coordinator_send). body_out = the body surely went out.
+    The item on its way at the crash may have gone, so it is named, never copied; the rest never started and goes
+    out now. Without proof of the body (no tail_at, no receipt) none goes: never a file or poll without its answer.
+    The notes go first, so they come before what is sent after them."""
+    tail, at = rec.get("tail") or [], rec.get("tail_at")
+    what = lambda item: f"the {'question' if item[0] == 'ask' else 'file'} \"{item[1][:80]}\""
+
+    def note(text):  # a note the bridge refuses never stops the files after it
+        try:
+            send_text(OWNER, text)
+        except Exception:
+            pass
+    if at is None and not body_out:
+        for item in tail:
+            note(f"(The relay restarted before {what(item)} went out. It was not sent; ask again if you need it.)")
+        return
+    if at is not None and at < len(tail):
+        note(f"(The relay restarted while {what(tail[at])} went out. Delivery is uncertain; it was not sent again.)")
+    send_tail(tail, key, 0 if at is None else at + 1)
 
 
 def inbox_back(rec):
@@ -4130,6 +4152,22 @@ def new_rows(c, last, cutoff=0):
     return keep, last
 
 
+_last_run = {}
+
+
+def each(name, seconds, now=None):
+    """True once per `seconds` of wall time. The tick counts in main_loop stretch with feedback.poll_seconds and
+    the work per tick (Instinct round 4, O1: "1800" ticks was about an hour). time.time, not monotonic: on macOS
+    monotonic stops while the Mac sleeps, and a sweep is due right after it wakes."""
+    now = time.time() if now is None else now
+    if now < _last_run.get(name, now):  # the clock was set back: start again from here, never stall
+        _last_run[name] = now
+    if now - _last_run.setdefault(name, now) < seconds:
+        return False
+    _last_run[name] = now
+    return True
+
+
 def main_loop():
     c = db("messages.db")
     cur = st("last-rowid")
@@ -4182,8 +4220,8 @@ def main_loop():
                           (30, job_watch),
                           (15, resume_parked),
                           (300, battery_warning),
-                          (1800, thread_auto_close if CFG["threads"]["enabled"] else None),
-                          (1800, digest_sweep if CFG["threads"]["enabled"] else None),
+                          (1, thread_auto_close if CFG["threads"]["enabled"] and each("thread_auto_close", 1800) else None),
+                          (1, digest_sweep if CFG["threads"]["enabled"] and each("digest_sweep", 1800) else None),
                           (30, mail_tick if CFG["mail"]["enabled"] else None)):
             if fn and tick % every == 0:
                 try:

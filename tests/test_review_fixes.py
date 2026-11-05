@@ -470,6 +470,122 @@ class FourthReview(unittest.TestCase):
         self.assertIsNotNone(relay.msg_epoch("2025-01-01 10:00:00.123456789+02:00"))
 
 
+class FifthReview(unittest.TestCase):
+    """Instinct's re-review of b849494 (O1, O2)."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+
+    def test_o1_the_sweep_runs_on_real_time_not_loop_ticks(self):
+        relay._last_run.pop("x", None)
+        self.assertFalse(relay.each("x", 1800, now=100.0))  # the first call starts the clock
+        self.assertFalse(relay.each("x", 1800, now=1899.0))
+        self.assertTrue(relay.each("x", 1800, now=1900.0))  # 30 min later, whatever poll_seconds is
+        self.assertFalse(relay.each("x", 1800, now=1901.0))
+        import inspect
+        self.assertIn('each("digest_sweep", 1800)', inspect.getsource(relay.main_loop))
+
+    def test_o1_the_main_loop_runs_the_sweep(self):  # the loop's own name "every" once hid a helper of that name
+        class Out(Exception):
+            pass
+        relay._last_run["digest_sweep"] = -1e9
+        conn = mock.MagicMock()
+        conn.execute.return_value.fetchone.return_value = (0,)
+        with mock.patch.object(relay, "db", return_value=conn), mock.patch.object(relay, "resume_jobs"), \
+                mock.patch.object(relay, "new_rows", return_value=([], 0)), \
+                mock.patch.object(relay, "digest_sweep") as sweep, \
+                mock.patch.object(relay.time, "sleep", side_effect=Out()):
+            with self.assertRaises(Out):
+                relay.main_loop()
+        sweep.assert_called_once()
+
+    def test_o1_auto_close_also_runs_on_real_time(self):
+        relay._last_run["thread_auto_close"] = -1e9
+        relay._last_run["digest_sweep"] = -1e9
+        conn = mock.MagicMock()
+        conn.execute.return_value.fetchone.return_value = (0,)
+        with mock.patch.object(relay, "db", return_value=conn), mock.patch.object(relay, "resume_jobs"), \
+                mock.patch.object(relay, "new_rows", return_value=([], 0)), mock.patch.object(relay, "digest_sweep"), \
+                mock.patch.object(relay, "thread_auto_close") as close, \
+                mock.patch.object(relay.time, "sleep", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                relay.main_loop()
+        close.assert_called_once()  # at tick 1, not tick 1800
+
+    def test_o1_the_sweep_waits_for_a_pending_retry(self):
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["timer"] = None
+        relay._digest["retry"] = mock.Mock(is_alive=lambda: True)
+        with mock.patch.object(relay, "digest_soon") as ds:
+            relay.digest_sweep()
+        ds.assert_not_called()
+        relay._digest["retry"] = None
+
+    def test_o1_a_clock_set_back_does_not_stop_the_sweeps(self):
+        relay._last_run["y"] = 10_000.0
+        self.assertFalse(relay.each("y", 1800, now=2_000.0))  # clock set back: the clock starts again here
+        self.assertTrue(relay.each("y", 1800, now=3_800.0))
+
+    def test_o2_a_note_the_bridge_refuses_never_drops_the_rest(self):
+        rec = {"route": ["o1", relay.OWNER, relay.OWNER, "cv?", ""], "sending": True, "tail_at": 0,
+               "tail": [["ask", "tailor it?", ["yes", "no"]], ["file", "cv.pdf"]]}
+        relay._inflight["o1"] = rec
+        with mock.patch.object(relay, "send_text", side_effect=OSError("bridge down")), \
+                mock.patch.object(relay, "send_owner_file") as sf:
+            relay.resume_tail("o1", rec, True)
+        sf.assert_called_once_with("cv.pdf")
+        relay._inflight.pop("o1")
+
+    def owner_cut(self):
+        relay._inflight["o1"] = {"route": ["o1", relay.OWNER, relay.OWNER, "send me the cv", ""]}
+        answer = "here it is\n@@ASK: tailor it? | yes | no\n@@FILE: cv.pdf"
+        with mock.patch.object(relay, "ask", side_effect=relay.StopRun()):  # a crash after the body
+            with self.assertRaises(relay.StopRun):
+                relay.coordinator_send(answer, "send me the cv", refs={"#1": ("o1", relay.OWNER, "send me the cv")})
+        rec = relay._inflight["o1"]
+        self.assertEqual(rec["tail"], [["ask", "tailor it?", ["yes", "no"]], ["file", "cv.pdf"]])
+        return rec
+
+    def test_o2_an_owner_answer_tracks_its_questions_and_files(self):
+        self.assertEqual(self.owner_cut()["tail_at"], 0)
+        relay._inflight.pop("o1")
+
+    def test_o2_a_cut_owner_answer_sends_the_files_that_never_started(self):
+        rec = self.owner_cut()
+        relay.write(relay.st("inflight.json"), json.dumps({"o1": rec}))
+        relay._inflight.clear()
+        with mock.patch.object(relay, "ask") as ask, mock.patch.object(relay, "send_owner_file") as sf, \
+                mock.patch.object(relay, "route") as r:
+            relay.resume_jobs()
+        r.assert_not_called()  # never a blind re-run
+        ask.assert_not_called()  # on its way at the crash: named, no copy
+        sf.assert_called_once_with("cv.pdf")
+        self.assertTrue(any("tailor it?" in t and "uncertain" in t for t in self.sent))
+        self.assertNotIn("o1", relay._inflight)
+
+
+    def test_o2_files_of_an_answer_whose_body_may_not_have_gone_are_named_not_sent(self):
+        relay.write(relay.st("inflight.json"), json.dumps({"o1": {
+            "route": ["o1", relay.OWNER, relay.OWNER, "cv?", ""], "sending": True, "after": 1, "text": None,
+            "tail": [["file", "cv.pdf"]]}}))  # no tail_at: the crash came before or during the body
+        relay._inflight.clear()
+        with mock.patch.object(relay, "send_owner_file") as sf, mock.patch.object(relay, "route"):
+            relay.resume_jobs()
+        sf.assert_not_called()  # never a file without its answer
+        self.assertTrue(any("cv.pdf" in t for t in self.sent))
+
+    def test_o2_the_uncertain_note_comes_before_the_rest(self):
+        relay.write(relay.st("inflight.json"), json.dumps({"o1": {
+            "route": ["o1", relay.OWNER, relay.OWNER, "cv?", ""], "sending": True, "after": 1, "text": None,
+            "tail": [["ask", "tailor it?", ["yes", "no"]], ["file", "cv.pdf"]], "tail_at": 0}}))
+        relay._inflight.clear()
+        order = []
+        with mock.patch.object(relay, "send_owner_file", lambda f: order.append(f)), mock.patch.object(relay, "route"), \
+                mock.patch.object(relay, "send_text", lambda c, t, **k: order.append(t)):
+            relay.resume_jobs()
+        self.assertIn("tailor it?", order[0])
+        self.assertEqual(order[1], "cv.pdf")
+
+
 class JobDedupThreadsOff(unittest.TestCase):
     """6. the job-end dedup also holds with threads off (the default): a crash before the job file is
     removed never sends the note twice."""
