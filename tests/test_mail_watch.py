@@ -216,10 +216,12 @@ class MailWatch(unittest.TestCase):
 
     def test_coordinator_prepares_the_next_step(self):
         """Owner 5 Nov 2026: the coordinator reads the mail and prepares the next step; drafts and calendar
-        only after the owner's yes; a 'reply to start' email is the owner's call; nothing is ever sent."""
+        only after the owner's yes; a 'reply to start' email is the owner's call; a send only after the owner's OK on
+        that draft (#125), never a delete, label or mark."""
         r = relay.MAIL_RULES
         for part in ("get_thread", "@@TO #<n>", "@@DRAFT", "only after the owner says yes",
-                     "is the owner's call", "Never send, delete, archive, label or mark mail", "@@WATCHMAIL"):
+                     "is the owner's call", "only after the owner's explicit OK on that exact draft",
+                     "Never delete, archive, label or mark mail", "@@WATCHMAIL"):
             self.assertIn(part, r)
 
     def test_verdict_lines(self):

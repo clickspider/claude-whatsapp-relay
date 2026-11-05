@@ -2,6 +2,9 @@
 """One-time Gmail access for the relay's mail watch (read only).
 
 Usage: python3 scripts/gmail_auth.py /path/to/relay.config.toml [client_secret.json]
+       python3 scripts/gmail_auth.py /path/to/relay.config.toml --send
+--send: a second, separate access with gmail.compose (read and send drafts) for scripts/gmail_send.py, saved under
+mail.send_keychain_service. The mail watch keeps its read-only access.
 
 1. Takes the OAuth client file (Google Cloud > Google Auth Platform > Clients > Desktop app > Download JSON):
    the path you give, else the newest ~/Downloads/client_secret_*.json. It moves the file to mail.client_file
@@ -16,19 +19,23 @@ import tomllib
 import urllib.parse, urllib.request, webbrowser
 
 SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+SEND_SCOPE = "https://www.googleapis.com/auth/gmail.compose"  # drafts.send refuses gmail.send
 AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN = "https://oauth2.googleapis.com/token"
 PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 
 
 def main(argv):
+    send = "--send" in argv
+    argv = [a for a in argv if a != "--send"]
     if not argv:
         sys.exit(__doc__)
+    scope, right = (SEND_SCOPE, "gmail.compose") if send else (SCOPE, "gmail.readonly")
     conf = os.path.abspath(os.path.expanduser(argv[0]))
     with open(conf, "rb") as f:
         m = tomllib.load(f).get("mail", {})
     user = m.get("user") or sys.exit("mail.user is empty in the config.")
-    service = m.get("keychain_service", "relay-gmail-oauth")
+    service = m.get("send_keychain_service", "relay-gmail-send") if send else m.get("keychain_service", "relay-gmail-oauth")
     dest = os.path.join(os.path.dirname(conf), os.path.expanduser(m.get("client_file", "gmail-client.json")))
     src = argv[1] if len(argv) > 1 else max(glob.glob(os.path.expanduser("~/Downloads/client_secret_*.json")),
                                              key=os.path.getmtime, default="")
@@ -69,7 +76,7 @@ def main(argv):
     print(f"Opening the browser. Pick {user}, then press Allow (if Google warns that the app is not "
           "verified: Advanced > Go to the app; it is your own app).")
     webbrowser.open(AUTH + "?" + urllib.parse.urlencode({
-        "client_id": c["client_id"], "redirect_uri": redirect, "response_type": "code", "scope": SCOPE,
+        "client_id": c["client_id"], "redirect_uri": redirect, "response_type": "code", "scope": scope,
         "access_type": "offline", "prompt": "consent", "state": state, "login_hint": user,
         "code_challenge": challenge, "code_challenge_method": "S256"}))
     end = time.time() + 1800  # 30 min: the Allow ask goes to the owner over WhatsApp
@@ -84,8 +91,8 @@ def main(argv):
                                    "grant_type": "authorization_code", "code_verifier": verifier}).encode()
     with urllib.request.urlopen(urllib.request.Request(TOKEN, data=body), timeout=30) as r:
         tok = json.load(r)
-    if set(tok.get("scope", "").split()) != {SCOPE}:
-        sys.exit(f"Google gave other rights than gmail.readonly ({tok.get('scope')}). Nothing saved.")
+    if set(tok.get("scope", "").split()) != {scope}:
+        sys.exit(f"Google gave other rights than {right} ({tok.get('scope')}). Nothing saved.")
     if not tok.get("refresh_token"):
         sys.exit("Google sent no refresh token. Run this again. Nothing saved.")
     req = urllib.request.Request(PROFILE, headers={"Authorization": f"Bearer {tok['access_token']}"})
@@ -96,8 +103,8 @@ def main(argv):
     # ponytail: `security -w <token>` shows the token in the process list for a moment; fine on a one-user Mac
     subprocess.run(["security", "add-generic-password", "-U", "-s", service, "-a", user, "-w", tok["refresh_token"]],
                    check=True)
-    print(f"OK: read-only Gmail access for {email} is saved in the Keychain ({service}). "
-          "The mail watch starts within 5 minutes.")
+    print(f"OK: {right} access for {email} is saved in the Keychain ({service}). " +
+          ("Claude can now send a draft after your OK." if send else "The mail watch starts within 5 minutes."))
 
 
 if __name__ == "__main__":

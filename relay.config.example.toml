@@ -92,6 +92,9 @@ whisper_language = "auto"
 state_dir = "state"
 # One folder per agent: RULES.md + its state files.
 agents_dir = "agents"
+# One rules file EVERY agent gets on top of its own RULES.md (read the chat first, never re-ask,
+# notes are instructions, privacy, loop guard). Its RULES.md can be stricter, never looser. "" = off.
+agent_base_rules = ""
 
 [feedback]
 # Show "typing..." in WhatsApp while Claude works (repeated every 10 s).
@@ -239,6 +242,12 @@ enabled = false
 user = ""                              # the Gmail address
 client_file = "gmail-client.json"      # the OAuth client file, next to this config (gmail_auth.py moves it here)
 keychain_service = "relay-gmail-oauth"
+# Optional: let Claude send an existing Gmail draft, only after your OK on that exact draft (scripts/gmail_send.py:
+# show, your OK, send; one OK = one mail, every send logged in mail-send/sent.log). A separate gmail.compose token:
+#   python3 scripts/gmail_auth.py /path/to/relay.config.toml --send
+# and add "Bash(python3 -I /path/to/claude-whatsapp-relay/scripts/gmail_send.py *)" to owner.allowed_tools.
+# HIGH: Claude can send mail in your name. Without that token nothing can be sent.
+send_keychain_service = "relay-gmail-send"
 check_minutes = 5
 digest_hour = 8                        # -1 = no morning digest
 [mail.watch]
@@ -263,8 +272,13 @@ main_chat_chars = 10000
 # Seconds the coordinator waits after a thread result before it writes to you, so results that come
 # close together arrive as ONE message. 0 = right away.
 digest_seconds = 120
-# Threads waiting in review this many hours close by themselves (a reply opens them again). 0 = never.
-auto_close_hours = 72
+# A thread in review closes this many hours after its result reached you (a reply opens it again). 0 = never.
+auto_close_hours = 24
+# A thread blocked this many days: the coordinator asks you once if it is still needed. 0 = never.
+blocked_ask_days = 7
+# ...and closes it this many hours after that question when nothing new came in. The open question stays
+# in the timeline as one line. 0 = never.
+blocked_close_hours = 48
 # Effort (claude --effort low|medium|high|xhigh|max; "" = the CLI default). The coordinator may end a
 # brief with "| effort=high"; else effort_high when a word below is in the title, brief or your
 # message (substring, any case), else effort_default. Higher effort = better answers, more usage.

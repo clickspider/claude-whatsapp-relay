@@ -135,7 +135,7 @@ class InstinctFixes(unittest.TestCase):
                 mock.patch.object(relay, "ask_owner_claude", return_value="@@SKIP") as ask, \
                 mock.patch.object(relay, "coordinator_send"):
             relay.coordinator_digest()
-        self.assertIn("matters to the owner this morning", ask.call_args[0][0])
+        self.assertIn("matters to the owner this morning", ask.call_args_list[0][0][0])
         self.assertNotIn("morning", relay._digest)
         self.news()
         relay._digest["due"] = True

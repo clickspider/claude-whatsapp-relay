@@ -114,11 +114,15 @@ class ThreadTests(unittest.TestCase):
         with mock.patch.object(relay, "run_claude", return_value=R("agents started\n@@STATE: working")):
             relay.thread_run("9", "go")
         self.assertEqual(relay.threads_db()["9"]["state"], "review")  # nothing runs after a reply
-        relay.thread_auto_close()
-        self.assertEqual(relay.threads_db()["9"]["state"], "review")
         with mock.patch.object(relay.time, "time", return_value=relay.time.time() + 73 * 3600):
             relay.thread_auto_close()
-        self.assertEqual(relay.threads_db()["9"]["state"], "closed")
+        self.assertEqual(relay.threads_db()["9"]["state"], "review")  # the owner never got the result: stays
+        relay.mark_delivered(relay.time.time() + 1)
+        relay.thread_auto_close()
+        self.assertEqual(relay.threads_db()["9"]["state"], "review")
+        with mock.patch.object(relay.time, "time", return_value=relay.time.time() + 25 * 3600):
+            relay.thread_auto_close()
+        self.assertEqual(relay.threads_db()["9"]["state"], "closed")  # 24 h after it reached the owner
 
     def test_big_session_hands_off(self):
         relay.threads_db("3", title="w", state="working", sid="old", last="")
