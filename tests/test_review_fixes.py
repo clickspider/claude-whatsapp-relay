@@ -325,6 +325,151 @@ class ThirdReview(unittest.TestCase):
         self.assertFalse(any("uncertain" in t for t in self.sent))
 
 
+class FourthReview(unittest.TestCase):
+    """Instinct's re-review of c802dbf (M1-M3 and the 3.10 timestamp)."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+
+    def cut_digest(self, got=True, **rec):
+        relay.write(relay.st("inflight.json"), json.dumps({"digest": dict({
+            "digest": True, "sending": True, "upto": 0, "after": 1, "text": "#4 is done."}, **rec)}))
+        relay._inflight.clear()
+        with mock.patch.object(relay, "landed", return_value=got), mock.patch.object(relay, "ask") as ask, \
+                mock.patch.object(relay, "send_owner_file") as sf, mock.patch.object(relay, "digest_soon"):
+            relay.resume_jobs()
+        return ask, sf
+
+    def test_m1_the_question_and_file_after_the_body_are_tracked(self):
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["due"] = True
+        answer = "#4 is done.\n@@ASK: keep it? | yes | no\n@@FILE: report.pdf"
+        with mock.patch.object(relay, "owner_night", return_value=False), \
+                mock.patch.object(relay, "ask_owner_claude", return_value=answer), \
+                mock.patch.object(relay, "ask", side_effect=relay.StopRun()):  # a crash after the body
+            with self.assertRaises(relay.StopRun):
+                relay.coordinator_digest()
+        rec = relay._inflight["digest"]
+        self.assertEqual(rec["tail"], [["ask", "keep it?", ["yes", "no"]], ["file", "report.pdf"]])
+        self.assertEqual(rec["tail_at"], 0)  # the question was on its way
+        relay.inflight("digest")
+
+    def test_m1_a_body_that_landed_still_sends_the_rest_of_the_bundle(self):
+        ask, sf = self.cut_digest(tail=[["ask", "keep it?", ["yes", "no"]], ["file", "report.pdf"]])
+        ask.assert_called_once_with(relay.OWNER, "keep it?", ["yes", "no"], kind="ask")
+        sf.assert_called_once_with("report.pdf")
+        self.assertFalse(any("uncertain" in t for t in self.sent))
+
+    def test_m1_the_item_on_its_way_is_named_never_sent_twice(self):
+        ask, sf = self.cut_digest(tail=[["ask", "keep it?", ["yes", "no"]], ["file", "report.pdf"]], tail_at=0)
+        ask.assert_not_called()  # it may have gone out: say so, no copy
+        sf.assert_called_once_with("report.pdf")
+        self.assertTrue(any("uncertain" in t and "keep it?" in t for t in self.sent))
+
+    def test_m1_a_contact_answer_of_only_pictures_is_unknown_not_silent(self):
+        relay._inflight["m1"] = {"route": ["m1", "c@s", "c", "hi", ""], "sending": True, "after": 5, "text": None}
+        seen = []
+        a = {"name": "mom", "home": "/tmp", "trust": "reply", "checkins": False, "files": False, "images": True,
+             "mentions": False, "gifs": False, "ask_contact": False}
+        with mock.patch.object(relay, "send_agent_image", lambda *x, **k: seen.append(relay._inflight["m1"]["text"])), \
+                mock.patch.object(relay, "pick_react"), mock.patch.object(relay, "apply_fixes", lambda c, t: t):
+            relay.deliver("c@s", a, "@@IMAGE: a.jpg", False, refs={"#1": ("m1", "c@s", "hi")})
+        self.assertEqual(seen, ["?"])  # a crash mid-pictures: "delivery uncertain", never silently "nothing went"
+        self.assertEqual(relay._inflight["m1"]["text"], "")  # all out: nothing to re-run
+
+    def test_m2_an_old_digest_record_without_a_receipt_is_uncertain(self):
+        relay.write(relay.st("inflight.json"), json.dumps({"digest": {
+            "digest": True, "sending": True, "upto": 0, "after": 1}}))
+        relay._inflight.clear()
+        relay.resume_jobs()
+        self.assertTrue(any("uncertain" in t for t in self.sent))
+
+    def test_m3_the_sweep_rearms_news_the_retries_gave_up_on(self):
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["timer"] = None
+        with mock.patch.object(relay, "digest_soon") as ds:
+            relay.digest_sweep()
+            ds.assert_called_once()
+            relay._inflight["digest"] = {"digest": True}  # one is queued or running: leave it
+            relay.digest_sweep()
+            ds.assert_called_once()
+            relay.inflight("digest")
+            relay._digest["timer"] = mock.Mock(is_alive=lambda: True)  # a timer waits (backoff, night)
+            relay.digest_sweep()
+            ds.assert_called_once()
+        relay._digest["timer"] = None
+
+    def test_m1_a_second_crash_during_resume_sends_nothing_twice(self):  # independent review, round 4
+        tail = [["file", "a.pdf"], ["file", "b.pdf"], ["file", "c.pdf"]]
+        relay._inflight["digest"] = {
+            "digest": True, "sending": True, "upto": 0, "after": 1, "text": "x", "tail": tail, "tail_at": 0}
+        with mock.patch.object(relay, "landed", return_value=True), \
+                mock.patch.object(relay, "send_owner_file", side_effect=relay.StopRun()):  # dies during b.pdf
+            with self.assertRaises(relay.StopRun):
+                relay.resume_one("digest", relay._inflight["digest"], {}, [])
+        self.assertEqual(relay._inflight["digest"]["tail_at"], 1)  # b.pdf was on its way, not a.pdf
+        relay.inflight("digest")
+
+    def test_m1_tail_at_proves_the_body_went_out(self):  # a long body cut over two bubbles may miss landed()
+        ask, sf = self.cut_digest(got=False, tail=[["file", "a.pdf"], ["file", "b.pdf"]], tail_at=0)
+        sf.assert_called_once_with("b.pdf")
+
+    def test_m1_a_failed_question_never_repeats_the_body(self):  # the retry after an error re-sent the digest
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["due"], relay._digest["fails"] = True, 0
+        with mock.patch.object(relay, "owner_night", return_value=False), \
+                mock.patch.object(relay, "ask_owner_claude", return_value="#4 is done.\n@@ASK: keep? | yes | no"), \
+                mock.patch.object(relay, "ask", side_effect=OSError("bridge down")), \
+                mock.patch.object(relay.threading, "Timer") as tm:
+            relay.coordinator_digest()
+        tm.assert_not_called()  # no retry: the body is out
+        self.assertTrue(any("not sent" in t and "keep?" in t for t in self.sent))
+        self.assertNotIn("#4 t", relay.main_since("coordinator", lambda w: False, peek=True))
+
+    def test_m1_a_failed_note_after_the_body_never_repeats_the_digest(self):  # independent review, round 4
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["due"], relay._digest["fails"] = True, 0
+        with mock.patch.object(relay, "owner_night", return_value=False), \
+                mock.patch.object(relay, "ask_owner_claude", return_value="#4 is done.\n@@ASK: keep? | yes | no"), \
+                mock.patch.object(relay, "ask", side_effect=OSError("bridge down")), \
+                mock.patch.object(relay, "send_text", side_effect=[None, OSError("bridge down")]), \
+                mock.patch.object(relay.threading, "Timer") as tm:
+            relay.coordinator_digest()
+        tm.assert_not_called()
+
+    def test_m1_a_body_with_pictures_is_never_run_again(self):  # a re-run sent the pictures twice
+        relay._inflight["m1"] = {"route": ["m1", "c@s", "c", "hi", ""], "sending": True, "after": 5, "text": None}
+        seen = []
+        a = {"name": "mom", "home": "/tmp", "trust": "reply", "checkins": False, "files": False, "images": True,
+             "mentions": False, "gifs": False, "ask_contact": False, "trial_hours": 0}
+        with mock.patch.object(relay, "send_agent_image", lambda *x, **k: seen.append(relay._inflight["m1"]["text"])), \
+                mock.patch.object(relay, "send_text", lambda *x, **k: seen.append(relay._inflight["m1"]["text"])), \
+                mock.patch.object(relay, "log_thread"), mock.patch.object(relay, "pick_quote"), \
+                mock.patch.object(relay, "pick_react"), mock.patch.object(relay, "apply_fixes", lambda c, t: t):
+            relay.deliver("c@s", a, "look\n@@IMAGE: a.jpg", False, refs={"#1": ("m1", "c@s", "hi")})
+        self.assertEqual(seen, ["?", "?"])
+        relay._inflight.pop("m1")
+
+    def test_m3_the_sweep_leaves_a_digest_parked_on_the_limit(self):
+        relay.main_log("#4 t (review)", "done")
+        relay._digest["timer"] = None
+        with mock.patch.object(relay, "parked", return_value={"digest": {"rec": {"digest": True}, "at": 1}}), \
+                mock.patch.object(relay, "digest_soon") as ds:
+            relay.digest_sweep()
+        ds.assert_not_called()
+
+    def test_a_second_digest_timer_keeps_the_receipt_of_the_one_going_out(self):
+        relay._inflight["digest"] = {"digest": True, "sending": True, "text": "x", "upto": 0, "after": 1}
+        with mock.patch.object(relay, "enqueue_job"):
+            relay.digest_job()
+        self.assertTrue(relay._inflight["digest"]["sending"])
+        relay._inflight.pop("digest")
+
+    def test_nanosecond_timestamps_parse_on_python_3_10_too(self):  # relay needs 3.11; reviewers shim 3.10
+        self.assertEqual(relay.msg_epoch("2025-01-01 10:00:00.123456789+02:00"),
+                         relay.msg_epoch("2025-01-01 10:00:00.123456+02:00"))
+        self.assertIsNotNone(relay.msg_epoch("2025-01-01 10:00:00.123456789+02:00"))
+
+
 class JobDedupThreadsOff(unittest.TestCase):
     """6. the job-end dedup also holds with threads off (the default): a crash before the job file is
     removed never sends the note twice."""

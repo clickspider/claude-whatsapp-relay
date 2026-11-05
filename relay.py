@@ -1499,9 +1499,11 @@ def sending_text(refs, text):
         inflight(mid, dict(rec, text=text[-4000:]))
 
 
-def coordinator_send(answer, text, voice=False, refs=None):
+def coordinator_send(answer, text, voice=False, refs=None, track=None):
     """The coordinator's answer -> markers handled, the rest sent to the owner.
-    refs = {"#1": (msg_id, OWNER, text), ...}: the owner messages this answer may quote."""
+    refs = {"#1": (msg_id, OWNER, text), ...}: the owner messages this answer may quote.
+    track = the in-flight key whose receipt covers this send: the questions and files after the body are
+    recorded there too, so a restart sends what did not go out yet (send_tail)."""
     qm = re.search(r"^\s*@@QUOTE\s*:?\s*(.*)$", answer, re.M)
     quote = pick_quote(OWNER, qm.group(1) if qm else None, refs, auto_last=len(refs or {}) > 1)
     answer = re.sub(r"^\s*@@(QUOTE|SKIP)\s*:?.*$\n?", "", answer, flags=re.M).strip()
@@ -1528,12 +1530,31 @@ def coordinator_send(answer, text, voice=False, refs=None):
         main_log("COORDINATOR", answer)
         acks = [thread_dispatch(t, text) for t in notes]  # the owner sees only problems, not "Sent to #n"
         answer = "\n".join([answer] + [x for x in acks if x.startswith("(")]).strip()
+    tail = [["ask", q, opts] for q, opts in asks] + [["file", f] for f in files]
+    if track and tail and _inflight.get(track):
+        inflight(track, dict(_inflight[track], tail=tail))
     if answer:
         send_voice(OWNER, answer) if voice else send_text(OWNER, answer, quote=quote)
-    for q, opts in asks:
-        ask(OWNER, q, opts, kind="ask")
-    for f in files:
-        send_owner_file(f)
+    if track == "digest":
+        _digest["sent"] = True  # the body is out: an error after this never repeats the digest
+    send_tail(tail, track)
+
+
+def send_tail(tail, track=None, start=0):
+    """The polls and files that go out after the body (Instinct round 3, M1: the receipt covered only the body,
+    so a crash after it lost the question or the file). tail_at = the item on its way, set before its send."""
+    for i, item in enumerate(tail[start:], start):
+        if track and _inflight.get(track):
+            inflight(track, dict(_inflight[track], tail_at=i))
+        try:  # one failed item never stops the rest, and never repeats the body (a digest retry would)
+            ask(OWNER, item[1], item[2], kind="ask") if item[0] == "ask" else send_owner_file(item[1])
+        except StopRun:
+            raise
+        except Exception as e:
+            try:
+                send_text(OWNER, f"({'question' if item[0] == 'ask' else 'file'} not sent: {item[1]}: {e})")
+            except Exception:
+                pass  # the bridge is down: the note cannot go either
 
 
 def send_owner_file(path):
@@ -1976,7 +1997,8 @@ def digest_soon():
 
 
 def digest_job():
-    inflight("digest", {"digest": True})  # tracked like any job: a restart or the usage limit resumes it
+    if "digest" not in _inflight:  # never over the receipt of a digest going out now (independent review)
+        inflight("digest", {"digest": True})  # tracked like any job: a restart or the usage limit resumes it
     enqueue_job("owner", coordinator_digest, "digest")
 
 
@@ -2023,7 +2045,7 @@ def _coordinator_digest():
             main_log("COORDINATOR", "Chose silence (it already reached the owner) for: " + "; ".join(items))
     inflight("digest", {"digest": True, "sending": True, "upto": upto, "after": bridge_rowid(),
                         "text": last_sent(answer)[-4000:]})  # a restart now: check the receipt, never blind
-    coordinator_send(answer, "")
+    coordinator_send(answer, "", track="digest")
     _digest["sent"] = True
     main_mark("coordinator", upto)
     mark_delivered(t0, news)
@@ -2070,6 +2092,15 @@ def unread_result():
         data, start = read(st("threads/main.md")), seen_offsets().get("coordinator", 0)
     start = start if start <= len(data) else 0
     return mid_entry(data, start) or bool(THREAD_RESULT_RE.search(data[start:]))  # mid-entry: its rest waits
+
+
+def digest_sweep():
+    """Unread news, no digest timer and no digest queued: arm one (Instinct round 3, M3). The retries stop after
+    5 backoffs; without this a long outage stalled the news until the next event or a restart."""
+    t = _digest["timer"]
+    if not (t and t.is_alive()) and "digest" not in _inflight and unread_result() \
+            and not any("digest" in j["rec"] for j in parked().values()):  # the limit resumes that one
+        digest_soon()
 
 
 def more_news():
@@ -2531,7 +2562,9 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         if CFG["ui"]["polls"]:
             ask(OWNER, f"{name} draft: send it?", DRAFT_OPTIONS, kind="draft", agent=name, draft=digest(body))
         return sending_text(refs, "")
-    sending_text(refs, body)  # before the pictures: from here a restart checks the receipt, never re-runs blind
+    # before the pictures: from here a restart checks the receipt, never re-runs blind. With pictures the receipt
+    # is "?" (unknown): a re-run would send them twice, and "" would hide a crash mid-pictures (review M1)
+    sending_text(refs, "?" if images or files else body)
     for spec in images:  # before the text: the question comes after the pictures
         send_agent_image(a, OWNER if dry else jid, spec)
     for spec in files:
@@ -2545,7 +2578,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     tags = []
     if a["mentions"] and m["MENTION"] and not dry:
         body, tags = add_mentions(a, body, m["MENTION"])
-    sending_text(refs, body)
+    sending_text(refs, "?" if images or files else body)
     send_text(OWNER if dry else jid, (f"[dry run → {name}]\n" if dry else "") + body, quote=quote, mentions=tags)
     if a["gifs"] and (m["GIF"] or m["STICKER"]):
         send_gif(OWNER if dry else jid, m["STICKER"] or m["GIF"], sticker=bool(m["STICKER"]))
@@ -3073,15 +3106,21 @@ def resume_one(key, rec, notes, unsure):
         n, prompt = rec["thread"]
         notes.setdefault(n, []).append((key, prompt, rec.get("ran") or prompt.startswith((RESUME_NOTE, LIMIT_NOTE, TIMEOUT_NOTE))))
     elif "digest" in rec and rec.get("sending"):  # stopped while it went out: ask the bridge what landed
-        got = landed(OWNER, rec.get("after"), rec["text"]) if rec.get("text") else True  # "" = it sent nothing
+        # "" = it sent nothing; no "text" key = a record from before the receipt: unknown (review M2)
+        got = landed(OWNER, rec.get("after"), rec["text"]) if rec.get("text") else None if "text" not in rec else True
+        got = True if rec.get("tail_at") is not None else got  # set only after the body went out
         if got is False:  # nothing landed: the news stays unread and goes out again
             inflight(key)
             digest_soon()
         else:  # landed (no copy), or the bridge cannot tell (delivery unknown: say so, no blind copy)
             main_mark("coordinator", rec["upto"])
-            inflight(key)
             if got is None:
                 unsure.append("a thread update")
+            tail, at = rec.get("tail") or [], rec.get("tail_at")
+            if at is not None and at < len(tail):  # on its way at the crash: maybe sent, so say so, no copy
+                unsure.append(f"the {'question' if tail[at][0] == 'ask' else 'file'} {tail[at][1]}")
+            send_tail(tail, key, 0 if at is None else at + 1)  # the rest never started: send it now
+            inflight(key)
     elif "digest" in rec:
         digest_soon()
     else:  # a kind this version does not know: never kept forever
@@ -3490,7 +3529,7 @@ def restart_if_changed():
         send_text(OWNER, "relay.py has a syntax error, so I did NOT restart:\n" + r.stderr[-800:])
         return
     print(f"{owner_now():%H:%M} relay.py changed: restarting, {len(_procs)} run(s) stopped", flush=True)
-    if _digest["due"]:  # thread news waiting for the coordinator: report it after the restart
+    if _digest["due"] and "digest" not in _inflight:  # thread news waiting: report it after the restart
         inflight("digest", {"digest": True})
     STOPPING.set()
     for p in list(_procs):
@@ -4066,7 +4105,8 @@ def mail_tick(now=None):
 def msg_epoch(stamp):
     """Bridge timestamps are text like '2026-10-15 16:21:03.5+02:00'. None if unreadable."""
     try:
-        return datetime.datetime.fromisoformat(str(stamp)).timestamp()
+        # the bridge writes nanoseconds; Python 3.10 reads at most 6 digits (Instinct round 3)
+        return datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", str(stamp))).timestamp()
     except ValueError:
         return None
 
@@ -4143,6 +4183,7 @@ def main_loop():
                           (15, resume_parked),
                           (300, battery_warning),
                           (1800, thread_auto_close if CFG["threads"]["enabled"] else None),
+                          (1800, digest_sweep if CFG["threads"]["enabled"] else None),
                           (30, mail_tick if CFG["mail"]["enabled"] else None)):
             if fn and tick % every == 0:
                 try:
