@@ -27,8 +27,9 @@ timezone = "Europe/Amsterdam"
 new_session_hour = 4
 # Automatic /new (with the same hand-off) when the context passes this many tokens. 0 = never.
 max_context_tokens = 500000
-# Messages you send within this many seconds (or while Claude is still busy) get ONE answer.
-batch_seconds = 3
+# Messages you send within this many seconds (or while Claude is still busy) get ONE answer. A newer
+# message cuts an answer that is not sent yet: the next turn answers all of them at once.
+batch_seconds = 8
 # Where files you send (photos, PDFs, documents) are copied, so they land in your folder.
 # Relative to `folder`, e.g. "_inbox/whatsapp". "" = leave them in the bridge's media folder. LOW.
 media_dir = ""
@@ -77,6 +78,14 @@ ffmpeg = "ffmpeg"
 whisper_cli = "whisper-cli"
 # Local speech-to-text model. Get it with scripts/get-model.sh. Voice never leaves this computer.
 whisper_model = "models/ggml-large-v3-turbo-q5_0.bin"
+# Optional: model for the Hebrew parts of voice notes, e.g. ggml-model.bin from huggingface.co/ivrit-ai/whisper-large-v3-turbo-ggml
+# (about 1.6 GB). Only used with whisper_language = "auto". A note is cut at its pauses and each language gets its own model,
+# so a note may mix languages. Takes about twice as long. Empty = the main model for everything.
+whisper_model_he = ""
+# Optional: names and terms you use in Hebrew notes, so the Hebrew model writes them right. Keep it short.
+whisper_prompt_he = ""
+# Optional: words whisper keeps mishearing, as { heard = "meant" }.
+whisper_fixes = {}
 # Language of voice notes for whisper ("auto", "en", "nl", ...).
 whisper_language = "auto"
 # Session id, read cursor and hand-off notes. Created with mode 0700.
@@ -87,15 +96,18 @@ agents_dir = "agents"
 [feedback]
 # Show "typing..." in WhatsApp while Claude works (repeated every 10 s).
 typing = true
-# Reactions on your message: 👀 got it, ⏳ long job, ✅ done, ⚠️ failed.
+# Reactions on your message: only the one Claude picks after reading. The relay never reacts by itself.
 reactions = true
-# Claude may pick a fitting emoji instead of ✅ (❤️ sweet, 😂 joke, 🙏 thanks, 🎉 good news);
-# a reaction alone can be the whole answer. Needs reactions = true. false = always ✅.
+# Claude reacts only when a person would (👀 looking into it, 👍 got it, ✅ done, ❤️/😂 the human bit),
+# sent just before its answer; most messages get none; a reaction alone can be the whole answer. Needs reactions = true.
+# false = no emoji, only the answer.
 context_reactions = true
+# An emoji someone puts on a message reaches the agent as a short answer to that message, so ✅ can
+# replace typing. Costs one Claude run per reaction. In groups: only on the agent's own messages.
+# Taking a reaction away does nothing. false = reactions are ignored.
+incoming_reactions = true
 # Mark your message as read (blue ticks) when the relay picks it up.
 mark_read = true
-# Add ⏳ after this many seconds. 0 = never.
-long_job_seconds = 180
 # How often the relay checks for new messages, in seconds.
 poll_seconds = 2
 # Listening groups: wait this many quiet seconds, then the agent reads the batch at once.
@@ -105,6 +117,12 @@ group_digest_after_seconds = 120
 # Max messages handled per chat per minute and per day (also caps your Claude bill). 0 = no cap (MED).
 per_minute = 6
 per_day = 150
+# Answers each contact agent gives a day, per person (0 = no cap). An agent's turns_per_day overrides it.
+# Over the cap the contact gets prompts.turns_used_up once that day, and you get a note.
+agent_turns_per_day = 0
+# A run that hits the Claude usage limit runs again by itself 2 min after the reset (every 15 min
+# when the reset time cannot be read), up to this many times; then you get one line. 0 = off.
+limit_resume_tries = 5
 # Max group messages kept while waiting for a digest turn. 0 = unbounded (MED).
 group_buffer_max = 40
 # Kill a Claude run after this many seconds. 0 = never.
@@ -149,6 +167,10 @@ polls = false
 # LOW. Free key from developers.giphy.com: agents with gifs = true may send GIFs and stickers.
 # Only the search words go to GIPHY. "" = off.
 giphy_api_key = ""
+# LOW. true = an answer goes out as a WhatsApp reply (quote) to the message it answers, when several
+# messages came together or newer ones came in before the answer. Claude (and every agent) can also
+# pick one with a line "@@QUOTE: #n". false = only that line quotes.
+auto_quote = true
 
 [prompts]
 # Fixed words the relay sends to agents. Your agents' RULES.md should use the same words.
@@ -157,6 +179,8 @@ status = "STATUS FOR OWNER"
 intro = "INTRO"
 checkin = "CHECK-IN TIME"
 from_owner_claude = "FROM OWNER'S CLAUDE: "
+# Sent with an emoji reaction (see feedback.incoming_reactions).
+reaction = "(This is an emoji reaction, not typed words. It is the person's short answer to that message: read the emoji in the context of that message. If it needs no answer, write no message text, only the line '@@REACT: 👍'.)"
 # Agents send you a note with a line "@@OWNER: <note>".
 owner_note_marker = "OWNER"
 # First words of a group digest prompt.
@@ -197,6 +221,29 @@ check_hours = 6
 # system sleep while it runs on power; it ends with the relay. No system settings are changed.
 # On battery (or with the lid closed and no display) the Mac can still sleep: the log warns you. LOW.
 keep_awake = true
+
+[mail]
+# Mail watch: tells you (through the coordinator) when an important email comes in. Gmail API with your
+# own OAuth client and only the gmail.readonly scope, so it can read but never send, delete or change mail.
+# Plain code asks Gmail for new inbox mail every check_minutes (no AI, no cost). Ads and newsletters are
+# skipped unless they match a watch topic. One cheap haiku call (no tools) sorts the rest by consequence:
+# does it change open work, need your decision, or carry a deadline, money or security risk? Important mail
+# goes to the coordinator as one '🔔 mail' note. At owner.night only what cannot wait goes out; the rest
+# comes in the digest at digest_hour (with what is still unread or not answered).
+# Setup, once: Google Cloud > new project > enable the Gmail API > Google Auth Platform (External, Publish
+# app, else the access ends after 7 days) > Clients > Desktop app > Download JSON. Then run
+#   python3 scripts/gmail_auth.py /path/to/relay.config.toml
+# and press Allow. The token goes to the macOS Keychain, never to a file.
+# MED: the first 500 characters of each new mail go to Claude for sorting. Off by default.
+enabled = false
+user = ""                              # the Gmail address
+client_file = "gmail-client.json"      # the OAuth client file, next to this config (gmail_auth.py moves it here)
+keychain_service = "relay-gmail-oauth"
+check_minutes = 5
+digest_hour = 8                        # -1 = no morning digest
+[mail.watch]
+# topic = ["sender address, domain or word", ...]: a hint for the sort; ads from these still count.
+# example = ["lawyer.example", "invoice 1234"]
 
 [threads]
 # Your chat works like a Claude Project. It becomes the coordinator: it answers small things itself and
@@ -267,8 +314,12 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # checkins = false                       # it may plan its own next message with @@NEXT_CHECKIN
 #                                        # and set reminders with @@REMIND: YYYY-MM-DD HH:MM | note
 # self_per_day = 0                       # max check-ins/reminders a day it starts itself, unless the contact wrote after the last one (0 = no cap)
+# turns_per_day = 20                     # answers a day for this contact (overrides limits.agent_turns_per_day)
+# trial_hours = 72                       # access ends this many hours after the first message it sends; you get a note 24 h before and at the end. Raise it to extend
+# turns_message = "" / trial_message = "" # what the contact reads at the cap / after the trial (default: prompts.turns_used_up / prompts.trial_ended)
 # quiet_hours = true                     # false = this agent ignores [quiet_hours] (check-ins + inbox notes any time)
 # gifs = false                           # true = it may add @@GIF: <words> or @@STICKER: <words> (needs ui.giphy_api_key)
+# files = false                         # true = it may send PDFs from its home with @@FILE: <path>
 # mentions = false                       # true = it may tag a person from members with @@MENTION: <name> (groups; tag only, no DMs)
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
 # use_owner_voice = true                 # write like you (owner.voice_file). Not set = on only in own-number

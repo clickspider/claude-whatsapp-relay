@@ -44,6 +44,6 @@ Then ask: "Do you want to continue?" Stop if the answer is no.
 ## 4. Start (ask first)
 1. Ask: "Start the relay now, and on every login?" On yes (macOS): `scripts/install-launchd.sh --load`.
    Without launchd: `python3 relay.py run` in a terminal.
-2. Ask the user to send "hi" from their own number. Watch the log (`[launchd] log_dir`/relay.log). Expect 👀 then ✅ on the message.
+2. Ask the user to send "hi" from their own number. Watch the log (`[launchd] log_dir`/relay.log). Expect "typing…", then the answer (a reaction only when it fits).
 3. Tell the user: "Done. Your chat is now a remote control for this folder. Keep your phone locked, and do not forward strangers' messages into it."
 4. If this is a dossier with a `backup.sh`: never add `relay.config.toml` to a public repo.

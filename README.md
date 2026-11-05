@@ -81,10 +81,10 @@ and follow its SETUP.md with me, one question at a time.
 | 📎 **Files and photos** | Claude gets the file. Set `owner.media_dir` to copy every file into your folder. |
 | 🔄 **`/new` with a hand-off** | A fresh conversation that starts with a short hand-off from the old one. Also automatic every day at 04:00 and when the context gets big. |
 | 🧑‍🤝‍🧑 **Agents per contact** | Optional. A locked Claude for one contact or group, with its own role in `RULES.md` and its own folder. Replies wait for your `/<name> ok` until you trust it. |
-| ↩️ **Quote-replies** | Claude can answer as a WhatsApp reply to one message. In a group, replying to the agent's message talks to it. |
+| ↩️ **Quote-replies** | Claude can answer as a WhatsApp reply to one message (`@@QUOTE: #n`). When several messages came together, or newer ones came in before the answer, the reply quotes the last one by itself (`ui.auto_quote`). In a group, replying to the agent's message talks to it. |
 | 🌙 **Quiet hours** | Agents never start a conversation at night or on your days off. Replies still go out. |
 | 🧵 **Threads** | Optional (`[threads]`). Your chat works like a Claude Project: it starts a thread for each real task, threads run in parallel, and each reply carries its tag (`#3 flat move: ...`). |
-| 👀 **Feedback** | 👀 when it got your message, ⏳ on a long job, ✅ when done, "typing…" while Claude works. Claude may swap ✅ for a fitting emoji (❤️, 😂, 🙏, 🎉): `[feedback] context_reactions`. |
+| 👀 **Feedback** | "typing…" while Claude works. The relay never reacts by itself. Claude reacts only when a person would, after reading, just before the answer (👀 looking into it, 👍 got it, ✅ done, ❤️/😂 the human bit); most messages get none: `[feedback] context_reactions`. An emoji on a message reaches Claude as a short answer to that message, so ✅ can replace typing. |
 
 ## Commands in your chat
 

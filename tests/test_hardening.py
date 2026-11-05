@@ -208,6 +208,7 @@ class UsageLimit(AgentCase):
         import threading
         done = threading.Event()
         relay.workers.pop("owner-limit-test", None)
+        relay._limit_noticed.clear()
 
         def send(c, t, quote=None):
             self.sent.append((c, t))
@@ -215,7 +216,8 @@ class UsageLimit(AgentCase):
         with Patch(CFG=self.cfg, OWNER=OWNER, send_text=send):
             relay.enqueue("owner-limit-test", lambda: (_ for _ in ()).throw(relay.ClaudeLimit("")))
             done.wait(5)
-        self.assertEqual(self.sent, [(OWNER, "owner-limit-test: I hit my Claude limit. Back later.")])
+        # one line per reset window, not one per stopped job (4 Nov 2026: five of them at 21:17)
+        self.assertEqual(self.sent, [(OWNER, "I hit my Claude limit. Back later. Stopped work goes on by itself then.")])
 
 
 class KeepAwake(unittest.TestCase):

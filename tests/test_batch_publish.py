@@ -32,7 +32,7 @@ class Batching(unittest.TestCase):
             relay.owner_drain()
         self.assertEqual(len(turns), 1)
         self.assertEqual([m[0] for m in turns[0]], ["m0", "m1", "m2"])
-        self.assertIn(("m0", "✅"), marks)
+        self.assertEqual(marks, [])  # no 👀/✅ on earlier messages: only the answer's own @@REACT
         self.assertFalse(relay.owner_sched[0])
 
     def test_new_runs_on_its_own(self):

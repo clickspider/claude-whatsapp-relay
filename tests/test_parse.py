@@ -35,6 +35,55 @@ class ParseTests(unittest.TestCase):
                          ("@31600000001, can you check the DJ?", ["31600000001"]))
         self.assertEqual(relay.add_mentions(a, "Hi both", ["Daniel", "Nobody"]), ("@31600000002 Hi both", ["31600000002"]))
 
+    def test_image_marker_sends_only_images_in_home(self):
+        import tempfile
+        relay.CFG = {"prompts": {"owner_note_marker": "OWNER"}}
+        body, marks = relay.parse("A or B?\n@@IMAGE: media/out/bed.jpg | NEIDEN https://x")
+        self.assertEqual((body, marks["IMAGE"]), ("A or B?", ["media/out/bed.jpg | NEIDEN https://x"]))
+        home, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, "media", "out"))
+        open(os.path.join(home, "media", "out", "bed.jpg"), "w").close()
+        sent, texts = [], []
+        relay.CFG = {"bridge": {"outbox": out}}
+        for name, fake in (("api", lambda kind, payload: sent.append(payload)),
+                           ("send_text", lambda chat, text, **kw: texts.append(text)),
+                           ("log_thread", lambda *a, **kw: None)):
+            self.addCleanup(setattr, relay, name, getattr(relay, name))
+            setattr(relay, name, fake)
+        a = {"name": "mom", "home": home}
+        relay.send_agent_image(a, "mom@s", marks["IMAGE"][0])
+        relay.send_agent_image(a, "mom@s", "../../etc/passwd")
+        self.assertEqual([(p["recipient"], p["message"]) for p in sent], [("mom@s", "NEIDEN https://x")])
+        self.assertEqual(len(texts), 1)  # the bad path: a note to the owner, nothing to mom
+
+    def test_file_marker_sends_only_pdfs_in_home(self):
+        import tempfile
+        relay.CFG = {"prompts": {"owner_note_marker": "OWNER"}}
+        body, marks = relay.parse("Here it is\n@@FILE: cv/cv.pdf")
+        self.assertEqual((body, marks["FILE"]), ("Here it is", ["cv/cv.pdf"]))
+        home, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, "cv"))
+        for f in ("cv.pdf", "notes.md"):
+            open(os.path.join(home, "cv", f), "w").close()
+        sent, texts = [], []
+        relay.CFG = {"bridge": {"outbox": out}, "prompts": {"owner_note_marker": "OWNER"}, "owner": {"name": "O"},
+                     "hooks": {"after_log": []}, "threads": {"enabled": False}, "ui": {"polls": False}}
+        for name, fake in (("api", lambda kind, payload: sent.append(payload)),
+                           ("send_text", lambda chat, text, **kw: texts.append((chat, text))),
+                           ("log_thread", lambda *a, **kw: None), ("pick_react", lambda *a: None)):
+            self.addCleanup(setattr, relay, name, getattr(relay, name))
+            setattr(relay, name, fake)
+        a = {"name": "ran", "home": home, "trust": "reply", "checkins": False, "files": True, "images": False,
+             "mentions": False, "gifs": False, "ask_contact": False}
+        relay.deliver("ran@s", a, "Here it is\n@@FILE: cv/cv.pdf\n@@FILE: cv/notes.md\n@@FILE: ../../../etc/passwd", False)
+        self.assertEqual([os.path.basename(p["media_path"]) for p in sent], ["cv.pdf"])
+        self.assertEqual(sent[0]["recipient"], "ran@s")
+        self.assertEqual(texts[-1], ("ran@s", "Here it is"))
+        self.assertEqual(len(texts), 3)  # 2 refused paths: notes to the owner
+        sent.clear()
+        relay.deliver("x@s", dict(a, files=False), "Hi\n@@FILE: cv/cv.pdf", False)  # off = nothing goes out
+        self.assertEqual(sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()

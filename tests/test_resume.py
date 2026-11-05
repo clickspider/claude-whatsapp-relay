@@ -61,7 +61,7 @@ class ResumeTests(unittest.TestCase):
         relay.threads_db("3", title="x", state="working", sid="", last="")
         relay.write(relay.st("inflight.json"), json.dumps({
             "m9": {"route": ["m9", relay.OWNER, "s", "plan my week", ""]},
-            "thread-3-1": {"thread": ["3", "find movers"]}}))
+            "thread-3-1": {"thread": ["3", "find movers"], "ran": True}}))
         with mock.patch.object(relay, "thread_job") as tj, mock.patch.object(relay, "owner_add") as oa:
             relay.resume_jobs()
         oa.assert_called_once_with("m9", "plan my week", "")

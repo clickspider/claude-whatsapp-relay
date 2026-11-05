@@ -171,7 +171,7 @@ extra_disallowed_tools = ["mcp__mail__send"]
 
     def test_feedback_switches(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for extra, expect in (("", {"mark-read", "react", "typing"}),
+            for extra, expect in (("", {"mark-read", "typing"}),
                                   ("[feedback]\ntyping = false\nreactions = false\nmark_read = false", set())):
                 relay.CFG = relay.load_config(write_cfg(tmp, extra))
                 calls, orig = [], relay.api
@@ -180,7 +180,7 @@ extra_disallowed_tools = ["mcp__mail__send"]
                     relay.with_feedback("c", "m", "s", lambda: None)
                 finally:
                     relay.api = orig
-                self.assertEqual(set(calls), expect)
+                self.assertEqual(set(calls), expect)  # no reaction on arrival, only after reading (@@REACT)
 
     def test_owner_media_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

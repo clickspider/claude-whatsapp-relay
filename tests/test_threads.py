@@ -47,6 +47,8 @@ class ThreadTests(unittest.TestCase):
         rest, notes = relay.take_thread_markers("On it.\n@@THREAD: flat move | find movers\n@@TO #2: add dates")
         self.assertEqual(rest, "On it.")
         self.assertEqual(notes, [("new", "flat move", "find movers"), ("to", "2", "add dates")])
+        rest, notes = relay.take_thread_markers("@@TO #3: fix this:\n1. a\n2. b\n\nDone, sent.")
+        self.assertEqual((rest, notes), ("Done, sent.", [("to", "3", "fix this:\n1. a\n2. b")]))
 
     def test_start_run_followup_close(self):
         self.assertEqual(relay.thread_dispatch(("new", "flat move", "find movers"), "help me move"),
@@ -234,7 +236,9 @@ class ThreadTests(unittest.TestCase):
                 relay.digest_soon()  # inside the wait: same timer
                 self.assertEqual([t.sec for t in timers], [120])
                 timers[0].fn()
-                self.assertEqual(self.jobs[-1], ("owner", relay.coordinator_digest))
+                self.assertEqual(self.jobs[-1][0], "owner")  # tracked: a restart or the usage limit resumes it
+                self.assertIn("digest", relay._inflight)
+                relay._inflight.pop("digest", None), relay._claimed.discard("digest")
                 timers[0].fired = True
                 relay.digest_soon()
                 self.assertEqual(len(timers), 2)

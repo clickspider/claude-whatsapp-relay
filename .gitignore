@@ -19,3 +19,4 @@ __pycache__/
 *.pyc
 .DS_Store
 .installed
+gmail-client.json

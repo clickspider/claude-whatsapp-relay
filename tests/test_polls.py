@@ -91,3 +91,26 @@ class OldBridge(Votes):
         with self.patch(api=boom):
             relay.ask("o@s.whatsapp.net", "Lunch?", ["Yes", "No"], kind="ask")
         self.assertEqual(self.sent, [("o@s.whatsapp.net", "Lunch?\n1. Yes\n2. No")])
+
+
+class OwnerFile(unittest.TestCase):
+    """@@FILE sends a file from the owner's folder to the OWNER only; outside paths are refused."""
+    def test_inside_sent_outside_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            open(os.path.join(root, "r.pdf"), "w").write("x")
+            sent, calls = [], []
+            cfg = {"owner": {"folder": root}, "bridge": {"outbox": os.path.join(root, "out")}}
+            with Patch(CFG=cfg, OWNER="o@s.whatsapp.net",
+                       send_text=lambda c, t, quote=None: sent.append(t),
+                       api=lambda path, p=None: calls.append(p) or {}):
+                relay.send_owner_file("r.pdf")
+                relay.send_owner_file("/etc/hosts")
+                relay.send_owner_file("../x.pdf")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["recipient"], "o@s.whatsapp.net")
+            self.assertEqual(os.path.basename(calls[0]["media_path"]), "r.pdf")  # own folder, plain name
+            self.assertEqual(len(sent), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
