@@ -41,14 +41,15 @@ class SendGate(unittest.TestCase):
     def run_cmd(self, cmd):
         with redirect_stdout(io.StringIO()) as out:
             try:
-                gs.main([cmd, DRAFT, self.conf])
+                with mock.patch.object(gs, "CONF", self.conf):
+                    gs.main([cmd, DRAFT])
             except SystemExit as e:
                 return str(e)
         return out.getvalue()
 
-    def owner_says(self, text, later=1):
+    def owner_says(self, text, later=1, where=""):
         with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:
-            json.dump({"time": time.time() + later, "text": text}, f)
+            json.dump({"time": time.time() + later, "text": text, "where": where}, f)
 
     def test_no_ok_means_no_send(self):
         self.assertIn("not shown", self.run_cmd("send"))  # never shown
@@ -82,6 +83,18 @@ class SendGate(unittest.TestCase):
             self.assertIn("UNKNOWN", json.loads(f.readline())["outcome"])
         self.assertIn("one OK = one mail", self.run_cmd("send"))  # and never sent again on the same OK
 
+    def test_only_a_plain_owner_chat_ok_counts(self):
+        # review #139 F1 + F3: no config from argv; a thread OK, a poll answer or an old record never opens it
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as e:
+                gs.main(["send", DRAFT, self.conf])
+        self.assertIn("no config argument", str(e.exception))
+        self.run_cmd("show")
+        for where in ("#134", "poll", None):
+            self.owner_says("ok", where=where)
+            self.assertIn("for a thread or a poll", self.run_cmd("send"), where)
+        self.assertEqual(self.sent, [])
+
     def test_changed_draft_needs_a_new_show(self):
         self.run_cmd("show")
         self.body = "Hi, other text"
@@ -96,7 +109,12 @@ class SendGate(unittest.TestCase):
                 mock.patch.object(relay, "resume_note", return_value=""):
             relay.owner_prep("m1", "שלח", None)
         last = json.loads(relay.read(relay.st("owner-last.json")))
-        self.assertEqual(last["text"], "שלח")  # the owner's own words, not the quoted message
+        self.assertEqual((last["text"], last["where"]), ("שלח", ""))  # his own words, in the owner chat
+        with mock.patch.object(relay, "quoted_text", return_value=""), mock.patch.object(relay, "resume_note", return_value=""):
+            relay.owner_prep("m2", "ok", None, where="#134")  # "#134 ok": thread_route strips the tag
+            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "#134")
+            relay.owner_prep("m3", 'ANSWER to "Send?": Yes', None)
+            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "poll")
         self.assertIn("gmail_send.py show", relay.MAIL_RULES)
         self.assertIn("only after the owner's explicit OK on that exact draft", relay.MAIL_RULES)
 

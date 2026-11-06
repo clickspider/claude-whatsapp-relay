@@ -104,23 +104,27 @@ def main(argv):
     if len(argv) < 2 or argv[0] not in ("show", "send") or not ID_RE.match(argv[1]):
         sys.exit(__doc__)
     cmd, did = argv[0], argv[1]
-    m, here, state = conf_paths(os.path.abspath(os.path.expanduser(argv[2] if len(argv) > 2 else CONF)))
-    pending_path, log_path = os.path.join(state, "mail-send", "pending.json"), os.path.join(state, "mail-send", "sent.log")
+    if len(argv) > 2:  # review #139 F1: a config from argv = a state folder (owner-last.json) the caller wrote
+        sys.exit("NOT SENT: the config path is fixed (gmail_send.CONF); no config argument.")
+    m, here, state = conf_paths(os.path.abspath(os.path.expanduser(CONF)))
+    pending_path, log_path = os.path.join(state, "mail-send", "pending.json"), os.path.join(state, "mail-send", "sent.log")  # also gmail_draft's slot
     tok = access(m, here)
     h, msg = draft(tok, did)
     if cmd == "show":
-        save(pending_path, {"draft": did, "hash": h, "time": time.time()})  # only the newest shown draft waits
+        save(pending_path, {"kind": "send", "draft": did, "hash": h, "time": time.time()})  # only the newest shown draft waits
         print(describe(msg))
         print(f"\nShow the owner exactly this and ask, naming the subject in the question. Send only after the "
               f"owner's next message is a clear OK for it: gmail_send.py send {did}")
         return
     p = load(pending_path, {})
     ok = load(os.path.join(state, "owner-last.json"), {})
-    why = ("this draft was not shown to the owner first (run show)" if p.get("draft") != did else
+    why = ("this draft was not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "send" else
            "the draft changed after it was shown: run show again and ask again" if p.get("hash") != h else
            "the owner wrote nothing after the show" if ok.get("time", 0) <= p.get("time", 0) else
-           "the OK came too late after the show: run show again" if ok["time"] - p["time"] > OK_HOURS * 3600 else
+           "the OK came too late after the show: run show again" if time.time() - p["time"] > OK_HOURS * 3600 else
+           "the owner's message has a time in the future (clock changed?): run show again" if ok["time"] > time.time() + 60 else
            "the owner's last message is not a clear OK" if not is_ok(ok.get("text")) else
+           "that OK was for a thread or a poll, not a message in the owner chat" if ok.get("where") != "" else
            "that OK already sent a mail: one OK = one mail" if p.get("used") == ok["time"] else "")
     if why:
         sys.exit(f"NOT SENT: {why}.")

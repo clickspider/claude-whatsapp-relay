@@ -51,14 +51,15 @@ class Attach(unittest.TestCase):
     def cmd(self, name, *files):
         with redirect_stdout(io.StringIO()) as out:
             try:
-                gd.main([name, DRAFT, *files, "--config", self.conf])
+                with mock.patch.object(gs, "CONF", self.conf):
+                    gd.main([name, DRAFT, *files])
             except SystemExit as e:
                 return str(e)
         return out.getvalue()
 
-    def owner_says(self, text, later=1):
+    def owner_says(self, text, later=1, where=""):
         with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:
-            json.dump({"time": time.time() + later, "text": text}, f)
+            json.dump({"time": time.time() + later, "text": text, "where": where}, f)
 
     def run_cmd(self, *files):
         """The happy path: show, the owner's clear OK, attach. A refusal at show stops there."""
@@ -167,7 +168,10 @@ class Attach(unittest.TestCase):
             self.owner_says(text)
             self.assertIn("NOT ATTACHED", self.cmd("attach", self.pdf), text)
         self.owner_says("ok", later=gd.gs.OK_HOURS * 3600 + 60)
-        self.assertIn("too late", self.cmd("attach", self.pdf))
+        self.assertIn("in the future", self.cmd("attach", self.pdf))  # a time ahead of the clock never counts
+        later = time.time() + gd.gs.OK_HOURS * 3600 + 120
+        with mock.patch.object(gd.time, "time", return_value=later):
+            self.assertIn("too late", self.cmd("attach", self.pdf))  # the window ends 2 h after the show
         self.assertEqual(self.puts, [])
 
     def test_any_change_after_the_show_needs_a_new_show(self):
@@ -201,10 +205,62 @@ class Attach(unittest.TestCase):
         self.assertEqual((line["draft"], line["to"], line["ok"]), (DRAFT, ["a@example.nl", "b@example.nl"], "ok"))
         self.owner_says("ok", later=-1)  # real order: his OK came before this moment (the test above used +1 s)
         with redirect_stdout(io.StringIO()):  # the send gate: show after the attach, the old OK does not count
-            gs.main(["show", DRAFT, self.conf])
-            with self.assertRaises(SystemExit) as e:
-                gs.main(["send", DRAFT, self.conf])
+            with mock.patch.object(gs, "CONF", self.conf):
+                gs.main(["show", DRAFT])
+                with self.assertRaises(SystemExit) as e:
+                    gs.main(["send", DRAFT])
         self.assertIn("NOT SENT: the owner wrote nothing after the show", str(e.exception))
+
+    def test_one_ok_covers_only_the_newest_show_of_either_gate(self):
+        # review #139 F3 repro E: attach show, then a send show, then "שלח": the send word never uploads a file
+        self.cmd("show", self.pdf)
+        with redirect_stdout(io.StringIO()), mock.patch.object(gs, "CONF", self.conf):
+            gs.main(["show", DRAFT])
+        self.owner_says("שלח")
+        self.assertIn("not shown to the owner first", self.cmd("attach", self.pdf))
+        self.assertEqual(self.puts, [])
+
+    def test_a_thread_or_poll_ok_never_attaches(self):
+        self.cmd("show", self.pdf)
+        for where in ("#134", "poll", None):
+            self.owner_says("ok", where=where)
+            self.assertIn("for a thread or a poll", self.cmd("attach", self.pdf), where)
+        self.assertEqual(self.puts, [])
+
+    def test_a_name_without_address_is_no_recipient(self):
+        self.raw = MAIL.replace("To: a@example.nl, b@example.nl", "To: Lara").encode()
+        self.assertIn("no recipient", self.cmd("show", self.pdf))
+
+    def test_the_uploaded_bytes_are_the_shown_bytes(self):
+        # review #139 F5: the file changes between the hash and the upload
+        real_open = open
+        def change_after_read(path, *a, **k):
+            f = real_open(path, *a, **k)
+            if isinstance(path, str) and os.path.realpath(path) == os.path.realpath(self.pdf) and "b" in (a[0] if a else k.get("mode", "")):
+                data = f.read()
+                f.close()
+                with real_open(self.pdf, "wb") as w:
+                    w.write(b"%PDF swapped")
+                return io.BytesIO(data)
+            return f
+        self.cmd("show", self.pdf)
+        with open(self.pdf, "wb") as f:
+            f.write(b"%PDF-1.7 fake")
+        self.owner_says("ok")
+        with mock.patch("builtins.open", change_after_read):
+            self.assertIn("ATTACHED", self.cmd("attach", self.pdf))
+        msg = email.message_from_bytes(self.raw, policy=email.policy.default)
+        part = next(p for p in msg.walk() if p.get_filename() == "letter.pdf")
+        self.assertEqual(part.get_content(), b"%PDF-1.7 fake")
+
+    def test_a_failed_read_back_is_logged_as_unknown(self):
+        self.cmd("show", self.pdf)
+        self.owner_says("ok")
+        with mock.patch.object(gs, "draft", side_effect=TimeoutError("timed out")):
+            out = self.cmd("attach", self.pdf)
+        self.assertIn("OUTCOME UNKNOWN", out)
+        with open(os.path.join(self.tmp, "mail-attach", "attach.log")) as f:
+            self.assertIn("OUTCOME UNKNOWN", json.loads(f.readline())["outcome"])
 
     def test_a_failed_upload_is_outcome_unknown(self):
         self.cmd("show", self.pdf)

@@ -1400,8 +1400,9 @@ def keep_media(path):
     return dest
 
 
-def owner_prep(msg_id, text, media_type):
-    """One owner message -> (prompt text, wants voice). Sends its own error and returns None."""
+def owner_prep(msg_id, text, media_type, where=""):
+    """One owner message -> (prompt text, wants voice). Sends its own error and returns None.
+    where: "" = the owner chat, "#n" = a message routed to thread n."""
     text, voice = text or "", False
     if media_type == "reaction":
         return f"{text}\n{CFG['prompts']['reaction']}", False
@@ -1420,8 +1421,11 @@ def owner_prep(msg_id, text, media_type):
         else:
             path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
-    # scripts/gmail_send.py sends a draft only when this, the owner's own words, is a clear OK after the show
-    write(st("owner-last.json"), json.dumps({"time": time.time(), "text": text.removeprefix("(voice note, transcribed) ")}))
+    # scripts/gmail_send.py / gmail_draft.py act only when this, the owner's own words in the owner chat (not a
+    # thread note, not a poll answer), is a clear OK after the show (review #139 F3)
+    where = "poll" if text.startswith('ANSWER to "') else where
+    write(st("owner-last.json"), json.dumps({"time": time.time(), "where": where,
+                                             "text": text.removeprefix("(voice note, transcribed) ")}))
     text = quoted_text(OWNER, msg_id) + text
     return resume_note(msg_id) + text, voice or text.lower().startswith("voice")
 
@@ -2262,7 +2266,7 @@ def thread_route(msg_id, text, media_type):
         n = q.group(1)
 
     def turn():
-        prep = owner_prep(msg_id, text, media_type)
+        prep = owner_prep(msg_id, text, media_type, where=f"#{n}")
         if prep:
             threads_db(n, state="working")  # a message to a closed thread opens it again
             main_log(f"{CFG['owner']['name'].upper()} to #{n}", prep[0])
