@@ -1,6 +1,6 @@
 """Attach files to a Gmail draft, never send (6 Nov 2026, #139). Against a fake Gmail: nothing goes out.
 Run: python3 -m unittest discover tests"""
-import base64, email, email.policy, io, json, os, sys, tempfile, unittest
+import base64, email, email.policy, io, json, os, sys, tempfile, time, unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -48,13 +48,25 @@ class Attach(unittest.TestCase):
         with open(self.conf, "w") as f:
             f.write('[paths]\nstate_dir = "."\n[mail]\nuser = "me@gmail.com"\n' + mail)
 
-    def run_cmd(self, *files):
+    def cmd(self, name, *files):
         with redirect_stdout(io.StringIO()) as out:
             try:
-                gd.main(["attach", DRAFT, *files, "--config", self.conf])
+                gd.main([name, DRAFT, *files, "--config", self.conf])
             except SystemExit as e:
                 return str(e)
         return out.getvalue()
+
+    def owner_says(self, text, later=1):
+        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:
+            json.dump({"time": time.time() + later, "text": text}, f)
+
+    def run_cmd(self, *files):
+        """The happy path: show, the owner's clear OK, attach. A refusal at show stops there."""
+        out = self.cmd("show", *files)
+        if "Files to attach" not in out:
+            return out
+        self.owner_says("ok")
+        return self.cmd("attach", *files)
 
     def test_attach_keeps_the_mail_and_adds_the_file(self):
         out = self.run_cmd(self.pdf)
@@ -138,6 +150,70 @@ class Attach(unittest.TestCase):
         msg = email.message_from_bytes(self.raw, policy=email.policy.default)
         self.assertEqual(msg.get_content_type(), "multipart/mixed")
         self.assertIn("<div>Hi</div>", msg.get_body(preferencelist=("html",)).get_content())
+
+    # The gate (Daniel + Instinct, 6 Nov 2026 12:25): the OK covers these recipients and these files, BEFORE upload.
+    def test_show_lists_recipients_and_files_and_uploads_nothing(self):
+        out = self.cmd("show", self.pdf)
+        for want in ("To: a@example.nl, b@example.nl", "letter.pdf", "Nothing is uploaded yet"):
+            self.assertIn(want, out)
+        self.assertEqual(self.puts, [])
+
+    def test_no_ok_means_no_upload(self):
+        self.assertIn("not shown", self.cmd("attach", self.pdf))  # never shown
+        self.owner_says("ok", later=-60)  # an OK from before the show does not count
+        self.cmd("show", self.pdf)
+        self.assertIn("wrote nothing after the show", self.cmd("attach", self.pdf))
+        for text in ("לא", "ok but other file", "wait", "which file?"):
+            self.owner_says(text)
+            self.assertIn("NOT ATTACHED", self.cmd("attach", self.pdf), text)
+        self.owner_says("ok", later=gd.gs.OK_HOURS * 3600 + 60)
+        self.assertIn("too late", self.cmd("attach", self.pdf))
+        self.assertEqual(self.puts, [])
+
+    def test_any_change_after_the_show_needs_a_new_show(self):
+        other = os.path.join(self.root, "other.pdf")
+        with open(other, "wb") as f:
+            f.write(b"%PDF other")
+        self.cmd("show", self.pdf)
+        self.owner_says("ok")
+        self.assertIn("changed after the show", self.cmd("attach", other))  # another file
+        self.assertIn("changed after the show", self.cmd("attach", self.pdf, other))  # one more file
+        with open(self.pdf, "ab") as f:
+            f.write(b" edited")
+        self.assertIn("changed after the show", self.cmd("attach", self.pdf))  # same name, new content
+        self.cmd("show", self.pdf)
+        self.owner_says("ok")
+        self.raw = self.raw.replace(b"b@example.nl", b"stranger@example.com")
+        self.assertIn("changed after the show", self.cmd("attach", self.pdf))  # another recipient
+        self.assertEqual(self.puts, [])
+
+    def test_a_draft_without_recipient_is_refused(self):
+        self.raw = MAIL.replace("To: a@example.nl, b@example.nl\r\n", "").encode()
+        self.assertIn("no recipient", self.cmd("show", self.pdf))
+
+    def test_one_ok_uploads_once_and_never_unlocks_a_send(self):
+        self.drop_on_save = True
+        self.assertIn("CHECK FAILED", self.run_cmd(self.pdf))
+        self.assertIn("one OK = one attach", self.cmd("attach", self.pdf))
+        self.assertEqual(len(self.puts), 1)
+        with open(os.path.join(self.tmp, "mail-attach", "attach.log")) as f:
+            line = json.loads(f.readline())
+        self.assertEqual((line["draft"], line["to"], line["ok"]), (DRAFT, ["a@example.nl", "b@example.nl"], "ok"))
+        self.owner_says("ok", later=-1)  # real order: his OK came before this moment (the test above used +1 s)
+        with redirect_stdout(io.StringIO()):  # the send gate: show after the attach, the old OK does not count
+            gs.main(["show", DRAFT, self.conf])
+            with self.assertRaises(SystemExit) as e:
+                gs.main(["send", DRAFT, self.conf])
+        self.assertIn("NOT SENT: the owner wrote nothing after the show", str(e.exception))
+
+    def test_a_failed_upload_is_outcome_unknown(self):
+        self.cmd("show", self.pdf)
+        self.owner_says("ok")
+        with mock.patch.object(gd, "put", side_effect=TimeoutError("timed out")):
+            out = self.cmd("attach", self.pdf)
+        self.assertIn("OUTCOME UNKNOWN", out)
+        self.assertNotIn("ATTACHED to", out)
+        self.assertIn("one OK = one attach", self.cmd("attach", self.pdf))
 
     def test_a_save_that_lost_the_file_is_reported(self):
         self.drop_on_save = True
