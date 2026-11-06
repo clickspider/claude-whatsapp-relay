@@ -1139,6 +1139,8 @@ def job_worker(rec):
     """The worker queue a resume entry belongs to: 'owner', '#<n>' or the agent's name."""
     if "thread" in rec:
         return f"#{rec['thread'][0]}"
+    if "vote" in rec:  # an owner-chat vote on an agent's poll runs in that agent's queue
+        return (polls().get(rec["vote"][3]) or {}).get("agent") or job_worker({"route": rec["route"]})
     if "route" in rec and rec["route"][1] != OWNER:
         return (by_jid(rec["route"][1]) or {}).get("name")
     if "inbox" in rec:
@@ -1445,7 +1447,7 @@ def bridge_rowid():
         c = db("messages.db")
         row = c.execute("SELECT max(rowid) FROM messages").fetchone()
         c.close()
-    except sqlite3.Error:
+    except (sqlite3.Error, KeyError):  # KeyError: no [bridge] store configured
         return None
     return row[0] if row else None
 
@@ -1511,20 +1513,19 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
     mark_sending(*[mid for mid, _, _ in (refs or {}).values()])
     track = track or next((mid for mid, _, _ in reversed(list((refs or {}).values())) if mid in _inflight), None)
     answer, drafts = take_drafts(answer)
+    answer, asks = take_asks(answer)
+    answer = take_watchmail(answer)
+    files = re.findall(r"^\s*@@FILE\s*:?\s*(.+?)\s*$", answer, re.M)
+    answer = re.sub(r"^\s*@@FILE\s*:?.*$\n?", "", answer, flags=re.M).strip()
+    tail = [["ask", q, opts] for q, opts in asks] + [["file", f] for f in files]
+    if track and tail and _inflight.get(track):  # before the drafts go out (Instinct round 5): a crash in the
+        rec = {k: v for k, v in _inflight[track].items() if k != "tail_at"}  # drafts or markers keeps the tail
+        inflight(track, dict(rec, tail=tail))
     for d in drafts:  # the draft alone, so the owner can copy or forward it as is
         send_text(OWNER, d)
         mid = sent_id(OWNER, d)
         if mid:  # the notes below answer the draft as a WhatsApp reply
             quote = (mid, OWNER if OWN[0] else own_jid(), d)
-    answer, drafts = take_drafts(answer)
-    if drafts and not voice:  # each draft = its own bubble to forward/copy; the notes reply to the last one
-        for d in drafts:
-            send_text(OWNER, d)
-        quote = sent_quote(OWNER, drafts[-1]) or quote
-    answer, asks = take_asks(answer)
-    answer = take_watchmail(answer)
-    files = re.findall(r"^\s*@@FILE\s*:?\s*(.+?)\s*$", answer, re.M)
-    answer = re.sub(r"^\s*@@FILE\s*:?.*$\n?", "", answer, flags=re.M).strip()
     if CFG["threads"]["enabled"]:
         answer, notes = take_thread_markers(answer)
         main_log(CFG["owner"]["name"].upper(), text)
@@ -1532,9 +1533,6 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
         main_log("COORDINATOR", answer)
         acks = [thread_dispatch(t, text) for t in notes]  # the owner sees only problems, not "Sent to #n"
         answer = "\n".join([answer] + [x for x in acks if x.startswith("(")]).strip()
-    tail = [["ask", q, opts] for q, opts in asks] + [["file", f] for f in files]
-    if track and tail and _inflight.get(track):
-        inflight(track, dict(_inflight[track], tail=tail))
     if answer:
         send_voice(OWNER, answer) if voice else send_text(OWNER, answer, quote=quote)
     if track == "digest":
@@ -2272,23 +2270,36 @@ def ask(chat, question, options, **record):
         send_text(chat, question + "\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options, 1)))
 
 
-def on_vote(vote_id, chat, sender, poll_id, choice):
-    """A vote on one of our polls. Only the chat the poll went to counts; each poll acts once."""
+def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
+    """A vote on one of our polls. Only the chat the poll went to counts; each poll acts once.
+    resumed = run again after a restart (resume_one): the poll is already done, the vote is not handled yet."""
     rec = polls().get(poll_id)
     choice = (choice or "").split("\n")[0].strip()
-    if not rec or rec.get("done") or rec["chat"] != chat or choice in ("", "(none)"):
+    if not rec or rec.get("done") and not resumed or rec["chat"] != chat or choice in ("", "(none)"):
         return
     name = rec.get("agent", "")
     jid, a = by_name(name) if name else (None, None)
     if name and not a:
         return
-    polls({poll_id: dict(rec, done=True)})
+    # On disk before the poll counts as done (Instinct round 5): a restart before its turn ends runs it again;
+    # re-tapping cannot, a poll acts once. The "route" part gives the receipt and the "uncertain" note.
+    inflight(vote_id, {"route": [vote_id, chat, sender, f"(vote: {choice})", None],
+                       "vote": [vote_id, chat, sender, poll_id, choice]})
+    try:
+        polls({poll_id: dict(rec, done=True)})
+        vote_job(vote_id, chat, sender, rec, choice, name, jid, a)
+    finally:
+        if vote_id not in _claimed:  # handled at once: nothing to resume
+            inflight(vote_id)
+
+
+def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
     if rec["kind"] == "draft":
         draft = flag(a, "pending")
         if not draft or digest(draft) != rec["draft"]:
             return send_text(OWNER, f"That {name} draft is not waiting any more.")
-        if choice == "Send":
-            return enqueue(name, lambda: owner_command(name, "ok"))
+        if choice == "Send":  # sending from here: a restart says "uncertain", never "not waiting" or a copy
+            return enqueue_job(name, lambda: (mark_sending(vote_id), owner_command(name, "ok")), vote_id)
         if choice == "Drop":
             flag(a, "pending", "")
             log_thread(a, f"AGENT (draft dropped by {CFG['owner']['name']})", draft)
@@ -2298,8 +2309,12 @@ def on_vote(vote_id, chat, sender, poll_id, choice):
     if not a:
         return owner_add(vote_id, answer, None)
     if chat == OWNER:
-        return enqueue(name, lambda: deliver(jid, a, run_agent(a, CFG["prompts"]["owner_says"] + answer), False))
-    enqueue(name, lambda: contact_turn(jid, a, vote_id, answer, None, sender=sender))
+        def agent_answer():
+            out = run_agent(a, CFG["prompts"]["owner_says"] + answer)
+            mark_sending(vote_id)  # after the run: a crash now says "uncertain", never a second send
+            deliver(jid, a, out, False)
+        return enqueue_job(name, agent_answer, vote_id)
+    enqueue_job(name, lambda: contact_turn(jid, a, vote_id, answer, None, sender=sender), vote_id)
 
 
 # ---------- agents (contacts and groups) ----------
@@ -3091,12 +3106,19 @@ def resume_one(key, rec, notes, unsure):
     if "route" in rec and rec.get("sending") and chat != OWNER:  # deliver() wrote what went to the contact
         t = rec.get("text", "?")  # "?" = a record from before this check: unknown, never a blind re-run
         got = None if t == "?" else False if t is None else True if not t else landed(chat, rec.get("after"), t)
+    if "route" in rec and rec.get("sending") and rec.get("tail_at") is not None:  # set only after the body went
+        got = True  # out: also the proof for the owner chat, where own messages look the same (round 5 review)
     if "route" in rec and rec.get("sending") and got is not False:  # never send it twice
         if got is None:  # the owner chat (own messages look the same) or no anchor: say so
             text = rec["route"][3] or f"({rec['route'][4]})"
             unsure.append(text if chat == OWNER else (by_jid(chat) or {}).get("name", "an agent") + ": " + text)
         resume_tail(key, rec, rec.get("tail_at") is not None)  # own messages look the same: only tail_at proves it
         inflight(key)
+    elif "vote" in rec:  # a poll vote whose turn never ended: run it again (the poll is done already)
+        RESUMED.add(key)
+        on_vote(*rec["vote"], resumed=True)
+        if key not in _claimed:
+            inflight(key)
     elif "route" in rec:  # not sent yet, or the bridge shows nothing of ours landed: run it again
         RESUMED.add(rec["route"][0])
         route(*rec["route"])
@@ -3335,7 +3357,10 @@ def resume_parked(now=None):
     due = parked(take) if any(j["at"] is not None and j["at"] <= now for j in parked().values()) else []
     names = []
     for rec in due:
-        if "route" in rec:
+        if "vote" in rec:  # a poll answer: run the vote itself, never its "(vote: ...)" label as a message
+            LIMIT_RESUMED.add(rec["vote"][0])
+            on_vote(*rec["vote"], resumed=True)
+        elif "route" in rec:
             LIMIT_RESUMED.add(rec["route"][0])
             route(*rec["route"])
         elif "thread" in rec:
@@ -4155,16 +4180,17 @@ def new_rows(c, last, cutoff=0):
 _last_run = {}
 
 
-def each(name, seconds, now=None):
-    """True once per `seconds` of wall time. The tick counts in main_loop stretch with feedback.poll_seconds and
-    the work per tick (Instinct round 4, O1: "1800" ticks was about an hour). time.time, not monotonic: on macOS
-    monotonic stops while the Mac sleeps, and a sweep is due right after it wakes."""
+def each(name, seconds, now=None, mono=None):
+    """True once per `seconds`. The tick counts in main_loop stretch with feedback.poll_seconds and the work per
+    tick (Instinct round 4, O1: "1800" ticks was about an hour). Elapsed = the larger of wall time (it counts
+    while the Mac sleeps; on macOS monotonic stops then) and monotonic time (it never steps back, so repeated
+    clock changes cannot postpone a sweep; Instinct round 5)."""
     now = time.time() if now is None else now
-    if now < _last_run.get(name, now):  # the clock was set back: start again from here, never stall
-        _last_run[name] = now
-    if now - _last_run.setdefault(name, now) < seconds:
+    mono = time.monotonic() if mono is None else mono
+    w0, m0 = _last_run.setdefault(name, (now, mono))
+    if max(now - w0, mono - m0) < seconds:
         return False
-    _last_run[name] = now
+    _last_run[name] = (now, mono)
     return True
 
 

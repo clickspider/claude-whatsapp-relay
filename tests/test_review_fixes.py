@@ -487,7 +487,7 @@ class FifthReview(unittest.TestCase):
     def test_o1_the_main_loop_runs_the_sweep(self):  # the loop's own name "every" once hid a helper of that name
         class Out(Exception):
             pass
-        relay._last_run["digest_sweep"] = -1e9
+        relay._last_run["digest_sweep"] = (-1e9, -1e9)
         conn = mock.MagicMock()
         conn.execute.return_value.fetchone.return_value = (0,)
         with mock.patch.object(relay, "db", return_value=conn), mock.patch.object(relay, "resume_jobs"), \
@@ -499,8 +499,8 @@ class FifthReview(unittest.TestCase):
         sweep.assert_called_once()
 
     def test_o1_auto_close_also_runs_on_real_time(self):
-        relay._last_run["thread_auto_close"] = -1e9
-        relay._last_run["digest_sweep"] = -1e9
+        relay._last_run["thread_auto_close"] = (-1e9, -1e9)
+        relay._last_run["digest_sweep"] = (-1e9, -1e9)
         conn = mock.MagicMock()
         conn.execute.return_value.fetchone.return_value = (0,)
         with mock.patch.object(relay, "db", return_value=conn), mock.patch.object(relay, "resume_jobs"), \
@@ -521,9 +521,9 @@ class FifthReview(unittest.TestCase):
         relay._digest["retry"] = None
 
     def test_o1_a_clock_set_back_does_not_stop_the_sweeps(self):
-        relay._last_run["y"] = 10_000.0
-        self.assertFalse(relay.each("y", 1800, now=2_000.0))  # clock set back: the clock starts again here
-        self.assertTrue(relay.each("y", 1800, now=3_800.0))
+        relay._last_run["y"] = (10_000.0, 0.0)
+        self.assertFalse(relay.each("y", 1800, now=2_000.0, mono=10.0))  # clock set back
+        self.assertTrue(relay.each("y", 1800, now=3_800.0, mono=1_810.0))
 
     def test_o2_a_note_the_bridge_refuses_never_drops_the_rest(self):
         rec = {"route": ["o1", relay.OWNER, relay.OWNER, "cv?", ""], "sending": True, "tail_at": 0,
@@ -584,6 +584,109 @@ class FifthReview(unittest.TestCase):
             relay.resume_jobs()
         self.assertIn("tailor it?", order[0])
         self.assertEqual(order[1], "cv.pdf")
+
+
+class SixthReview(unittest.TestCase):
+    """Instinct's re-review of 233ad89 (votes, drafts, owner proof, clock)."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+
+    def test_v1_a_vote_cut_by_a_restart_is_answered_after_it(self):
+        relay.polls({"P1": {"chat": relay.OWNER, "question": "tailor it?", "kind": "ask"}})
+        disk = []
+        with mock.patch.object(relay, "owner_add", lambda *a: disk.append(relay.read(relay.st("inflight.json")))):
+            relay.on_vote("V1", relay.OWNER, relay.OWNER, "P1", "yes")
+        self.assertTrue(relay.polls()["P1"]["done"])
+        self.assertIn("V1", json.loads(disk[0]))  # on disk while the answer waits in memory
+        relay.write(relay.st("inflight.json"), disk[0])  # the process dies here: a restart reads this
+        relay._inflight.clear()
+        with mock.patch.object(relay, "owner_add") as oa:
+            relay.resume_jobs()
+        oa.assert_called_once_with("V1", 'ANSWER to "tailor it?": yes', None)
+
+    def test_v1_a_real_kill_mid_vote_loses_nothing(self):  # a real process death: no finally block runs
+        import subprocess
+        relay.polls({"P3": {"chat": relay.OWNER, "question": "tailor it?", "kind": "ask"}})
+        child = (
+            "import os, sys; sys.path.insert(0, sys.argv[1]); import relay\n"
+            "relay.CFG = {'paths': {'state_dir': sys.argv[2]}, 'ui': {'polls': True}}\n"
+            "relay.OWNER = sys.argv[3]\n"
+            "relay.owner_add = lambda *a: os._exit(9)  # killed while the answer waits in memory\n"
+            "relay.on_vote('V3', relay.OWNER, relay.OWNER, 'P3', 'yes')\n")
+        r = subprocess.run([sys.executable, "-c", child, os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            relay.CFG["paths"]["state_dir"], relay.OWNER], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 9, r.stderr)
+        self.assertTrue(relay.polls()["P3"]["done"])  # re-tapping would be ignored now
+        relay._inflight.clear()
+        with mock.patch.object(relay, "owner_add") as oa:
+            relay.resume_jobs()
+        oa.assert_called_once_with("V3", 'ANSWER to "tailor it?": yes', None)
+
+    def test_v1_a_vote_that_is_handled_at_once_leaves_no_record(self):
+        relay.polls({"P2": {"chat": relay.OWNER, "question": "q", "kind": "ask"}})
+        with mock.patch.object(relay, "owner_add"):  # owner_add claims the id in real life; here it does not
+            relay.on_vote("V2", relay.OWNER, relay.OWNER, "P2", "yes")
+        self.assertNotIn("V2", relay._inflight)
+
+    def test_v1_a_vote_parked_on_the_limit_runs_as_a_vote(self):  # independent review: not as "(vote: yes)"
+        rec = {"route": ["V4", relay.OWNER, relay.OWNER, "(vote: yes)", None],
+               "vote": ["V4", relay.OWNER, relay.OWNER, "P4", "yes"]}
+        relay.parked(lambda j: j.update({"route:V4": {"rec": rec, "at": 0, "since": 0, "tries": 0}}))
+        with mock.patch.object(relay, "on_vote") as ov, mock.patch.object(relay, "route") as r:
+            relay.resume_parked(now=1)
+        r.assert_not_called()
+        ov.assert_called_once_with("V4", relay.OWNER, relay.OWNER, "P4", "yes", resumed=True)
+
+    def test_v1_a_vote_job_is_marked_sending_before_it_sends(self):  # a restart then says "uncertain", no copy
+        rec = {"kind": "draft", "agent": "mom", "draft": "d", "chat": relay.OWNER, "question": "send?"}
+        a = {"name": "mom"}
+        relay._inflight["V5"] = {"route": ["V5", relay.OWNER, relay.OWNER, "(vote: Send)", None]}
+        jobs = []
+        with mock.patch.object(relay, "flag", return_value="x"), mock.patch.object(relay, "digest", return_value="d"), \
+                mock.patch.object(relay, "enqueue_job", lambda k, fn, d: jobs.append(fn)), \
+                mock.patch.object(relay, "owner_command", lambda *x: self.assertTrue(relay._inflight["V5"]["sending"])):
+            relay.vote_job("V5", relay.OWNER, relay.OWNER, rec, "Send", "mom", "c@s", a)
+            jobs[0]()
+        relay._inflight.pop("V5")
+
+    def test_v1_stop_finds_the_worker_of_an_owner_chat_vote(self):
+        relay.polls({"P6": {"chat": relay.OWNER, "question": "q", "kind": "draft", "agent": "mom"}})
+        self.assertEqual(relay.job_worker({"route": ["V6", relay.OWNER, relay.OWNER, "x", None],
+                                           "vote": ["V6", relay.OWNER, relay.OWNER, "P6", "Send"]}), "mom")
+
+    def test_v1_no_bridge_store_never_stops_a_vote_job(self):  # mark_sending now runs in vote jobs
+        old = relay.CFG.pop("bridge", None)
+        try:
+            self.assertIsNone(relay.bridge_rowid())
+        finally:
+            if old is not None:
+                relay.CFG["bridge"] = old
+
+    def test_d1_the_bundle_is_saved_before_the_draft_goes_out(self):
+        relay._inflight["o1"] = {"route": ["o1", relay.OWNER, relay.OWNER, "cv?", ""]}
+        with mock.patch.object(relay, "send_text", side_effect=relay.StopRun()):  # a crash during the draft
+            with self.assertRaises(relay.StopRun):
+                relay.coordinator_send("@@DRAFT\nhi vendor\n@@END\nnotes\n@@FILE: cv.pdf", "cv?",
+                                       refs={"#1": ("o1", relay.OWNER, "cv?")})
+        self.assertEqual(relay._inflight["o1"]["tail"], [["file", "cv.pdf"]])
+        relay._inflight.pop("o1")
+
+    def test_p1_tail_at_proves_an_owner_body_went_out(self):
+        relay.write(relay.st("inflight.json"), json.dumps({"o1": {
+            "route": ["o1", relay.OWNER, relay.OWNER, "cv?", ""], "sending": True, "after": 1, "text": None,
+            "tail": [["file", "a.pdf"], ["file", "b.pdf"]], "tail_at": 0}}))
+        relay._inflight.clear()
+        with mock.patch.object(relay, "send_owner_file"), mock.patch.object(relay, "route"):
+            relay.resume_jobs()
+        self.assertFalse(any('answer to "cv?"' in t for t in self.sent))  # only the file on its way is named
+        self.assertTrue(any("a.pdf" in t for t in self.sent))
+
+    def test_c1_repeated_clock_steps_back_never_postpone_a_sweep(self):
+        relay._last_run.pop("z", None)
+        self.assertFalse(relay.each("z", 1800, now=10_000.0, mono=0.0))
+        for i in range(1, 6):  # the clock steps back every 5 min
+            self.assertFalse(relay.each("z", 1800, now=10_000.0 - i * 100, mono=i * 300.0))
+        self.assertTrue(relay.each("z", 1800, now=9_000.0, mono=1_800.0))  # 30 real minutes passed
 
 
 class JobDedupThreadsOff(unittest.TestCase):

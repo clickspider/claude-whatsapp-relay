@@ -20,7 +20,7 @@ class Votes(unittest.TestCase):
         os.makedirs(self.adir)
         self.agent = {"name": "mom", "jid": "c@s.whatsapp.net", "dir": self.adir, "home": self.adir,
                       "live": True, "trust": "reply", "ask_contact": False, "timezone": "UTC"}
-        self.cfg = {"paths": {"state_dir": self.tmp.name}, "ui": {"polls": True},
+        self.cfg = {"paths": {"state_dir": self.tmp.name}, "ui": {"polls": True}, "bridge": {"store": self.tmp.name},
                     "owner": {"name": "Owner"}, "prompts": {"owner_says": "OWNER SAYS: "},
                     "hooks": {"after_log": []}, "agents": [self.agent]}
         self.sent, self.jobs, self.calls = [], [], []
