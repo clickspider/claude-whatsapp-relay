@@ -14,7 +14,7 @@ All user-specific values live in the config file. See SECURITY.md.
 """
 import base64, datetime, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request, uuid, wave
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
@@ -1124,6 +1124,11 @@ class StopRun(Exception):
 
 
 _stopped = set()  # processes killed by /stop
+_stop_n = Counter()  # /stops per worker key ('*' = /stop all), so a run can see one since its job began
+
+
+def stop_mark(key):
+    return _stop_n[key], _stop_n["*"]
 
 
 class Preempted(StopRun):
@@ -1176,8 +1181,18 @@ def stop_runs(keys=None):
     # A vote tapped in the owner chat is the owner's, also when its job waits or runs in an agent's queue (a
     # draft "Send"): plain /stop stops it there too (Instinct round 6). Its job checks _stopped_votes first.
     own_vote = lambda rec: hit("owner") and "vote" in rec and rec["vote"][1] == OWNER
+    for k in keys or ["*"]:  # before the scan of _procs: a run registered after it ends itself (run_claude)
+        _stop_n[k] += 1
+    if _vote_lock.locked():  # a long bundle or a slow send: say why the "Stopped" line waits (Instinct round 8)
+        send_text(OWNER, "A send is on its way: stopping right after it.")
     with _vote_lock:  # a vote send on its way ends first; after this no vote job of these sends (vote_queue)
         votes = {k: rec for k, rec in list(_inflight.items()) if own_vote(rec)}
+        # off the disk first, then stopped in memory (Instinct round 8): a crash in between never replays one
+        for key in votes:
+            inflight(key)
+        # parked on the usage limit: it would run again when the limit ends, also after a restart (review)
+        parked(lambda jobs: [jobs.pop(k) for k, j in list(jobs.items())  # not the digest: it is thread news
+                             if "digest" not in j["rec"] and (hit(job_worker(j["rec"])) or own_vote(j["rec"]))])
         _stopped_votes.update(votes)
     runs = [p for p in list(_procs) if hit(getattr(p, "relay_key", None)) or getattr(p, "vote", None) in votes]
     for p in runs:
@@ -1199,10 +1214,6 @@ def stop_runs(keys=None):
         for key, rec in votes.items():  # the snapshot: a killed run may end and drop its record meanwhile
             dropped += not hit(job_worker(rec)) and key not in running  # else counted already
             _claimed.discard(key)
-            inflight(key)
-    # parked on the usage limit: it would run again when the limit ends, also after a restart (review)
-    parked(lambda jobs: [jobs.pop(k) for k, j in list(jobs.items())  # not the digest: it is thread news, not a send
-                         if "digest" not in j["rec"] and (hit(job_worker(j["rec"])) or own_vote(j["rec"]))])
     for key, rec in list(_inflight.items()):
         if hit(job_worker(rec)):
             _claimed.discard(key)
@@ -1211,8 +1222,11 @@ def stop_runs(keys=None):
         if t["state"] == "working" and hit(f"#{n}"):
             threads_db(n, state="blocked", last="Stopped by the owner (/stop). Reply to go on.")
     what = "everything" if keys is None else ", ".join(sorted("this chat" if k == "owner" else k for k in keys))
+    held = sorted({rec.get("worker") for rec in votes.values() if rec["vote"][4] == "Send"
+                   and not rec.get("sending")} - {None, "owner"})  # a Send already out is no held draft
     send_text(OWNER, f"Stopped {what}: {len(runs)} running, {dropped} waiting. Nothing from them is sent; "
-                     "what already went out stays out.")
+                     "what already went out stays out."
+              + "".join(f" The {n} draft stays held: /{n} ok still sends it." for n in held))
 
 
 def hold_if_stopping():
@@ -1228,11 +1242,12 @@ def run_claude(args, cwd, prompt):
                          stderr=subprocess.PIPE, text=True)
     p.relay_key = getattr(_wk, "key", None)
     p.vote = getattr(_wk, "vote", None)  # a vote job's run: an owner-chat /stop ends it too (stop_runs)
-    if p.vote in _stopped_votes:  # the /stop came between the job's start and this run
+    p.preempt = getattr(_wk, "preempt", False)
+    _procs.add(p)  # registered first, then checked (Instinct round 8): a /stop in between sees one or the other
+    stops = getattr(_wk, "stops", None)
+    if p.vote in _stopped_votes or (stops and stops != stop_mark(p.relay_key)):  # /stop since the job started
         _stopped.add(p)
         p.terminate()
-    p.preempt = getattr(_wk, "preempt", False)
-    _procs.add(p)
     try:
         out, err = p.communicate(prompt, timeout=CFG["limits"]["run_timeout_seconds"] or None)
     except subprocess.TimeoutExpired:
@@ -3249,6 +3264,7 @@ def enqueue(key, fn):
             while True:
                 job = q.get()
                 _wk.key = key  # run_claude tags its process with it, for '/stop'
+                _wk.stops = stop_mark(key)  # a /stop after this ends the job's runs, also one not started yet
                 busy[0] += 1
                 try:
                     job()

@@ -781,7 +781,7 @@ class SeventhReview(unittest.TestCase):
         with mock.patch.object(relay, "by_name", return_value=("c14@s", a)), \
                 mock.patch.object(relay, "flag", return_value="x"), mock.patch.object(relay, "digest", return_value="d"), \
                 mock.patch.object(relay, "mark_sending"), mock.patch.object(relay, "owner_command", command), \
-                mock.patch.object(relay, "send_text", lambda c, t, **k: order.append("stopped")):
+                mock.patch.object(relay, "send_text", lambda c, t, **k: order.append("waiting" if "on its way" in t else "stopped")):
             relay.on_vote("V14", relay.OWNER, relay.OWNER, "P14", "Send")
             job = threading.Thread(target=self.jobs[-1][1])
             job.start()
@@ -791,7 +791,7 @@ class SeventhReview(unittest.TestCase):
             stop.join(0.3)
             self.assertTrue(stop.is_alive())  # it waits for the send on its way
             go.set(), job.join(5), stop.join(5)
-        self.assertEqual(order, ["sent", "stopped"])
+        self.assertEqual(order, ["waiting", "sent", "stopped"])  # round 8: it says why it waits
 
     def test_s1_a_vote_after_the_stop_still_counts(self):
         sent = []
@@ -806,6 +806,82 @@ class SeventhReview(unittest.TestCase):
             for _, job in self.jobs:
                 job()
         self.assertEqual(sent, [("busy8", "ok")])
+
+
+class EighthReview(unittest.TestCase):
+    """Instinct's re-review of 457505e: two narrow /stop races, and a clearer acknowledgement."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+
+    def vote(self, v, worker, choice="Mon"):
+        return {"route": [v, relay.OWNER, relay.OWNER, f"(vote: {choice})", None],
+                "vote": [v, relay.OWNER, relay.OWNER, "P" + v, choice], "worker": worker}
+
+    def stop_at_register(self, vote=None, key=None, stops=None):
+        """/stop lands after the run's process started, right before run_claude registers it."""
+        fake = mock.Mock()
+        fake.communicate.return_value = ("", "")
+        fake.returncode = 0
+
+        class Racy(set):
+            def add(s, p):
+                relay.stop_runs({"owner"})
+                super().add(p)
+        relay._wk.vote, relay._wk.key, relay._wk.stops = vote, key, stops
+        try:
+            with mock.patch.object(relay.subprocess, "Popen", return_value=fake), \
+                    mock.patch.object(relay, "_procs", Racy()), mock.patch.object(relay, "hold_if_stopping"):
+                with self.assertRaises(relay.StopRun):
+                    relay.run_claude(["claude"], "/tmp", "hi")
+        finally:
+            relay._wk.vote = relay._wk.key = relay._wk.stops = None
+        fake.terminate.assert_called()
+
+    def test_r1_a_stop_before_the_vote_run_registers_still_ends_it(self):
+        relay._inflight["V20"] = self.vote("V20", "busy20")
+        self.stop_at_register(vote="V20", key="busy20")
+
+    def test_r1_a_stop_before_an_owner_run_registers_still_ends_it(self):  # the same window without a vote
+        self.stop_at_register(key="owner", stops=relay.stop_mark("owner"))
+
+    def test_r1_a_stop_of_another_worker_leaves_the_run_alone(self):
+        relay._wk.key, relay._wk.stops = "#7", relay.stop_mark("#7")
+        fake = mock.Mock()
+        fake.communicate.return_value = ("ok", "")
+        fake.returncode = 0
+        try:
+            relay.stop_runs({"owner"})
+            with mock.patch.object(relay.subprocess, "Popen", return_value=fake), \
+                    mock.patch.object(relay, "hold_if_stopping"), mock.patch.object(relay, "limit_hit", return_value=None):
+                relay.run_claude(["claude"], "/tmp", "hi")
+        finally:
+            relay._wk.key = relay._wk.stops = None
+        fake.terminate.assert_not_called()
+
+    def test_r2_a_crash_inside_the_stop_never_replays_the_vote(self):  # the disk changes before the memory mark
+        relay.inflight("V21", self.vote("V21", "busy21"))
+        rec = self.vote("V22", "busy22")
+        relay.parked(lambda j: j.update({relay.job_id(rec): {"rec": rec, "at": 0, "since": 0, "tries": 0}}))
+
+        class Crash(set):
+            def update(s, *a):
+                raise SystemExit("killed")
+        with mock.patch.object(relay, "_stopped_votes", Crash()):
+            with self.assertRaises(SystemExit):
+                relay.stop_runs({"owner"})
+        with open(relay.st("inflight.json")) as f:
+            self.assertNotIn("V21", json.load(f))
+        self.assertEqual(relay.parked(), {})
+
+    def test_p_the_stop_line_says_a_stopped_draft_stays_held(self):
+        relay._inflight["V23"] = self.vote("V23", "busy23", "Send")
+        relay.stop_runs({"owner"})
+        self.assertTrue(any("/busy23 ok" in t for t in self.sent))
+
+    def test_p_a_send_already_out_is_not_called_held(self):
+        relay._inflight["V24"] = dict(self.vote("V24", "busy24", "Send"), sending=True)
+        relay.stop_runs({"owner"})
+        self.assertFalse(any("busy24" in t for t in self.sent))
 
 
 class JobDedupThreadsOff(unittest.TestCase):
