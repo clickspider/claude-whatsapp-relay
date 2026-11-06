@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-"""Attach files to ONE existing Gmail draft, only after the owner's OK on those recipients and those exact files,
-given BEFORE the upload (Daniel + Instinct, 6 Nov 2026 12:25, #139). Drafts only: this script never sends.
+"""Attach files to ONE existing Gmail draft, only after the owner's vote on a poll for those recipients and those
+exact files, given BEFORE the upload (Daniel + Instinct 12:25, poll 14:27, 6 Nov 2026, #139). Never sends.
 
 Usage: python3 -I scripts/gmail_draft.py show   <draft-id> <file> [<file> ...]
        python3 -I scripts/gmail_draft.py attach <draft-id> <file> [<file> ...]
-The config is the relay's RELAY_CONFIG (gs.CONF), never an argument: a caller-picked config = a caller-written
-owner-last.json.
+The config is the relay's RELAY_CONFIG (gs.CONF), never an argument.
 
 Why a gate here too: an upload to a draft already moves the file out of the dossier, even when it is never sent,
-and "an address I mailed before" is no permission for a file. So, like gmail_send.py:
-show:   prints the draft's To, Cc, Bcc and the files (name, size, place), and remembers exactly that (recipients,
-        file paths and a hash of each file's content). Only the newest show waits for an OK.
-attach: uploads only when the owner wrote after the show a short clear OK (gs.is_ok) in the owner chat (not
-        a "#n" thread message, not a poll answer), at most gs.OK_HOURS after the show (now, not the OK, counts),
-        no OK time in the future, the recipients and files are still exactly the shown ones (any change = show
-        again; each file is read once, so the hashed bytes are the uploaded bytes), and that OK did not already
-        unlock another action. ONE pending slot with gmail_send.py (mail-send/pending.json, kind=attach|send):
-        the newest show of either kind is the only one waiting. Then: reads the draft (raw MIME), adds the files, saves it with
-        drafts.update in the same thread and reads it back. Every attach gets one line with its outcome in
-        mail-attach/attach.log.
-The changed draft needs a new 'gmail_send.py show' and a NEW OK before any send: show -> OK -> send stays the
-last gate, and one OK never unlocks both an attach and a send.
+and "an address I mailed before" is no permission for a file.
+show:   uploads nothing. Puts the draft, its recipients and the files (path + content hash, read once) in the one
+        waiting slot shared with gmail_send.py (mail-send/pending.json, kind attach). After the turn the relay
+        sends the owner the recipients, each file's name, size and pages, the files themselves, and its own
+        "Send / Don't send" poll (gmail_send.py has the rest of the flow).
+attach: only when the slot is this draft, the recipients and files are exactly the shown ones (any change =
+        show again; the hashed bytes are the uploaded bytes), and gs.vote_ok passes. Then it reads the draft (raw
+        MIME), adds the files, saves it with drafts.update in the same thread and reads it back. Every attach gets
+        one line with its outcome in mail-attach/attach.log.
+The changed draft needs its own gmail_send.py show and a new vote before any send: one vote never does both.
 Files: only real files inside mail.attach_dir (no setting = nothing is attached), symlinks resolved first, never
 hidden paths (.git, .env) or mail.attach_deny matches, at most MAX_MB together. Uses the gmail.compose token of
 scripts/gmail_send.py (made by 'scripts/gmail_auth.py <config> --send')."""
-import base64, email.utils, fnmatch, hashlib, json, mimetypes, os, sys, time, tomllib, urllib.request
+import base64, email.utils, fnmatch, hashlib, json, mimetypes, os, re, sys, time, tomllib, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gmail_send as gs  # noqa: E402  same config, token and draft-id rules
@@ -62,6 +58,14 @@ def put(tok, did, body):
                                  headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.load(r)
+
+
+def pages(data):
+    """', N pages' for a PDF (its /Type /Page objects), else ''."""
+    if not data.startswith(b"%PDF"):
+        return ""
+    n = len(re.findall(rb"/Type\s*/Page(?!s)", data))
+    return f", {n} page{'s' if n != 1 else ''}" if n else ""
 
 
 def recipients(msg):
@@ -111,27 +115,23 @@ def main(argv):
     files = data
     key = fingerprint(did, msg, files)
     if cmd == "show":
-        gs.save(pending_path, {"kind": "attach", "draft": did, "key": key, "time": time.time()})  # only the newest show waits
-        print("\n".join(f"{h}: {msg[h]}" for h in ("To", "Cc", "Bcc", "Subject") if msg[h]))
-        print("Files to attach:")
-        for p in files:
-            print(f"  {os.path.basename(p)} ({len(files[p])} bytes) from {p}")
-        print(f"\nNothing is uploaded yet. Show the owner exactly these recipients and files and ask, naming them. "
-              f"Attach only after the owner's next message is a clear OK: gmail_draft.py attach {did} <same files>")
+        head = "\n".join(f"{h}: {msg[h]}" for h in ("To", "Cc", "Bcc", "Subject") if msg[h])
+        lines = [f"  {os.path.basename(p)} ({len(b)} bytes{pages(b)})" for p, b in files.items()]
+        gs.request(pending_path, {"kind": "attach", "draft": did, "key": key, "subject": str(msg["Subject"] or ""),
+                                  "files": list(files),
+                                  "summary": f"Files to put on this draft (nothing is uploaded yet):\n{head}\n" + "\n".join(lines)})
+        print(head + "\nFiles to attach:\n" + "\n".join(f"{q} from {p}" for q, p in zip(lines, files)))
+        print(f"\nNothing is uploaded. After your reply the relay sends the owner these recipients, the files "
+              f"themselves and a '{gs.SEND} / {gs.NO}' poll. Do not ask in text. A typed 'ok' never attaches. Only "
+              f"when the vote comes back as '{gs.SEND}', run: gmail_draft.py attach {did} <same files>")
         return
-    p = gs.load(pending_path, {})
-    ok = gs.load(os.path.join(state, "owner-last.json"), {})
-    why = ("these files were not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "attach" else
-           "the recipients or files changed after the show: run show again and ask again" if p.get("key") != key else
-           "the owner wrote nothing after the show" if ok.get("time", 0) <= p.get("time", 0) else
-           "the OK came too late after the show: run show again" if time.time() - p["time"] > gs.OK_HOURS * 3600 else
-           "the owner's message has a time in the future (clock changed?): run show again" if ok["time"] > time.time() + 60 else
-           "the owner's last message is not a clear OK" if not gs.is_ok(ok.get("text")) else
-           "that OK was for a thread or a poll, not a message in the owner chat" if ok.get("where") != "" else
-           "that OK already attached files once: one OK = one attach" if p.get("used") == ok["time"] else "")
-    if why:
-        sys.exit(f"NOT ATTACHED: {why}.")
-    gs.save(pending_path, dict(p, used=ok["time"]))  # before the upload: one OK can never upload twice
+    with gs.slot_lock(pending_path):
+        p = gs.load(pending_path, {})
+        why = ("these files were not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "attach" else
+               "the recipients or files changed after the show: run show again" if p.get("key") != key else gs.vote_ok(p))
+        if why:
+            sys.exit(f"NOT ATTACHED: {why}.")
+        gs.save(pending_path, dict(p, used=True))  # before the upload: one vote can never upload twice
     for f_ in files:
         name = os.path.basename(f_)
         kind = (mimetypes.guess_type(name)[0] or "application/octet-stream").split("/")
@@ -141,7 +141,7 @@ def main(argv):
     if d.get("threadId"):
         body["message"]["threadId"] = d["threadId"]
     line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "draft": did, "to": recipients(msg),
-            "files": list(files), "ok": ok.get("text", "")}
+            "files": list(files), "poll": p["poll"]}
     os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
     try:
         new_id = put(tok, did, body).get("id", did)

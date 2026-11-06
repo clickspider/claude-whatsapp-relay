@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Send ONE existing Gmail draft, only after the owner's OK on exactly that draft (rule 5 Nov 2026).
+"""Send ONE existing Gmail draft, only after the owner's vote on a poll for exactly that draft (rule 5 Nov 2026;
+a poll since 6 Nov 2026 14:27: a typed "ok" never sends).
 
 Usage: python3 -I scripts/gmail_send.py show <draft-id>
        python3 -I scripts/gmail_send.py send <draft-id>
 The config is RELAY_CONFIG, set by the relay for the claude it starts; never an argument (review #139 F1, N6).
 
-show: prints To, Cc, Bcc, Subject, attachments and the text, and remembers this exact version (a hash of the
-      whole mail). Only the newest shown draft waits for an OK. Show the owner what it prints, then ask.
-send: sends it (Gmail drafts.send) only when all of this holds, else nothing goes out:
-      1. the owner wrote after the show (the show at most OK_HOURS ago, no OK time in the future), in the owner
-         chat (not a thread, poll, reaction or media), and that message is a short clear OK
-         ('שלח', 'ok send', 'כן') with no 'no', 'wait', 'but' or change in it;
-      2. the draft is still exactly the version that was shown (any edit = show it again);
-      3. that OK did not already send another mail: one OK = one mail.
-      Every send gets one line in <state_dir>/mail-send/sent.log (time, draft id, to, cc, subject).
-The relay writes the owner's last message to <state_dir>/owner-last.json. Access: a separate gmail.compose
-refresh token in the Keychain (mail.send_keychain_service, made by 'scripts/gmail_auth.py <config> --send');
-the mail watch keeps its read-only token. This script never deletes, archives, labels or marks mail."""
-import base64, email, email.policy, hashlib, json, os, re, subprocess, sys, time, tomllib
+show: prints To, Cc, Bcc, Subject, attachments and the text, and puts exactly this version (a hash of the whole
+      mail) in the one waiting slot, <state_dir>/mail-send/pending.json, status "requested". After the turn the
+      relay (mail_gate_ask) sends the owner that text and a "Send / Don't send" poll it makes itself, and writes
+      the poll id. The owner's vote on THAT poll is written by the relay (mail_gate_vote), never by Claude.
+send: sends it (Gmail drafts.send) only when the slot is this draft, the draft is still exactly the shown
+      version, the vote on the slot's own poll is "Send", the show is at most OK_HOURS old, and that vote did
+      not already do its action (one vote = one action). A newer show of either gate replaces the slot, so an
+      old vote never counts. Every send gets one line in <state_dir>/mail-send/sent.log.
+Access: a separate gmail.compose refresh token in the Keychain (mail.send_keychain_service, made by
+'scripts/gmail_auth.py <config> --send'); the mail watch keeps its read-only token. This script never deletes,
+archives, labels or marks mail."""
+import base64, contextlib, email, email.policy, fcntl, hashlib, json, os, re, subprocess, sys, time, tomllib
 import urllib.parse, urllib.request
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me/"
@@ -25,12 +25,6 @@ TOKEN = "https://oauth2.googleapis.com/token"
 CONF = os.environ.get("RELAY_CONFIG", "")  # set by the relay for the claude it starts; never from argv (#139 F1, N6)
 ID_RE = re.compile(r"^r-?\d{6,25}$")  # Gmail draft ids: 'r123...' or 'r-123...'
 OK_HOURS = 2
-MAX_OK_WORDS = 8
-OK_WORDS = {"ok", "okay", "oki", "okey", "yes", "yep", "yup", "send", "go", "sure", "כן", "שלח", "תשלח", "לשלוח",
-            "שלחו", "אשר", "מאשר", "מאושר", "אוקיי", "אוקי", "סבבה", "יאללה", "בסדר"}
-NO_WORDS = {"no", "nope", "not", "don", "dont", "don't", "cancel", "wait", "stop", "hold", "later", "but", "change",
-            "fix", "edit", "before",
-            "אל", "לא", "עוד", "חכה", "תחכה", "רגע", "אבל", "תשנה", "שנה", "תתקן", "תקן", "לפני", "אחכ", "בלי", "בטל"}
 
 
 def conf_paths(conf):
@@ -82,12 +76,6 @@ def describe(msg):
     return "\n".join(lines) + "\n\n" + text.strip()
 
 
-def is_ok(text):
-    """A short, clear OK with no 'no', 'wait', 'but' or change request in it."""
-    words = re.findall(r"[\w']+", (text or "").lower())
-    return 0 < len(words) <= MAX_OK_WORDS and bool(OK_WORDS & set(words)) and not NO_WORDS & set(words)
-
-
 def load(path, default):
     try:
         with open(path) as f:
@@ -107,11 +95,44 @@ def save(path, data):
     os.replace(tmp, path)
 
 
+SEND, NO = "Send", "Don't send"  # the approval poll's options (Daniel 6 Nov 2026 14:27)
+
+
+def vote_ok(p):
+    """'' when the owner's vote on the relay's poll approves exactly this pending show, else why not.
+    Only the relay writes "poll", "asked" and "vote" (relay.py mail_gate_ask / mail_gate_vote)."""
+    v = p.get("vote") or {}
+    return ("the owner was not asked yet: the relay sends the mail and the poll after your reply" if not p.get("poll") else
+            "the owner has not voted on the poll yet" if not v else
+            "the vote is for another poll: run show again" if v.get("poll") != p["poll"] else
+            "the owner voted not to" if v.get("choice") != SEND else
+            "the vote has a time in the future (clock changed?): run show again" if v.get("time", 0) > time.time() + 60 else
+            "the show is too old: run show again" if time.time() - p.get("time", 0) > OK_HOURS * 3600 else
+            "that vote already did its action: one vote = one action" if p.get("used") else "")
+
+
+@contextlib.contextmanager
+def slot_lock(path):
+    """The slot's read-change-write, one at a time with the relay (same <slot>.lock, flock): a vote written
+    by the relay can never bring back an older show, and a show never wipes a vote it did not see."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)) as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def request(path, entry):
+    """The newest show of either gate (one slot, kind send|attach). status "requested": the relay sends the
+    summary, the files and a Send / Don't send poll to the owner after the turn."""
+    with slot_lock(path):
+        save(path, dict(entry, time=time.time(), status="requested"))
+
+
 def main(argv):
     if len(argv) < 2 or argv[0] not in ("show", "send") or not ID_RE.match(argv[1]):
         sys.exit(__doc__)
     cmd, did = argv[0], argv[1]
-    if len(argv) > 2:  # review #139 F1: a config from argv = a state folder (owner-last.json) the caller wrote
+    if len(argv) > 2:  # review #139 F1: a config from argv = a state folder the caller wrote
         sys.exit("NOT SENT: the config comes from the relay (RELAY_CONFIG); no config argument.")
     if not CONF:
         sys.exit("NOT SENT: RELAY_CONFIG is not set (run this from the relay).")
@@ -120,26 +141,23 @@ def main(argv):
     tok = access(m, here)
     h, msg = draft(tok, did)
     if cmd == "show":
-        save(pending_path, {"kind": "send", "draft": did, "hash": h, "time": time.time()})  # only the newest shown draft waits
-        print(describe(msg))
-        print(f"\nShow the owner exactly this and ask, naming the subject in the question. Send only after the "
-              f"owner's next message is a clear OK for it: gmail_send.py send {did}")
+        text = describe(msg)
+        request(pending_path, {"kind": "send", "draft": did, "hash": h, "subject": str(msg["Subject"] or ""),
+                               "summary": "Mail to send:\n" + text})
+        print(text)
+        print(f"\nNothing is sent. After your reply the relay sends the owner this mail and a '{SEND} / {NO}' poll. "
+              f"Do not ask in text and do not repeat the mail. A typed 'ok' never sends. Only when the vote comes back "
+              f"as '{SEND}', run: gmail_send.py send {did}")
         return
-    p = load(pending_path, {})
-    ok = load(os.path.join(state, "owner-last.json"), {})
-    why = ("this draft was not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "send" else
-           "the draft changed after it was shown: run show again and ask again" if p.get("hash") != h else
-           "the owner wrote nothing after the show" if ok.get("time", 0) <= p.get("time", 0) else
-           "the OK came too late after the show: run show again" if time.time() - p["time"] > OK_HOURS * 3600 else
-           "the owner's message has a time in the future (clock changed?): run show again" if ok["time"] > time.time() + 60 else
-           "the owner's last message is not a clear OK" if not is_ok(ok.get("text")) else
-           "that OK was for a thread or a poll, not a message in the owner chat" if ok.get("where") != "" else
-           "that OK already sent a mail: one OK = one mail" if p.get("used") == ok["time"] else "")
-    if why:
-        sys.exit(f"NOT SENT: {why}.")
-    save(pending_path, dict(p, used=ok["time"]))  # before the send: a crash can never send twice on one OK
+    with slot_lock(pending_path):
+        p = load(pending_path, {})
+        why = ("this draft was not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "send" else
+               "the draft changed after it was shown: run show again" if p.get("hash") != h else vote_ok(p))
+        if why:
+            sys.exit(f"NOT SENT: {why}.")
+        save(pending_path, dict(p, used=True))  # before the send: a crash can never send twice on one vote
     line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "draft": did, "to": str(msg["To"] or ""),
-            "cc": str(msg["Cc"] or ""), "subject": str(msg["Subject"] or ""), "ok": ok.get("text", "")}
+            "cc": str(msg["Cc"] or ""), "subject": str(msg["Subject"] or ""), "poll": p["poll"]}
     os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
     # The hash was checked a moment ago; drafts.send sends the draft as it is now. An edit in another Gmail
     # client inside that gap goes out: the API has no "send only this version" (Instinct review, known limit).

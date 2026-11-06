@@ -57,16 +57,22 @@ class Attach(unittest.TestCase):
                 return str(e)
         return out.getvalue()
 
-    def owner_says(self, text, later=1, where=""):
-        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:
-            json.dump({"time": time.time() + later, "text": text, "where": where}, f)
+    def approve(self, choice=gs.SEND, poll="P1", later=1, asked=True):
+        """What the relay writes: its poll went out (mail_gate_ask), then the owner's tap (mail_gate_vote)."""
+        path = os.path.join(self.tmp, "mail-send", "pending.json")
+        p = gs.load(path, {})
+        if asked:
+            p.update(status="asked", poll=poll, asked=time.time())
+        if choice:
+            p["vote"] = {"poll": poll, "choice": choice, "time": time.time() + later}
+        gs.save(path, p)
 
     def run_cmd(self, *files):
-        """The happy path: show, the owner's clear OK, attach. A refusal at show stops there."""
+        """The happy path: show, the owner's Send vote on the relay's poll, attach. A refusal at show stops there."""
         out = self.cmd("show", *files)
         if "Files to attach" not in out:
             return out
-        self.owner_says("ok")
+        self.approve()
         return self.cmd("attach", *files)
 
     def test_attach_keeps_the_mail_and_adds_the_file(self):
@@ -152,26 +158,38 @@ class Attach(unittest.TestCase):
         self.assertEqual(msg.get_content_type(), "multipart/mixed")
         self.assertIn("<div>Hi</div>", msg.get_body(preferencelist=("html",)).get_content())
 
-    # The gate (Daniel + Instinct, 6 Nov 2026 12:25): the OK covers these recipients and these files, BEFORE upload.
+    # The gate (Daniel + Instinct 12:25, poll 14:27, 6 Nov 2026): the vote covers these recipients and files, BEFORE upload.
     def test_show_lists_recipients_and_files_and_uploads_nothing(self):
         out = self.cmd("show", self.pdf)
-        for want in ("To: a@example.nl, b@example.nl", "letter.pdf", "Nothing is uploaded yet"):
+        for want in ("To: a@example.nl, b@example.nl", "letter.pdf", "Nothing is uploaded", "A typed 'ok' never"):
             self.assertIn(want, out)
+        slot = gs.load(os.path.join(self.tmp, "mail-send", "pending.json"), {})
+        self.assertEqual((slot["kind"], slot["status"], slot["files"]), ("attach", "requested", [os.path.realpath(self.pdf)]))
+        self.assertIn("letter.pdf (13 bytes)", slot["summary"])  # what the relay shows the owner
+        self.assertIn("To: a@example.nl, b@example.nl", slot["summary"])
         self.assertEqual(self.puts, [])
 
-    def test_no_ok_means_no_upload(self):
+    def test_a_pdf_shows_its_pages(self):
+        self.assertEqual(gd.pages(b"%PDF-1.7 1 0 obj <</Type /Pages>> 2 0 obj <</Type /Page>> 3 0 obj <</Type/Page>>"),
+                         ", 2 pages")
+        self.assertEqual(gd.pages(b"not a pdf /Type /Page"), "")
+
+    def test_no_vote_means_no_upload(self):
         self.assertIn("not shown", self.cmd("attach", self.pdf))  # never shown
-        self.owner_says("ok", later=-60)  # an OK from before the show does not count
         self.cmd("show", self.pdf)
-        self.assertIn("wrote nothing after the show", self.cmd("attach", self.pdf))
-        for text in ("לא", "ok but other file", "wait", "which file?"):
-            self.owner_says(text)
-            self.assertIn("NOT ATTACHED", self.cmd("attach", self.pdf), text)
-        self.owner_says("ok", later=gd.gs.OK_HOURS * 3600 + 60)
+        self.assertIn("not asked yet", self.cmd("attach", self.pdf))
+        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:  # a typed "ok" counts for nothing
+            json.dump({"time": time.time() + 1, "text": "ok", "where": ""}, f)
+        self.approve(choice=None)
+        self.assertIn("has not voted", self.cmd("attach", self.pdf))
+        self.approve(choice=gs.NO)
+        self.assertIn("voted not to", self.cmd("attach", self.pdf))
+        self.approve(later=3600)
         self.assertIn("in the future", self.cmd("attach", self.pdf))  # a time ahead of the clock never counts
+        self.approve()
         later = time.time() + gd.gs.OK_HOURS * 3600 + 120
-        with mock.patch.object(gd.time, "time", return_value=later):
-            self.assertIn("too late", self.cmd("attach", self.pdf))  # the window ends 2 h after the show
+        with mock.patch.object(gd.time, "time", return_value=later), mock.patch.object(gs.time, "time", return_value=later):
+            self.assertIn("too old", self.cmd("attach", self.pdf))  # the window ends 2 h after the show
         self.assertEqual(self.puts, [])
 
     def test_any_change_after_the_show_needs_a_new_show(self):
@@ -179,14 +197,14 @@ class Attach(unittest.TestCase):
         with open(other, "wb") as f:
             f.write(b"%PDF other")
         self.cmd("show", self.pdf)
-        self.owner_says("ok")
+        self.approve()
         self.assertIn("changed after the show", self.cmd("attach", other))  # another file
         self.assertIn("changed after the show", self.cmd("attach", self.pdf, other))  # one more file
         with open(self.pdf, "ab") as f:
             f.write(b" edited")
         self.assertIn("changed after the show", self.cmd("attach", self.pdf))  # same name, new content
         self.cmd("show", self.pdf)
-        self.owner_says("ok")
+        self.approve()
         self.raw = self.raw.replace(b"b@example.nl", b"stranger@example.com")
         self.assertIn("changed after the show", self.cmd("attach", self.pdf))  # another recipient
         self.assertEqual(self.puts, [])
@@ -195,28 +213,27 @@ class Attach(unittest.TestCase):
         self.raw = MAIL.replace("To: a@example.nl, b@example.nl\r\n", "").encode()
         self.assertIn("no recipient", self.cmd("show", self.pdf))
 
-    def test_one_ok_uploads_once_and_never_unlocks_a_send(self):
+    def test_one_vote_uploads_once_and_never_unlocks_a_send(self):
         self.drop_on_save = True
         self.assertIn("CHECK FAILED", self.run_cmd(self.pdf))
-        self.assertIn("one OK = one attach", self.cmd("attach", self.pdf))
+        self.assertIn("one vote = one action", self.cmd("attach", self.pdf))
         self.assertEqual(len(self.puts), 1)
         with open(os.path.join(self.tmp, "mail-attach", "attach.log")) as f:
             line = json.loads(f.readline())
-        self.assertEqual((line["draft"], line["to"], line["ok"]), (DRAFT, ["a@example.nl", "b@example.nl"], "ok"))
-        self.owner_says("ok", later=-1)  # real order: his OK came before this moment (the test above used +1 s)
-        with redirect_stdout(io.StringIO()):  # the send gate: show after the attach, the old OK does not count
+        self.assertEqual((line["draft"], line["to"], line["poll"]), (DRAFT, ["a@example.nl", "b@example.nl"], "P1"))
+        with redirect_stdout(io.StringIO()):  # the send gate: its show replaces the slot, the attach vote is gone
             with mock.patch.object(gs, "CONF", self.conf):
                 gs.main(["show", DRAFT])
                 with self.assertRaises(SystemExit) as e:
                     gs.main(["send", DRAFT])
-        self.assertIn("NOT SENT: the owner wrote nothing after the show", str(e.exception))
+        self.assertIn("NOT SENT: the owner was not asked yet", str(e.exception))
 
-    def test_one_ok_covers_only_the_newest_show_of_either_gate(self):
-        # review #139 F3 repro E: attach show, then a send show, then "שלח": the send word never uploads a file
+    def test_one_vote_covers_only_the_newest_show_of_either_gate(self):
+        # review #139 F3 repro E: attach show, then a send show, then a Send vote: it never uploads a file
         self.cmd("show", self.pdf)
         with redirect_stdout(io.StringIO()), mock.patch.object(gs, "CONF", self.conf):
             gs.main(["show", DRAFT])
-        self.owner_says("שלח")
+        self.approve()
         self.assertIn("not shown to the owner first", self.cmd("attach", self.pdf))
         self.assertEqual(self.puts, [])
 
@@ -232,11 +249,11 @@ class Attach(unittest.TestCase):
         self.assertIn("RELAY_CONFIG is not set", str(e.exception))
         self.assertEqual(self.puts, [])
 
-    def test_a_thread_or_poll_ok_never_attaches(self):
+    def test_a_vote_on_another_poll_never_attaches(self):
         self.cmd("show", self.pdf)
-        for where in ("#134", "poll", None):
-            self.owner_says("ok", where=where)
-            self.assertIn("for a thread or a poll", self.cmd("attach", self.pdf), where)
+        self.approve(poll="P2")
+        self.approve(poll="P1", asked=False)  # the tap belongs to an older poll than the slot's
+        self.assertIn("another poll", self.cmd("attach", self.pdf))
         self.assertEqual(self.puts, [])
 
     def test_a_name_without_address_is_no_recipient(self):
@@ -258,7 +275,7 @@ class Attach(unittest.TestCase):
         self.cmd("show", self.pdf)
         with open(self.pdf, "wb") as f:
             f.write(b"%PDF-1.7 fake")
-        self.owner_says("ok")
+        self.approve()
         with mock.patch("builtins.open", change_after_read):
             self.assertIn("ATTACHED", self.cmd("attach", self.pdf))
         msg = email.message_from_bytes(self.raw, policy=email.policy.default)
@@ -267,7 +284,7 @@ class Attach(unittest.TestCase):
 
     def test_a_failed_read_back_is_logged_as_unknown(self):
         self.cmd("show", self.pdf)
-        self.owner_says("ok")
+        self.approve()
         with mock.patch.object(gs, "draft", side_effect=TimeoutError("timed out")):
             out = self.cmd("attach", self.pdf)
         self.assertIn("OUTCOME UNKNOWN", out)
@@ -276,12 +293,12 @@ class Attach(unittest.TestCase):
 
     def test_a_failed_upload_is_outcome_unknown(self):
         self.cmd("show", self.pdf)
-        self.owner_says("ok")
+        self.approve()
         with mock.patch.object(gd, "put", side_effect=TimeoutError("timed out")):
             out = self.cmd("attach", self.pdf)
         self.assertIn("OUTCOME UNKNOWN", out)
         self.assertNotIn("ATTACHED to", out)
-        self.assertIn("one OK = one attach", self.cmd("attach", self.pdf))
+        self.assertIn("one vote = one action", self.cmd("attach", self.pdf))
 
     def test_a_save_that_lost_the_file_is_reported(self):
         self.drop_on_save = True

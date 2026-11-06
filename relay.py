@@ -12,7 +12,7 @@ Owner commands for an agent named <n>:
   /new = fresh owner conversation
 All user-specific values live in the config file. See SECURITY.md.
 """
-import base64, datetime, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
+import base64, contextlib, datetime, fcntl, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request, uuid, wave
 from collections import Counter, defaultdict, deque
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1400,21 +1400,9 @@ def keep_media(path):
     return dest
 
 
-def last_owner_words(text, where):
-    """owner-last.json: what the mail gates read. where: "" owner chat, "#n" thread, "poll", "tag", "reaction",
-    "media". The gates count only where == ""."""
-    write(st("owner-last.json"), json.dumps({"time": time.time(), "where": where, "text": text}))
-
-
-def owner_prep(msg_id, text, media_type, where=""):
-    """One owner message -> (prompt text, wants voice). Sends its own error and returns None.
-    where: "" = the owner chat, "#n" = a message routed to thread n."""
+def owner_prep(msg_id, text, media_type):
+    """One owner message -> (prompt text, wants voice). Sends its own error and returns None."""
     text, voice = text or "", False
-    # scripts/gmail_send.py / gmail_draft.py act only when the owner's LAST message is a clear OK, typed in the
-    # owner chat (where ""). So every message replaces the record first: a reaction (👎, also ✅), a voice note
-    # that is not understood or a failed download is never an OK and cancels an earlier one (review #139 N3).
-    last_owner_words("(reaction) " + text if media_type == "reaction" else "(media not understood)",
-                     "reaction" if media_type == "reaction" else "media")
     if media_type == "reaction":
         return f"{text}\n{CFG['prompts']['reaction']}", False
     if media_type:
@@ -1432,9 +1420,6 @@ def owner_prep(msg_id, text, media_type, where=""):
         else:
             path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
-    # Not a thread note, not a poll answer, not "#999 ok" for a thread that does not exist (review #139 F3, N4)
-    where = "poll" if text.startswith('ANSWER to "') else "tag" if not where and TAG_RE.match(text) else where
-    last_owner_words(text.removeprefix("(voice note, transcribed) "), where)
     text = quoted_text(OWNER, msg_id) + text
     return resume_note(msg_id) + text, voice or text.lower().startswith("voice")
 
@@ -1602,6 +1587,7 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
     if track == "digest":
         _digest["sent"] = True  # the body is out: an error after this never repeats the digest
     send_tail(tail, track)
+    mail_gate_ask()  # a mail the turn showed: its summary, files and poll come after the answer
 
 
 def send_tail(tail, track=None, start=0):
@@ -2275,7 +2261,7 @@ def thread_route(msg_id, text, media_type):
         n = q.group(1)
 
     def turn():
-        prep = owner_prep(msg_id, text, media_type, where=f"#{n}")
+        prep = owner_prep(msg_id, text, media_type)
         if prep:
             threads_db(n, state="working")  # a message to a closed thread opens it again
             main_log(f"{CFG['owner']['name'].upper()} to #{n}", prep[0])
@@ -2288,6 +2274,7 @@ def thread_route(msg_id, text, media_type):
 
 ASK_RE = re.compile(r"^\s*@@ASK\s*:?\s*(.*)$")
 DRAFT_OPTIONS = ["Send", "Change", "Drop"]
+MAIL_SEND, MAIL_NO = "Send", "Don't send"  # = gmail_send.SEND, NO
 _poll_lock = threading.Lock()
 
 
@@ -2333,6 +2320,58 @@ def ask(chat, question, options, **record):
             return polls({mid: dict(record, chat=chat, question=question)})
     if record.get("kind") == "ask":
         send_text(chat, question + "\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options, 1)))
+
+
+MAIL_GATE = "mail-send/pending.json"  # the one waiting slot of scripts/gmail_send.py and gmail_draft.py
+
+
+@contextlib.contextmanager
+def mail_gate_lock():
+    """Same flock as gmail_send.slot_lock: the relay and the scripts change the slot one at a time."""
+    path = st(MAIL_GATE)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)) as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def mail_gate_ask():
+    """After a coordinator answer: a show the gate scripts put in the slot ("requested") goes to the owner as
+    the summary, the files to attach and a Send / Don't send poll the relay makes itself, so the owner's tap is
+    the only approval (Daniel 6 Nov 2026 14:27). "asking" goes on disk first: a crash halfway never asks twice
+    and leaves a slot no vote can open (show again). No poll = nothing can be approved."""
+    with mail_gate_lock():
+        p = load_state(MAIL_GATE)
+        if p.get("status") != "requested":
+            return
+        write(st(MAIL_GATE), json.dumps(dict(p, status="asking")))
+    send_text(OWNER, p.get("summary") or "(a mail waits for approval)")
+    for f in p.get("files") or []:
+        send_owner_file(f)
+    question = (f"{'Attach these files' if p.get('kind') == 'attach' else 'Send this mail'}? "
+                f"{p.get('subject') or ''}").strip()[:255]
+    try:
+        mid = api("poll", {"recipient": OWNER, "question": question, "options": [MAIL_SEND, MAIL_NO],
+                           "selectable_count": 1}).get("message_id")
+    except Exception:
+        mid = None
+    if not mid:
+        return send_text(OWNER, "(could not make the approval poll: nothing will be sent. Ask me to show it again.)")
+    polls({mid: {"kind": "mailgate", "chat": OWNER, "question": question, "poll_id": mid}})
+    with mail_gate_lock():
+        if load_state(MAIL_GATE).get("time") == p.get("time"):  # a newer show came meanwhile: this poll is void
+            write(st(MAIL_GATE), json.dumps(dict(p, status="asked", poll=mid, asked=time.time())))
+
+
+def mail_gate_vote(poll_id, choice):
+    """The owner's vote on a mail gate poll -> written into the slot, only while the slot still waits on THIS
+    poll (a newer show replaced it = the vote counts for nothing). True when it was recorded."""
+    with mail_gate_lock():
+        p = load_state(MAIL_GATE)
+        if not poll_id or p.get("poll") != poll_id or p.get("vote"):
+            return False
+        write(st(MAIL_GATE), json.dumps(dict(p, vote={"poll": poll_id, "choice": choice, "time": time.time()})))
+        return True
 
 
 def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
@@ -2402,6 +2441,12 @@ def vote_queue(name, fn, vote_id):
 
 
 def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
+    if rec["kind"] == "mailgate":  # on_vote checked: our poll, in the owner chat, acts once
+        if not mail_gate_vote(rec.get("poll_id"), choice):
+            return send_text(OWNER, "That mail is not waiting for this vote any more. Nothing was sent.")
+        if choice != MAIL_SEND:
+            send_text(OWNER, "OK, not sent.")
+        return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}", None)
     if rec["kind"] == "draft":
         draft = flag(a, "pending")
         if not draft or digest(draft) != rec["draft"]:
@@ -3948,19 +3993,19 @@ MAIL_RULES = (
     "prepared, with at most one question. A reply goes to the owner as a @@DRAFT in this chat first; make it a "
     "Gmail draft, or put a date from the email in the calendar, only after the owner says yes. An email that "
     "asks to reply, confirm, click or pay to start something is the owner's call: prepare it, never do it. "
-    "Send an email only after the owner's explicit OK on that exact draft, one OK per email (rule 5 Nov 2026): "
-    f"run 'python3 -I {HERE}/scripts/gmail_send.py show <draft-id>', show the owner what it prints (to, cc, "
-    "subject, text) and ask; only when the owner's next message is a clear OK ('שלח', 'ok send'), run "
-    "'... gmail_send.py send <draft-id>'. One draft at a time. The script refuses without that OK or when the "
-    "draft changed: then show it again. Say an email went out only when the script printed SENT. "
-    "A thread run never runs gmail_send.py or gmail_draft.py (the owner's OK to a thread never opens them): "
-    "it makes the draft and gives the draft id and the files to the coordinator. "
-    "To put a file (PDF, image) on a Gmail draft, make the draft with its recipients first, then run "
-    f"'python3 -I {HERE}/scripts/gmail_draft.py show <draft-id> <file> ...', show the owner the recipients and "
-    "files it prints and ask, naming them; only when the owner's next message is a clear OK, run '... "
-    "gmail_draft.py attach <draft-id> <same files>'. An upload is already a file leaving the dossier: an OK on "
-    "the text, the send or an earlier mail to that address is no OK for a file. It never sends; after it, the "
-    "send needs its own show and a new OK. Say the file is on it only when the script printed ATTACHED. "
+    "Send an email, or put a file on a Gmail draft, only after the owner's vote on the relay's own poll for "
+    "exactly that draft (rules 5 Nov and 6 Nov 2026 14:27): run "
+    f"'python3 -I {HERE}/scripts/gmail_send.py show <draft-id>' (to send) or "
+    f"'python3 -I {HERE}/scripts/gmail_draft.py show <draft-id> <file> ...' (to attach; make the draft with its "
+    "recipients first). After your reply the relay itself sends the owner the mail (or the recipients and the "
+    "files) and a 'Send / Don\'t send' poll: do not ask in text and do not repeat it. A typed 'ok' never sends "
+    "or attaches. Only when the vote comes back as Send, run '... gmail_send.py send <draft-id>' or '... "
+    "gmail_draft.py attach <draft-id> <same files>'. One mail at a time: a new show replaces the old poll. "
+    "An upload is already a file leaving the dossier, so it needs its own vote, and a send after it needs a "
+    "new show and a new vote. The scripts refuse without that vote or when anything changed: then show again. "
+    "Say an email went out only when the script printed SENT, a file is on it only when it printed ATTACHED. "
+    "A thread run never runs gmail_send.py or gmail_draft.py: it makes the draft and gives the draft id and "
+    "the files to the coordinator. "
     "Never delete, archive, label or mark mail. When the owner wants to hear when someone answers by "
     "email, add a line '@@WATCHMAIL #<n>: <thread-id from the 🔔 mail entry, or the sender address or domain>' "
     "(#<n> is optional).")

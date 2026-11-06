@@ -220,7 +220,7 @@ class MailWatch(unittest.TestCase):
         that draft (#125), never a delete, label or mark."""
         r = relay.MAIL_RULES
         for part in ("get_thread", "@@TO #<n>", "@@DRAFT", "only after the owner says yes",
-                     "is the owner's call", "only after the owner's explicit OK on that exact draft",
+                     "is the owner's call", "only after the owner's vote on the relay's own poll for exactly that draft",
                      "Never delete, archive, label or mark mail", "@@WATCHMAIL"):
             self.assertIn(part, r)
 

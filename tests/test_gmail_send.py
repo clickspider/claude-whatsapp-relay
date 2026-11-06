@@ -1,4 +1,5 @@
-"""Send a Gmail draft only after the owner's OK on that exact draft (5 Nov 2026, #125). Against a fake Gmail:
+"""Send a Gmail draft only after the owner's vote on the relay's poll for that exact draft (5 Nov 2026, #125;
+poll 6 Nov 2026 14:27, #139). Against a fake Gmail:
 no real mail is ever sent here. Run: python3 -m unittest discover tests"""
 import base64, io, json, os, sys, tempfile, time, unittest
 from contextlib import redirect_stdout
@@ -12,7 +13,6 @@ import test_threads  # noqa: E402
 import gmail_send as gs  # noqa: E402
 
 DRAFT = "r9222184318451542730"
-OK_FUTURE = 3600  # an OK stamped an hour ahead of the clock
 
 
 def raw(body):
@@ -48,75 +48,97 @@ class SendGate(unittest.TestCase):
                 return str(e)
         return out.getvalue()
 
-    def owner_says(self, text, later=1, where=""):
-        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:
-            json.dump({"time": time.time() + later, "text": text, "where": where}, f)
+    def slot(self):
+        return gs.load(os.path.join(self.tmp, "mail-send", "pending.json"), {})
 
-    def test_no_ok_means_no_send(self):
+    def relay_asks(self, poll="P1"):
+        """What relay.mail_gate_ask writes once its poll went out."""
+        gs.save(os.path.join(self.tmp, "mail-send", "pending.json"),
+                dict(self.slot(), status="asked", poll=poll, asked=time.time()))
+
+    def owner_votes(self, choice, poll="P1", later=1):
+        """What relay.mail_gate_vote writes for the owner's tap."""
+        gs.save(os.path.join(self.tmp, "mail-send", "pending.json"),
+                dict(self.slot(), vote={"poll": poll, "choice": choice, "time": time.time() + later}))
+
+    def test_no_vote_means_no_send(self):
         self.assertIn("not shown", self.run_cmd("send"))  # never shown
-        self.owner_says("שלח", later=-60)  # an OK from before the show does not count
-        self.assertIn("Subject: Re: question", self.run_cmd("show"))
-        self.assertIn("NOT SENT: the owner wrote nothing after the show", self.run_cmd("send"))
-        for text in ("אל תשלח", "ok but change the date", "wait", "don’t send", "what about the date?"):
-            self.owner_says(text)
-            self.assertIn("NOT SENT", self.run_cmd("send"), text)
+        out = self.run_cmd("show")
+        self.assertIn("Subject: Re: question", out)
+        self.assertIn("A typed 'ok' never sends", out)
+        self.assertEqual((self.slot()["status"], self.slot()["kind"]), ("requested", "send"))
+        self.assertIn("Re: question", self.slot()["summary"])  # what the relay shows the owner
+        self.assertIn("NOT SENT: the owner was not asked yet", self.run_cmd("send"))
+        self.relay_asks()
+        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:  # a typed "ok" counts for nothing
+            json.dump({"time": time.time() + 1, "text": "ok שלח", "where": ""}, f)
+        self.assertIn("has not voted", self.run_cmd("send"))
+        self.owner_votes(gs.NO)
+        self.assertIn("voted not to", self.run_cmd("send"))
         self.assertEqual(self.sent, [])
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "mail-send", "sent.log")))
 
-    def test_ok_sends_once_and_logs(self):
+    def test_a_send_vote_sends_once_and_logs(self):
         self.run_cmd("show")
-        self.owner_says("ok שלח")
+        self.relay_asks()
+        self.owner_votes(gs.SEND)
         self.assertIn("SENT: draft", self.run_cmd("send"))
-        self.assertIn("one OK = one mail", self.run_cmd("send"))
+        self.assertIn("one vote = one action", self.run_cmd("send"))
         self.assertEqual(self.sent, [DRAFT])
         with open(os.path.join(self.tmp, "mail-send", "sent.log")) as f:
             line = json.loads(f.readline())
-        self.assertEqual((line["draft"], line["to"], line["subject"]), (DRAFT, "vendor@example.nl", "Re: question"))
+        self.assertEqual((line["draft"], line["to"], line["subject"], line["poll"]),
+                         (DRAFT, "vendor@example.nl", "Re: question", "P1"))
+
+    def test_only_the_vote_on_the_slots_own_poll_counts(self):
+        self.run_cmd("show")
+        self.relay_asks("P2")
+        self.owner_votes(gs.SEND, poll="P1")  # a vote on an older poll
+        self.assertIn("another poll", self.run_cmd("send"))
+        self.owner_votes(gs.SEND, poll="P2")
+        self.run_cmd("show")  # a new show replaces the slot: the vote it had is gone
+        self.assertIn("not asked yet", self.run_cmd("send"))
+        self.assertEqual(self.sent, [])
 
     def test_a_failed_send_is_outcome_unknown_never_sent(self):
         self.run_cmd("show")
-        self.owner_says("שלח")
+        self.relay_asks()
+        self.owner_votes(gs.SEND)
         with mock.patch.object(gs, "api", side_effect=[{"message": {"raw": raw(self.body)}}, TimeoutError("timed out")]):
             out = self.run_cmd("send")
         self.assertIn("OUTCOME UNKNOWN", out)
         self.assertNotIn("SENT:", out)
         with open(os.path.join(self.tmp, "mail-send", "sent.log")) as f:
             self.assertIn("UNKNOWN", json.loads(f.readline())["outcome"])
-        self.assertIn("one OK = one mail", self.run_cmd("send"))  # and never sent again on the same OK
+        self.assertIn("one vote = one action", self.run_cmd("send"))  # and never sent again on the same vote
 
-    def test_only_a_plain_owner_chat_ok_counts(self):
-        # review #139 F1 + F3: no config from argv; a thread OK, a poll answer or an old record never opens it
+    def test_the_config_comes_only_from_the_relay(self):
+        # review #139 F1, N6: no config from argv; not started by the relay = nothing
         with redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as e:
                 gs.main(["send", DRAFT, self.conf])
         self.assertIn("no config argument", str(e.exception))
-        self.run_cmd("show")
-        for where in ("#134", "poll", "tag", "reaction", "media", None):
-            self.owner_says("ok", where=where)
-            self.assertIn("for a thread or a poll", self.run_cmd("send"), where)
-        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:  # an old record with no "where" key
-            json.dump({"time": time.time() + 1, "text": "ok"}, f)
-        self.assertIn("for a thread or a poll", self.run_cmd("send"))
-        with mock.patch.object(gs, "CONF", ""), redirect_stdout(io.StringIO()):  # not started by the relay
+        with mock.patch.object(gs, "CONF", ""), redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as e:
                 gs.main(["send", DRAFT])
         self.assertIn("RELAY_CONFIG is not set", str(e.exception))
         self.assertEqual(self.sent, [])
 
-    def test_the_window_runs_from_the_show_and_no_future_ok(self):
+    def test_the_window_runs_from_the_show_and_no_future_vote(self):
         self.run_cmd("show")
-        self.owner_says("שלח", later=OK_FUTURE)
+        self.relay_asks()
+        self.owner_votes(gs.SEND, later=3600)
         self.assertIn("in the future", self.run_cmd("send"))
-        self.owner_says("שלח", later=60)
-        later = time.time() + gs.OK_HOURS * 3600 + 120  # an OK 1 min after the show, the send 2 h later
+        self.owner_votes(gs.SEND, later=60)
+        later = time.time() + gs.OK_HOURS * 3600 + 120  # a vote 1 min after the show, the send 2 h later
         with mock.patch.object(gs.time, "time", return_value=later):
-            self.assertIn("too late", self.run_cmd("send"))
+            self.assertIn("too old", self.run_cmd("send"))
         self.assertEqual(self.sent, [])
 
     def test_an_attach_show_never_opens_a_send(self):
         gs.save(os.path.join(self.tmp, "mail-send", "pending.json"),
-                {"kind": "attach", "draft": DRAFT, "key": "k", "time": time.time()})  # the shared slot
-        self.owner_says("שלח")
+                {"kind": "attach", "draft": DRAFT, "key": "k", "time": time.time(), "poll": "P1",
+                 "vote": {"poll": "P1", "choice": gs.SEND, "time": time.time()}})  # the shared slot
         self.assertIn("not shown to the owner first", self.run_cmd("send"))
         self.assertEqual(self.sent, [])
 
@@ -139,50 +161,112 @@ class SendGate(unittest.TestCase):
 
     def test_changed_draft_needs_a_new_show(self):
         self.run_cmd("show")
+        self.relay_asks()
+        self.owner_votes(gs.SEND)
         self.body = "Hi, other text"
-        self.owner_says("שלח")
         self.assertIn("draft changed", self.run_cmd("send"))
         self.assertEqual(self.sent, [])
 
-    def test_relay_records_the_owner_words(self):
+
+class RelaySide(unittest.TestCase):
+    """relay.mail_gate_ask / mail_gate_vote / vote_job: the relay, not Claude, asks and records the tap."""
+    def setUp(self):
         test_threads.ThreadTests.setUp(self)
         self.addCleanup(test_threads.ThreadTests.tearDown, self)
-        with mock.patch.object(relay, "quoted_text", return_value='[Replying to your message: "send it"]\n'), \
-                mock.patch.object(relay, "resume_note", return_value=""):
-            relay.owner_prep("m1", "שלח", None)
-        last = json.loads(relay.read(relay.st("owner-last.json")))
-        self.assertEqual((last["text"], last["where"]), ("שלח", ""))  # his own words, in the owner chat
-        with mock.patch.object(relay, "quoted_text", return_value=""), mock.patch.object(relay, "resume_note", return_value=""):
-            relay.owner_prep("m2", "ok", None, where="#134")  # "#134 ok": thread_route strips the tag
-            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "#134")
-            relay.owner_prep("m3", 'ANSWER to "Send?": Yes', None)
-            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "poll")
-            relay.owner_prep("m4", "#999 ok", None)  # no thread 999: it stays with the coordinator (review N4)
-            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "tag")
-            relay.owner_prep("m5", "ok", None)
-            relay.owner_prep("m6", 'REACTION ✅ to your message: "ok send"', "reaction")  # a ✅ never sends (1 Nov)
-            last = json.loads(relay.read(relay.st("owner-last.json")))
-            self.assertEqual(last["where"], "reaction")
-            relay.owner_prep("m7", "ok", None)
-            with mock.patch.object(relay, "download", return_value="/x.ogg"), \
-                    mock.patch.object(relay, "transcribe", return_value=""), mock.patch.object(relay, "send_text"):
-                self.assertIsNone(relay.owner_prep("m8", "", "audio"))  # "wait, not that file", not understood
-            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "media")
-            with mock.patch.object(relay, "download", return_value="/x.ogg"), \
-                    mock.patch.object(relay, "transcribe", return_value="ok"):
-                relay.owner_prep("m9", "", "audio")  # a voice "ok" in the owner chat still counts
-            last = json.loads(relay.read(relay.st("owner-last.json")))
-            self.assertEqual((last["where"], last["text"]), ("", "ok"))
-        relay.threads_db("134", title="apply", state="waiting")  # "#134 ok" through the real thread_route
-        with mock.patch.object(relay, "enqueue_job", lambda k, fn, d: fn()), \
-                mock.patch.object(relay, "with_feedback", lambda c, m, o, fn: fn()), \
-                mock.patch.object(relay, "thread_run", lambda n, p: None), mock.patch.object(relay, "main_log"), \
-                mock.patch.object(relay, "quoted_text", return_value=""), mock.patch.object(relay, "resume_note", return_value=""):
-            self.assertTrue(relay.thread_route("m10", "#134 ok", None))
-        self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "#134")
-        self.assertIn("A thread run never runs gmail_send.py or gmail_draft.py", relay.MAIL_RULES)
-        self.assertIn("gmail_send.py show", relay.MAIL_RULES)
-        self.assertIn("only after the owner's explicit OK on that exact draft", relay.MAIL_RULES)
+        self.path = relay.st(relay.MAIL_GATE)
+        self.texts, self.files, self.polls_sent, self.added = [], [], [], []
+        def api(path, body):
+            self.assertEqual(path, "poll")
+            self.polls_sent.append(body)
+            return {"message_id": f"P{len(self.polls_sent)}"}
+        for p in (mock.patch.object(relay, "api", api),
+                  mock.patch.object(relay, "send_text", lambda chat, t, **k: self.texts.append(t)),
+                  mock.patch.object(relay, "send_owner_file", self.files.append),
+                  mock.patch.object(relay, "owner_add", lambda *a: self.added.append(a))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def show(self, **entry):
+        gs.request(self.path, dict({"kind": "attach", "draft": DRAFT, "key": "k", "subject": "Re: letter",
+                                    "files": ["/d/letter.pdf"], "summary": "To: a@example.nl\n  letter.pdf"}, **entry))
+
+    def test_the_relay_sends_summary_files_and_its_own_poll(self):
+        self.show()
+        relay.mail_gate_ask()
+        self.assertEqual(self.texts, ["To: a@example.nl\n  letter.pdf"])
+        self.assertEqual(self.files, ["/d/letter.pdf"])
+        self.assertEqual(self.polls_sent[0]["options"], [relay.MAIL_SEND, relay.MAIL_NO])
+        self.assertEqual([relay.MAIL_SEND, relay.MAIL_NO], [gs.SEND, gs.NO])
+        self.assertIn("Re: letter", self.polls_sent[0]["question"])
+        p = gs.load(self.path, {})
+        self.assertEqual((p["status"], p["poll"]), ("asked", "P1"))
+        self.assertEqual(relay.polls()["P1"]["kind"], "mailgate")
+        relay.mail_gate_ask()  # asked once only
+        self.assertEqual(len(self.polls_sent), 1)
+
+    def test_no_poll_means_nothing_can_be_approved(self):
+        self.show()
+        with mock.patch.object(relay, "api", side_effect=OSError("bridge down")):
+            relay.mail_gate_ask()
+        self.assertIn("nothing will be sent", self.texts[-1])
+        p = gs.load(self.path, {})
+        self.assertEqual((p["status"], p.get("poll")), ("asking", None))
+        self.assertIn("not asked yet", gs.vote_ok(p))
+
+    def test_the_tap_is_recorded_and_goes_to_the_coordinator(self):
+        self.show()
+        relay.mail_gate_ask()
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        p = gs.load(self.path, {})
+        self.assertEqual((p["vote"]["poll"], p["vote"]["choice"]), ("P1", gs.SEND))
+        self.assertEqual(gs.vote_ok(p), "")
+        self.assertIn(": Send", self.added[0][1])
+        relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)  # a poll acts once
+        self.assertEqual(gs.load(self.path, {})["vote"]["choice"], gs.SEND)
+
+    def test_one_tap_is_written_once(self):
+        self.show()
+        relay.mail_gate_ask()
+        self.assertTrue(relay.mail_gate_vote("P1", relay.MAIL_NO))
+        self.assertFalse(relay.mail_gate_vote("P1", relay.MAIL_SEND))  # a second tap never turns No into Send
+        self.assertEqual(gs.load(self.path, {})["vote"]["choice"], gs.NO)
+        self.assertFalse(relay.mail_gate_vote(None, relay.MAIL_SEND))
+
+    def test_the_poll_comes_after_the_coordinator_answer(self):
+        order = []
+        with mock.patch.object(relay, "send_text", lambda chat, t, **k: order.append("answer")), \
+                mock.patch.object(relay, "mail_gate_ask", lambda: order.append("poll")):
+            relay.coordinator_send("Here is the mail.", "send the letter")
+        self.assertEqual(order, ["answer", "poll"])
+
+    def test_a_vote_after_a_newer_show_counts_for_nothing(self):
+        self.show()
+        relay.mail_gate_ask()
+        self.show(draft="r1234567")  # the coordinator showed another mail before the tap
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        self.assertNotIn("vote", gs.load(self.path, {}))
+        self.assertIn("not waiting for this vote", self.texts[-1])
+        self.assertEqual(self.added, [])
+
+    def test_a_vote_from_another_chat_never_counts(self):
+        self.show()
+        relay.mail_gate_ask()
+        relay.on_vote("v1", "123@s.whatsapp.net", "123", "P1", relay.MAIL_SEND)
+        self.assertNotIn("vote", gs.load(self.path, {}))
+
+    def test_a_show_during_the_ask_voids_that_poll(self):
+        self.show()
+        def show_meanwhile(f):
+            self.show(draft="r1234567")
+        with mock.patch.object(relay, "send_owner_file", show_meanwhile):
+            relay.mail_gate_ask()
+        p = gs.load(self.path, {})
+        self.assertEqual((p["draft"], p["status"], p.get("poll")), ("r1234567", "requested", None))
+
+    def test_the_coordinator_is_told_how(self):
+        for want in ("gmail_send.py show", "gmail_draft.py show", "A typed 'ok' never sends",
+                     "A thread run never runs gmail_send.py or gmail_draft.py"):
+            self.assertIn(want, relay.MAIL_RULES)
 
 
 if __name__ == "__main__":
