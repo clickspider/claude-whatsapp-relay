@@ -57,10 +57,21 @@ sed -e "s|__LABEL__|$(esc "$LABEL")|" -e "s|__PYTHON__|$(esc "$PY_PATH")|" \
     "$ROOT/launchd/relay.plist.template" > "$PLIST"
 plutil -lint "$PLIST"
 echo "Wrote $PLIST"
+# The watchdog: a separate job that tells you on WhatsApp when the relay is down (scripts/relay_watchdog.py).
+WPLIST="$HOME/Library/LaunchAgents/$LABEL.watchdog.plist"
+sed -e "s|__LABEL__|$(esc "$LABEL")|" -e "s|__PYTHON__|$(esc "$PY_PATH")|" \
+    -e "s|__WATCHDOG__|$(esc "$ROOT/scripts/relay_watchdog.py")|" -e "s|__CONFIG__|$(esc "$CONFIG")|" \
+    -e "s|__HOME__|$(esc "$HOME")|" -e "s|__LOG_DIR__|$(esc "$LOG_DIR")|g" \
+    "$ROOT/launchd/watchdog.plist.template" > "$WPLIST"
+plutil -lint "$WPLIST"
+echo "Wrote $WPLIST"
 if [ "$LOAD" = 1 ]; then
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  echo "Started $LABEL. Logs: $LOG_DIR/relay.log"
+  for P in "$PLIST" "$WPLIST"; do
+    L="$(basename "$P" .plist)"
+    launchctl bootout "gui/$(id -u)/$L" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$P"
+  done
+  echo "Started $LABEL and its watchdog. Logs: $LOG_DIR/relay.log, $LOG_DIR/watchdog.log"
 else
-  echo "Not started. To start:  launchctl bootstrap gui/$(id -u) \"$PLIST\""
+  echo "Not started. To start:  launchctl bootstrap gui/$(id -u) \"$PLIST\"; launchctl bootstrap gui/$(id -u) \"$WPLIST\""
 fi

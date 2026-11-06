@@ -77,6 +77,9 @@ DEFAULTS = {
     "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 10000, "auto_close_hours": 24,
                 "blocked_ask_days": 7, "blocked_close_hours": 48,
                 "digest_seconds": 120, "effort_default": "", "effort_high": "", "effort_high_words": []},
+    "watchdog": {"enabled": True, "down_minutes": 3,  # scripts/relay_watchdog.py reads these itself
+                 "down_text": "The relay is down since {since} and does not answer. Log: {log}",
+                 "back_text": "The relay is back (down since {since})."},
     "launchd": {"label": "com.example.claude-whatsapp-relay", "python": "python3",
                 "log_dir": "~/Library/Logs/claude-whatsapp-relay"},
 }
@@ -1633,7 +1636,8 @@ COORDINATOR_RULES = (
     "For real work (research, building, writing, several steps) do not do it here: add a line "
     "'@@THREAD: <short title> | <brief: what to do, defaults you picked>' and write at most one line "
     "about it. The owner's message goes to the thread with your brief. For a message about an open "
-    "thread, add '@@TO #<n>: <note>' instead. Open threads are listed at the top of the message, "
+    "thread, add '@@TO #<n>: <note>' instead. Each marker is one line; only a marker that ends in ':' "
+    "goes on until the next blank line. Open threads are listed at the top of the message, "
     "with THREAD NEWS: what the threads reported and what the owner told them since your last turn. "
     "Treat it as current; never contradict a thread without saying why. "
     "Give every thread one short topic word: add ' | topic=<word>' to the brief and reuse the "
@@ -1698,18 +1702,18 @@ def take_thread_markers(text):
     for line in (text or "").splitlines():
         m = THREAD_MARK_RE.match(line)
         if in_note and not m and line.strip() and not line.lstrip().startswith("@@"):
-            kind, a, b = out[-1]  # a note runs on until the first blank line, never shown to the owner
+            kind, a, b = out[-1]  # a note that ends in ':' runs on until the first blank line
             out[-1] = (kind, a, f"{b}\n{line.rstrip()}")
             continue
         in_note = False
         if m and m.group(1) == "THREAD" and m.group(2).strip():
             title, _, brief = m.group(2).partition("|")
             out.append(("new", title.strip()[:60], brief.strip()))
-            in_note = True
+            in_note = line.rstrip().endswith(":")  # else one line: the owner's text right after it stays his
         elif m and m.group(1) == "TO" and re.match(r"#?(\d+)\s*:?\s*(.*)$", m.group(2), re.S):
             n, note = re.match(r"#?(\d+)\s*:?\s*(.*)$", m.group(2), re.S).groups()
             out.append(("to", n, note.strip()))
-            in_note = True
+            in_note = line.rstrip().endswith(":")
         else:
             keep.append(line)
     return "\n".join(keep).strip(), out
@@ -3627,6 +3631,25 @@ def fix_last(a, prompt):
         log_thread(a, "AGENT (fixed its last message)", parse(out)[0] or out)
 
 
+LOAD_CHECK = ("import runpy, sys\n"
+              "g = runpy.run_path(sys.argv[1], run_name='relay_load_check')\n"
+              "if sys.argv[2]:\n"
+              "    e = g['validate'](g['load_config'](sys.argv[2]))[0]\n"
+              "    sys.exit('\\n'.join(e) if e else 0)\n")
+
+
+def load_check(path, conf=""):
+    """'' when the code at path compiles, runs its top level (imports, globals) and loads conf in a
+    separate process; else the error. 6 Nov 2026: a missing import passed py_compile and the relay
+    crash-looped for 35 minutes."""
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", LOAD_CHECK, path, conf],
+                           capture_output=True, text=True, timeout=60, cwd=os.path.dirname(path))
+    except subprocess.TimeoutExpired:
+        return "the load check took more than 60 s"
+    return "" if r.returncode == 0 else (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+
+
 def restart_if_changed():
     """Opt-in (danger.self_edit): relay.py or the config changed and both still load -> stop every claude run
     and restart at once. Unfinished jobs go on after the restart (see resume_jobs)."""
@@ -3643,10 +3666,11 @@ def restart_if_changed():
             CFG_MTIME["start"] = cm  # report once, keep running the old config
             send_text(OWNER, f"relay.config.toml has an error, so I did NOT restart: {e}")
             return
-    r = subprocess.run([sys.executable, "-m", "py_compile", me], capture_output=True, text=True)
-    if r.returncode != 0:
+    err = load_check(me, conf)
+    if err:
         globals()["START_MTIME"] = os.path.getmtime(me)  # report once, keep running old code
-        send_text(OWNER, "relay.py has a syntax error, so I did NOT restart:\n" + r.stderr[-800:])
+        agent_note("relay", "relay.py changed but does not load, so I did NOT restart (still on the old code):\n"
+                   + err[-800:])
         return
     print(f"{owner_now():%H:%M} relay.py changed: restarting, {len(_procs)} run(s) stopped", flush=True)
     if _digest["due"] and "digest" not in _inflight:  # thread news waiting: report it after the restart
@@ -4267,7 +4291,31 @@ def each(name, seconds, now=None, mono=None):
     return True
 
 
+def heartbeat():
+    """This file's mtime = the main loop is alive (scripts/relay_watchdog.py checks it every minute)."""
+    with open(st("heartbeat"), "a"):
+        pass
+    os.utime(st("heartbeat"))
+
+
+def watchdog_back():
+    """The watchdog told the owner we were down: its message is ours (never an owner message), and
+    the owner hears that we are back."""
+    p = st("watchdog-down.json")
+    if not os.path.exists(p):
+        return
+    d = load_state("watchdog-down.json")
+    if d.get("id"):
+        remember_sent(OWNER, msg_id=d["id"])
+    if d.get("text"):
+        remember_sent(OWNER, d["text"])
+    os.remove(p)
+    since = datetime.datetime.fromtimestamp(d.get("since") or time.time(), ZoneInfo(CFG["owner"]["timezone"]))
+    send_text(OWNER, CFG["watchdog"]["back_text"].format(since=f"{since:%H:%M}"))
+
+
 def main_loop():
+    heartbeat()
     c = db("messages.db")
     cur = st("last-rowid")
     if os.path.exists(cur):
@@ -4281,6 +4329,10 @@ def main_loop():
     except Exception as e:
         print(f"resume failed: {e}", flush=True)
     while True:
+        try:  # before the rows: also after a hang that ended without a restart
+            watchdog_back()
+        except Exception as e:
+            print(f"watchdog note failed: {e}", flush=True)
         rows, seen = new_rows(c, last, cutoff)
         for rowid, msg_id, chat, sender, content, media_type, filename in rows:
             last = rowid
@@ -4311,7 +4363,8 @@ def main_loop():
             last = seen
             write(cur, str(last))
         tick += 1
-        for every, fn in ((5, lambda: [deliver_inbox(a, fixes_only=True) for a in agents(CFG) if a["live"]]),
+        for every, fn in ((10, heartbeat),
+                          (5, lambda: [deliver_inbox(a, fixes_only=True) for a in agents(CFG) if a["live"]]),
                           (300, lambda: threading.Thread(target=publish_check, daemon=True).start()),
                           (5, flush_quiet_groups),
                           (3, restart_if_changed if CFG["danger"]["self_edit"] else None),

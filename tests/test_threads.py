@@ -49,6 +49,11 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(notes, [("new", "flat move", "find movers"), ("to", "2", "add dates")])
         rest, notes = relay.take_thread_markers("@@TO #3: fix this:\n1. a\n2. b\n\nDone, sent.")
         self.assertEqual((rest, notes), ("Done, sent.", [("to", "3", "fix this:\n1. a\n2. b")]))
+        # 6 Nov 2026 09:12: the owner line right after a one-line note was swallowed into the note
+        rest, notes = relay.take_thread_markers("@@TO #134: round 7, apply via watch_job.\nLogged: capsule 09:12.\n\nNext.")
+        self.assertEqual((rest, notes), ("Logged: capsule 09:12.\n\nNext.", [("to", "134", "round 7, apply via watch_job.")]))
+        rest, notes = relay.take_thread_markers("@@THREAD: rent | find a flat\nOpened a thread.")
+        self.assertEqual((rest, notes), ("Opened a thread.", [("new", "rent", "find a flat")]))
 
     def test_start_run_followup_close(self):
         self.assertEqual(relay.thread_dispatch(("new", "flat move", "find movers"), "help me move"),

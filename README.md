@@ -100,7 +100,7 @@ cp relay.config.example.toml relay.config.toml   # fill it in
 scripts/get-model.sh                              # local speech model, ~550 MB
 python3 relay.py check                            # every setting + its risk, and dependency checks
 python3 relay.py plan                             # the exact claude commands, runs nothing
-scripts/install-launchd.sh                        # macOS: writes the launchd job (add --load to start)
+scripts/install-launchd.sh                        # macOS: writes the launchd job + its watchdog (add --load to start)
 ```
 
 Needs: Python 3.11+, Claude Code, ffmpeg, whisper.cpp (`whisper-cli`), and a paired [whatsapp-mcp](https://github.com/verygoodplugins/whatsapp-mcp) bridge. Linux works without voice replies and launchd.

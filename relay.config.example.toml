@@ -286,6 +286,15 @@ effort_default = ""
 effort_high = "high"
 effort_high_words = []
 
+[watchdog]
+# scripts/relay_watchdog.py runs every minute (its own launchd job, installed by scripts/install-launchd.sh).
+# When the relay's heartbeat stops for down_minutes, it sends you ONE WhatsApp message through the bridge;
+# the relay says "back" after its next start. Plain code, no AI. owner.night = it waits for the morning.
+enabled = true
+down_minutes = 3
+down_text = "The relay is down since {since} and does not answer. Log: {log}"
+back_text = "The relay is back (down since {since})."
+
 [launchd]
 # Used by scripts/install-launchd.sh (macOS) for the relay job. python must be 3.11 or newer.
 label = "com.example.claude-whatsapp-relay"
