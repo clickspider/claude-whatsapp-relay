@@ -167,6 +167,7 @@ class Attach(unittest.TestCase):
         self.assertEqual((slot["kind"], slot["status"], slot["files"]), ("attach", "requested", [os.path.realpath(self.pdf)]))
         self.assertIn("letter.pdf (13 bytes)", slot["summary"])  # what the relay shows the owner
         self.assertIn("To: a@example.nl, b@example.nl", slot["summary"])
+        self.assertIn("The mail text now:\nHi, see the file.", slot["summary"])  # review P2-7: the text too
         self.assertEqual(self.puts, [])
 
     def test_a_pdf_shows_its_pages(self):

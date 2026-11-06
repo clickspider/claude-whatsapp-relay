@@ -72,8 +72,33 @@ def describe(msg):
     body = msg.get_body(preferencelist=("plain", "html"))
     text = body.get_content() if body else ""
     if body and body.get_content_type() == "text/html":
-        text = re.sub(r"<[^>]+>", " ", text)
+        text = strip_html(text)
+    html = msg.get_body(preferencelist=("html",))
+    if html and html is not body and squash(strip_html(html.get_content())) != squash(text):
+        # review #139 P2-6: most mail apps show the html part; the owner must see it when it says something else
+        text += "\n\n(HTML version, what most mail apps show:)\n" + strip_html(html.get_content()).strip()
     return "\n".join(lines) + "\n\n" + text.strip()
+
+
+def strip_html(t):
+    return re.sub(r"<[^>]+>", " ", t)
+
+
+def squash(t):
+    return " ".join(t.split())
+
+
+def save_files(msg, folder):
+    """review #139 P2-5 (decision 14:27): the draft's own attachments, copied for the owner to get before the poll."""
+    out = []
+    for i, part in enumerate(p for p in msg.walk() if p.get_filename()):
+        name = os.path.basename(part.get_filename()).lstrip(".") or "file"
+        path = os.path.join(folder, str(i), name)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(part.get_payload(decode=True) or b"")
+        out.append(path)
+    return out
 
 
 def load(path, default):
@@ -142,8 +167,9 @@ def main(argv):
     h, msg = draft(tok, did)
     if cmd == "show":
         text = describe(msg)
+        files = save_files(msg, os.path.join(state, "mail-send", "files", h))  # = relay MAIL_FILES
         request(pending_path, {"kind": "send", "draft": did, "hash": h, "subject": str(msg["Subject"] or ""),
-                               "summary": "Mail to send:\n" + text})
+                               "files": files, "summary": "Mail to send:\n" + text})
         print(text)
         print(f"\nNothing is sent. After your reply the relay sends the owner this mail and a '{SEND} / {NO}' poll. "
               f"Do not ask in text and do not repeat the mail. A typed 'ok' never sends. Only when the vote comes back "

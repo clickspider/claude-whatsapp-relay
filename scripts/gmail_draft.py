@@ -119,7 +119,8 @@ def main(argv):
         lines = [f"  {os.path.basename(p)} ({len(b)} bytes{pages(b)})" for p, b in files.items()]
         gs.request(pending_path, {"kind": "attach", "draft": did, "key": key, "subject": str(msg["Subject"] or ""),
                                   "files": list(files),
-                                  "summary": f"Files to put on this draft (nothing is uploaded yet):\n{head}\n" + "\n".join(lines)})
+                                  "summary": f"Files to put on this draft (nothing is uploaded yet):\n{head}\n" + "\n".join(lines)
+                                             + "\n\nThe mail text now:\n" + gs.describe(msg).split("\n\n", 1)[-1][:1500]})
         print(head + "\nFiles to attach:\n" + "\n".join(f"{q} from {p}" for q, p in zip(lines, files)))
         print(f"\nNothing is uploaded. After your reply the relay sends the owner these recipients, the files "
               f"themselves and a '{gs.SEND} / {gs.NO}' poll. Do not ask in text. A typed 'ok' never attaches. Only "

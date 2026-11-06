@@ -1607,22 +1607,25 @@ def send_tail(tail, track=None, start=0):
                 pass  # the bridge is down: the note cannot go either
 
 
-def send_owner_file(path):
+def send_owner_file(path, root=None):
     """@@FILE: <path> -> that file, sent as a document to the OWNER only (never a contact).
-    Only files inside the owner's folder; anything else is refused with a note to the owner."""
-    root = os.path.realpath(os.path.expanduser(CFG["owner"]["folder"]))
+    Only files inside the owner's folder (or the given root); anything else is refused with a note to the owner.
+    True when the bridge took it."""
+    root = os.path.realpath(os.path.expanduser(root or CFG["owner"]["folder"]))
     p = os.path.realpath(os.path.join(root, os.path.expanduser(path.strip().strip("'\""))))
     if not (p.startswith(root + os.sep) and os.path.isfile(p)):
         send_text(OWNER, f"(file not sent: {path} is not a file in {CFG['owner']['folder']})")
-        return
+        return False
     # unique folder, not a name prefix: WhatsApp shows the file name as is
     out = os.path.join(CFG["bridge"]["outbox"], uuid.uuid4().hex[:8], os.path.basename(p))
     try:
         os.makedirs(os.path.dirname(out), exist_ok=True)
         shutil.copyfile(p, out)
         api("send", {"recipient": OWNER, "message": "", "media_path": out})
+        return True
     except Exception as e:
         send_text(OWNER, f"(file not sent: {os.path.basename(p)}: {e})")
+        return False
 
 
 # ---------- threads (opt-in: [threads]): the owner chat works like a Claude Project ----------
@@ -2323,6 +2326,8 @@ def ask(chat, question, options, **record):
 
 
 MAIL_GATE = "mail-send/pending.json"  # the one waiting slot of scripts/gmail_send.py and gmail_draft.py
+MAIL_FILES = "mail-send/files"  # gmail_send.py show copies a draft's attachments here, so the owner gets them too
+MAIL_OK_HOURS = 2  # = gmail_send.OK_HOURS: an older show gets no poll
 
 
 @contextlib.contextmanager
@@ -2344,10 +2349,14 @@ def mail_gate_ask():
         p = load_state(MAIL_GATE)
         if p.get("status") != "requested":
             return
-        write(st(MAIL_GATE), json.dumps(dict(p, status="asking")))
+        old = time.time() - p.get("time", 0) > MAIL_OK_HOURS * 3600  # a late turn: a poll now could never be used
+        write(st(MAIL_GATE), json.dumps(dict(p, status="expired" if old else "asking")))
+    if old:
+        return send_text(OWNER, "(a mail approval waited too long: nothing will be sent. Ask me to show it again.)")
     send_text(OWNER, p.get("summary") or "(a mail waits for approval)")
-    for f in p.get("files") or []:
-        send_owner_file(f)
+    root = st(MAIL_FILES) if p.get("kind") == "send" else None  # a send: the draft's own files, copied by show
+    if not all(send_owner_file(f, root) for f in p.get("files") or []):  # decision 14:27: the files BEFORE the poll
+        return mail_gate_failed(p, "(a file did not reach you, so there is no poll: nothing will be sent. Ask me to show it again.)")
     question = (f"{'Attach these files' if p.get('kind') == 'attach' else 'Send this mail'}? "
                 f"{p.get('subject') or ''}").strip()[:255]
     try:
@@ -2356,11 +2365,19 @@ def mail_gate_ask():
     except Exception:
         mid = None
     if not mid:
-        return send_text(OWNER, "(could not make the approval poll: nothing will be sent. Ask me to show it again.)")
+        return mail_gate_failed(p, "(could not make the approval poll: nothing will be sent. Ask me to show it again.)")
     polls({mid: {"kind": "mailgate", "chat": OWNER, "question": question, "poll_id": mid}})
     with mail_gate_lock():
         if load_state(MAIL_GATE).get("time") == p.get("time"):  # a newer show came meanwhile: this poll is void
             write(st(MAIL_GATE), json.dumps(dict(p, status="asked", poll=mid, asked=time.time())))
+
+
+def mail_gate_failed(p, why):
+    """No poll after "asking": say why once, and mark it, so the start-up sweep does not tell it again."""
+    with mail_gate_lock():
+        if load_state(MAIL_GATE).get("time") == p.get("time"):
+            write(st(MAIL_GATE), json.dumps(dict(p, status="failed")))
+    return send_text(OWNER, why)
 
 
 def mail_gate_vote(poll_id, choice):
@@ -2368,10 +2385,31 @@ def mail_gate_vote(poll_id, choice):
     poll (a newer show replaced it = the vote counts for nothing). True when it was recorded."""
     with mail_gate_lock():
         p = load_state(MAIL_GATE)
-        if not poll_id or p.get("poll") != poll_id or p.get("vote"):
+        if not poll_id or p.get("poll") != poll_id:
             return False
+        if p.get("vote"):  # the same tap again (a resume after a crash) is still recorded
+            return p["vote"].get("choice") == choice
         write(st(MAIL_GATE), json.dumps(dict(p, vote={"poll": poll_id, "choice": choice, "time": time.time()})))
         return True
+
+
+def mail_gate_retract(poll_id):
+    with mail_gate_lock():
+        p = load_state(MAIL_GATE)
+        if p.get("poll") != poll_id or p.get("used"):
+            return False
+        write(st(MAIL_GATE), json.dumps(dict(p, vote={"poll": poll_id, "choice": MAIL_NO, "time": time.time()})))
+        return True
+
+
+def mail_gate_sweep():
+    """At start: an ask a crash cut between "asking" and the poll is told once, never left waiting in silence."""
+    with mail_gate_lock():
+        p = load_state(MAIL_GATE)
+        if p.get("status") != "asking":
+            return
+        write(st(MAIL_GATE), json.dumps(dict(p, status="cut")))
+    send_text(OWNER, "(a mail approval was cut by a restart: nothing will be sent. Ask me to show it again.)")
 
 
 def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
@@ -2379,6 +2417,10 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
     resumed = run again after a restart (resume_one): the poll is already done, the vote is not handled yet."""
     rec = polls().get(poll_id)
     choice = (choice or "").split("\n")[0].strip()
+    if rec and rec.get("kind") == "mailgate" and rec.get("done") and not resumed and rec["chat"] == chat \
+            and choice != MAIL_SEND:  # he changed his tap to Don't send (or took it back): that wins until used
+        return send_text(OWNER, "Changed: not sent." if mail_gate_retract(poll_id) else
+                         "Too late to change: that mail was already handled.")
     if not rec or rec.get("done") and not resumed or rec["chat"] != chat or choice in ("", "(none)"):
         return
     if resumed and vote_id in stopped_votes():  # a /stop stopped it before the crash or the limit
@@ -4414,6 +4456,7 @@ def main_loop():
     tick, grace = 0, CFG["limits"]["history_grace_seconds"]
     cutoff = time.time() - grace if grace else 0
     try:
+        mail_gate_sweep()
         resume_jobs()
     except Exception as e:
         print(f"resume failed: {e}", flush=True)
