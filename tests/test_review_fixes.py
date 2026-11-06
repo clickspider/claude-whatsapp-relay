@@ -11,7 +11,7 @@ class ReviewFixes(unittest.TestCase):
     setUp = test_threads.ThreadTests.setUp
 
     def tearDown(self):
-        relay._inflight.clear(), relay.RESUMED.clear()
+        relay._inflight.clear(), relay.RESUMED.clear(), relay._stopped_votes.clear()
         test_threads.ThreadTests.tearDown(self)
 
     def digest(self, answer="ok", **kw):
@@ -687,6 +687,125 @@ class SixthReview(unittest.TestCase):
         for i in range(1, 6):  # the clock steps back every 5 min
             self.assertFalse(relay.each("z", 1800, now=10_000.0 - i * 100, mono=i * 300.0))
         self.assertTrue(relay.each("z", 1800, now=9_000.0, mono=1_800.0))  # 30 real minutes passed
+
+
+class SeventhReview(unittest.TestCase):
+    """Instinct's re-review of e97ba05: plain /stop must stop a vote from the owner chat."""
+    setUp = ReviewFixes.setUp
+    tearDown = ReviewFixes.tearDown
+
+    def test_s1_stop_stops_a_send_vote_queued_behind_a_busy_agent(self):
+        sent = []  # setUp's enqueue keeps jobs in self.jobs: a queue no /stop of the owner chat drains
+        a = {"name": "busy7", "jid": "c7@s"}
+        relay.polls({"P7": {"chat": relay.OWNER, "question": "send?", "kind": "draft", "agent": "busy7", "draft": "d"}})
+        with mock.patch.object(relay, "by_name", return_value=("c7@s", a)), \
+                mock.patch.object(relay, "flag", return_value="x"), mock.patch.object(relay, "digest", return_value="d"), \
+                mock.patch.object(relay, "mark_sending"), \
+                mock.patch.object(relay, "owner_command", lambda *x: sent.append(x)):
+            relay.enqueue("busy7", lambda: None)  # the agent is busy with this one
+            relay.on_vote("V7", relay.OWNER, relay.OWNER, "P7", "Send")  # Send tapped: queued behind it
+            relay.stop_runs({"owner"})  # plain /stop in the owner chat
+            for _, job in self.jobs:  # the agent's worker goes on
+                job()
+        self.assertEqual(sent, [])  # the draft never goes out after the stop
+        self.assertNotIn("V7", relay._inflight)
+        self.assertTrue(any("1 waiting" in t for t in self.sent))
+
+    def test_s1_stop_during_the_agent_run_sends_nothing(self):
+        a = {"name": "busy9", "jid": "c9@s"}
+        relay.polls({"P9": {"chat": relay.OWNER, "question": "which day?", "kind": "ask", "agent": "busy9"}})
+
+        def run(*x):  # the owner types /stop while the agent writes its answer
+            relay.stop_runs({"owner"})
+            return "monday then"
+        with mock.patch.object(relay, "by_name", return_value=("c9@s", a)), mock.patch.object(relay, "run_agent", run), \
+                mock.patch.object(relay, "mark_sending"), mock.patch.object(relay, "deliver") as d:
+            relay.on_vote("V9", relay.OWNER, relay.OWNER, "P9", "Mon")
+            for _, job in self.jobs:
+                job()
+        d.assert_not_called()
+
+    def test_s1_stop_drops_a_vote_parked_on_the_limit(self):  # independent review: it sent after a restart
+        rec = {"route": ["V10", relay.OWNER, relay.OWNER, "(vote: Mon)", None],
+               "vote": ["V10", relay.OWNER, relay.OWNER, "P10", "Mon"], "worker": "busy10"}
+        relay.parked(lambda j: j.update({relay.job_id(rec): {"rec": rec, "at": 0, "since": 0, "tries": 0}}))
+        relay.stop_runs({"owner"})
+        self.assertEqual(relay.parked(), {})
+        with mock.patch.object(relay, "on_vote") as ov:
+            relay.resume_parked(now=1)
+        ov.assert_not_called()
+
+    def test_s1_stop_kills_the_agent_run_of_a_vote_and_counts_right(self):
+        relay._inflight["V11"] = {"route": ["V11", relay.OWNER, relay.OWNER, "(vote: Mon)", None],
+                                  "vote": ["V11", relay.OWNER, relay.OWNER, "P11", "Mon"], "worker": "busy11"}
+        p = mock.Mock(relay_key="busy11", vote="V11")
+        with mock.patch.object(relay, "_procs", {p}):
+            relay.stop_runs({"owner"})
+        p.terminate.assert_called_once()
+        self.assertTrue(any("1 running" in t for t in self.sent))
+
+    def test_s1_a_vote_run_that_ends_during_the_stop_is_no_error(self):
+        relay._inflight["V12"] = {"route": ["V12", relay.OWNER, relay.OWNER, "(vote: Mon)", None],
+                                  "vote": ["V12", relay.OWNER, relay.OWNER, "P12", "Mon"], "worker": "busy12"}
+        p = mock.Mock(relay_key="busy12", vote="V12")
+        p.terminate.side_effect = lambda: relay._inflight.pop("V12", None)  # its job ends at once
+        with mock.patch.object(relay, "_procs", {p}):
+            relay.stop_runs({"owner"})
+        self.assertTrue(any("Stopped" in t for t in self.sent))
+
+    def test_s1_a_run_that_starts_after_the_stop_is_ended(self):
+        relay._stopped_votes.add("V13")
+        relay._wk.vote = "V13"
+        fake = mock.Mock()
+        fake.communicate.return_value = ("", "")
+        fake.returncode = 0
+        try:
+            with mock.patch.object(relay.subprocess, "Popen", return_value=fake), \
+                    mock.patch.object(relay, "hold_if_stopping"):  # an earlier test may leave STOPPING set
+                try:
+                    relay.run_claude(["claude"], "/tmp", "hi")
+                except Exception:
+                    pass
+        finally:
+            relay._wk.vote = None
+        fake.terminate.assert_called()
+
+    def test_s1_stop_waits_for_a_draft_send_on_its_way(self):  # never "Stopped" while it still sends
+        import threading
+        order, inside, go = [], threading.Event(), threading.Event()
+        a = {"name": "busy14", "jid": "c14@s"}
+        relay.polls({"P14": {"chat": relay.OWNER, "question": "send?", "kind": "draft", "agent": "busy14", "draft": "d"}})
+
+        def command(*x):
+            inside.set(), go.wait(5), order.append("sent")
+        with mock.patch.object(relay, "by_name", return_value=("c14@s", a)), \
+                mock.patch.object(relay, "flag", return_value="x"), mock.patch.object(relay, "digest", return_value="d"), \
+                mock.patch.object(relay, "mark_sending"), mock.patch.object(relay, "owner_command", command), \
+                mock.patch.object(relay, "send_text", lambda c, t, **k: order.append("stopped")):
+            relay.on_vote("V14", relay.OWNER, relay.OWNER, "P14", "Send")
+            job = threading.Thread(target=self.jobs[-1][1])
+            job.start()
+            inside.wait(5)
+            stop = threading.Thread(target=relay.stop_runs, args=({"owner"},))
+            stop.start()
+            stop.join(0.3)
+            self.assertTrue(stop.is_alive())  # it waits for the send on its way
+            go.set(), job.join(5), stop.join(5)
+        self.assertEqual(order, ["sent", "stopped"])
+
+    def test_s1_a_vote_after_the_stop_still_counts(self):
+        sent = []
+        a = {"name": "busy8", "jid": "c8@s"}
+        relay.polls({"P8": {"chat": relay.OWNER, "question": "send?", "kind": "draft", "agent": "busy8", "draft": "d"}})
+        with mock.patch.object(relay, "by_name", return_value=("c8@s", a)), \
+                mock.patch.object(relay, "flag", return_value="x"), mock.patch.object(relay, "digest", return_value="d"), \
+                mock.patch.object(relay, "mark_sending"), \
+                mock.patch.object(relay, "owner_command", lambda *x: sent.append(x)):
+            relay.stop_runs({"owner"})
+            relay.on_vote("V8", relay.OWNER, relay.OWNER, "P8", "Send")
+            for _, job in self.jobs:
+                job()
+        self.assertEqual(sent, [("busy8", "ok")])
 
 
 class JobDedupThreadsOff(unittest.TestCase):

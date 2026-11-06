@@ -1140,7 +1140,7 @@ def job_worker(rec):
     if "thread" in rec:
         return f"#{rec['thread'][0]}"
     if "vote" in rec:  # an owner-chat vote on an agent's poll runs in that agent's queue
-        return (polls().get(rec["vote"][3]) or {}).get("agent") or job_worker({"route": rec["route"]})
+        return rec.get("worker") or (polls().get(rec["vote"][3]) or {}).get("agent") or job_worker({"route": rec["route"]})
     if "route" in rec and rec["route"][1] != OWNER:
         return (by_jid(rec["route"][1]) or {}).get("name")
     if "inbox" in rec:
@@ -1173,7 +1173,13 @@ def stop_runs(keys=None):
     resume entries, so nothing they would send goes out. Held drafts stay held (they never go out
     without the owner's Send). Something already sent is not undone."""
     hit = lambda k: keys is None or k in keys
-    runs = [p for p in list(_procs) if hit(getattr(p, "relay_key", None))]
+    # A vote tapped in the owner chat is the owner's, also when its job waits or runs in an agent's queue (a
+    # draft "Send"): plain /stop stops it there too (Instinct round 6). Its job checks _stopped_votes first.
+    own_vote = lambda rec: hit("owner") and "vote" in rec and rec["vote"][1] == OWNER
+    with _vote_lock:  # a vote send on its way ends first; after this no vote job of these sends (vote_queue)
+        votes = {k: rec for k, rec in list(_inflight.items()) if own_vote(rec)}
+        _stopped_votes.update(votes)
+    runs = [p for p in list(_procs) if hit(getattr(p, "relay_key", None)) or getattr(p, "vote", None) in votes]
     for p in runs:
         _stopped.add(p)
         p.terminate()
@@ -1189,6 +1195,14 @@ def stop_runs(keys=None):
         with owner_lock:
             dropped += len(owner_buf)
             owner_buf.clear()
+        running = {getattr(p, "vote", None) for p in runs}
+        for key, rec in votes.items():  # the snapshot: a killed run may end and drop its record meanwhile
+            dropped += not hit(job_worker(rec)) and key not in running  # else counted already
+            _claimed.discard(key)
+            inflight(key)
+    # parked on the usage limit: it would run again when the limit ends, also after a restart (review)
+    parked(lambda jobs: [jobs.pop(k) for k, j in list(jobs.items())  # not the digest: it is thread news, not a send
+                         if "digest" not in j["rec"] and (hit(job_worker(j["rec"])) or own_vote(j["rec"]))])
     for key, rec in list(_inflight.items()):
         if hit(job_worker(rec)):
             _claimed.discard(key)
@@ -1213,6 +1227,10 @@ def run_claude(args, cwd, prompt):
     p = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
     p.relay_key = getattr(_wk, "key", None)
+    p.vote = getattr(_wk, "vote", None)  # a vote job's run: an owner-chat /stop ends it too (stop_runs)
+    if p.vote in _stopped_votes:  # the /stop came between the job's start and this run
+        _stopped.add(p)
+        p.terminate()
     p.preempt = getattr(_wk, "preempt", False)
     _procs.add(p)
     try:
@@ -2284,7 +2302,7 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
     # On disk before the poll counts as done (Instinct round 5): a restart before its turn ends runs it again;
     # re-tapping cannot, a poll acts once. The "route" part gives the receipt and the "uncertain" note.
     inflight(vote_id, {"route": [vote_id, chat, sender, f"(vote: {choice})", None],
-                       "vote": [vote_id, chat, sender, poll_id, choice]})
+                       "vote": [vote_id, chat, sender, poll_id, choice], "worker": name or "owner"})
     try:
         polls({poll_id: dict(rec, done=True)})
         vote_job(vote_id, chat, sender, rec, choice, name, jid, a)
@@ -2293,13 +2311,39 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
             inflight(vote_id)
 
 
+_stopped_votes = set()  # vote ids a /stop stopped while their job waited in a queue
+_vote_lock = threading.Lock()  # a vote's check + send against /stop (stop_runs): no send after "Stopped"
+
+
+def vote_send(vote_id, send):
+    """The send of a vote job: only if no /stop came, and a /stop waits until it is out."""
+    with _vote_lock:
+        if vote_id not in _stopped_votes:
+            mark_sending(vote_id)  # a crash now says "uncertain", never a second send
+            send()
+
+
+def vote_queue(name, fn, vote_id):
+    """A vote's job in the agent's queue. /stop of the owner chat may stop it before or while it runs
+    (stop_runs): its claude run carries the vote id (run_claude), so that /stop can end it."""
+    def job():
+        if vote_id in _stopped_votes:
+            return
+        _wk.vote = vote_id
+        try:
+            fn()
+        finally:
+            _wk.vote = None
+    enqueue_job(name, job, vote_id)
+
+
 def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
     if rec["kind"] == "draft":
         draft = flag(a, "pending")
         if not draft or digest(draft) != rec["draft"]:
             return send_text(OWNER, f"That {name} draft is not waiting any more.")
         if choice == "Send":  # sending from here: a restart says "uncertain", never "not waiting" or a copy
-            return enqueue_job(name, lambda: (mark_sending(vote_id), owner_command(name, "ok")), vote_id)
+            return vote_queue(name, lambda: vote_send(vote_id, lambda: owner_command(name, "ok")), vote_id)
         if choice == "Drop":
             flag(a, "pending", "")
             log_thread(a, f"AGENT (draft dropped by {CFG['owner']['name']})", draft)
@@ -2311,10 +2355,9 @@ def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
     if chat == OWNER:
         def agent_answer():
             out = run_agent(a, CFG["prompts"]["owner_says"] + answer)
-            mark_sending(vote_id)  # after the run: a crash now says "uncertain", never a second send
-            deliver(jid, a, out, False)
-        return enqueue_job(name, agent_answer, vote_id)
-    enqueue_job(name, lambda: contact_turn(jid, a, vote_id, answer, None, sender=sender), vote_id)
+            vote_send(vote_id, lambda: deliver(jid, a, out, False))  # a /stop while it wrote: nothing goes
+        return vote_queue(name, agent_answer, vote_id)
+    vote_queue(name, lambda: contact_turn(jid, a, vote_id, answer, None, sender=sender), vote_id)
 
 
 # ---------- agents (contacts and groups) ----------
