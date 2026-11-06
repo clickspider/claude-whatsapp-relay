@@ -73,7 +73,7 @@ DEFAULTS = {
                 "check_hours": 6},
     "power": {"keep_awake": True},
     "mail": {"enabled": False, "user": "", "client_file": "gmail-client.json", "keychain_service": "relay-gmail-oauth",
-             "send_keychain_service": "relay-gmail-send", "check_minutes": 5, "digest_hour": 8, "watch": {}},
+             "send_keychain_service": "relay-gmail-send", "attach_dir": "", "check_minutes": 5, "digest_hour": 8, "watch": {}},
     "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 10000, "auto_close_hours": 24,
                 "blocked_ask_days": 7, "blocked_close_hours": 48,
                 "digest_seconds": 120, "effort_default": "", "effort_high": "", "effort_high_words": []},
@@ -3942,6 +3942,9 @@ MAIL_RULES = (
     "subject, text) and ask; only when the owner's next message is a clear OK ('שלח', 'ok send'), run "
     "'... gmail_send.py send <draft-id>'. One draft at a time. The script refuses without that OK or when the "
     "draft changed: then show it again. Say an email went out only when the script printed SENT. "
+    "To put a file (PDF, image) on a Gmail draft, make the draft first, then run "
+    f"'python3 -I {HERE}/scripts/gmail_draft.py attach <draft-id> <file> ...' (only files inside mail.attach_dir; "
+    "it never sends); say the file is on it only when the script printed ATTACHED. "
     "Never delete, archive, label or mark mail. When the owner wants to hear when someone answers by "
     "email, add a line '@@WATCHMAIL #<n>: <thread-id from the 🔔 mail entry, or the sender address or domain>' "
     "(#<n> is optional).")

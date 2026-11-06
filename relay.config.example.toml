@@ -248,6 +248,10 @@ keychain_service = "relay-gmail-oauth"
 # and add "Bash(python3 -I /path/to/claude-whatsapp-relay/scripts/gmail_send.py *)" to owner.allowed_tools.
 # HIGH: Claude can send mail in your name. Without that token nothing can be sent.
 send_keychain_service = "relay-gmail-send"
+# Optional: let Claude put files on a Gmail draft (scripts/gmail_draft.py attach; it never sends), with the same
+# gmail.compose token. Only files inside this folder (symlinks resolved); "" = no attachments at all. Add
+# "Bash(python3 -I /path/to/claude-whatsapp-relay/scripts/gmail_draft.py *)" to owner.allowed_tools.
+attach_dir = ""
 check_minutes = 5
 digest_hour = 8                        # -1 = no morning digest
 [mail.watch]
