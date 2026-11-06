@@ -32,7 +32,7 @@ def allowed(paths, root, deny=()):
         rel = os.path.relpath(real, root)
         if any(part.startswith(".") for part in rel.split(os.sep)):
             sys.exit(f"NOT ATTACHED: {p} is in a hidden folder or is a hidden file.")
-        if any(fnmatch.fnmatch(rel, pat) for pat in deny):
+        if any(fnmatch.fnmatchcase(rel.lower(), pat.lower()) for pat in deny):  # APFS ignores case, so do we
             sys.exit(f"NOT ATTACHED: {p} is on the attach_deny list.")
         if not os.path.isfile(real):
             sys.exit(f"NOT ATTACHED: {p} is not a file.")

@@ -93,6 +93,30 @@ class Attach(unittest.TestCase):
             self.assertIn("NOT ATTACHED", self.run_cmd(os.path.join(self.root, rel)), rel)
         self.assertIn("ATTACHED to draft", self.run_cmd(self.pdf))  # a normal file still goes
 
+    def test_a_passwords_file_is_refused_by_name(self):
+        # the live attach_deny (6 Nov 2026): any file or folder whose name says password, in en/nl/he
+        deny = '["*password*", "*Password*", "*PASSWORD*", "*wachtwoord*", "*סיסמ*"]'
+        self.write_conf(f'attach_dir = "{self.root}"\nattach_deny = {deny}\n')
+        for rel in ("money/payslip-password.md", "Passwords/list.txt", "nl/loonstrook-wachtwoord.txt", "he/סיסמאות.txt"):
+            path = os.path.join(self.root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x")
+            self.assertIn("attach_deny", self.run_cmd(path), rel)
+        self.assertEqual(self.puts, [])
+
+    def test_a_password_file_is_refused_by_name_in_any_case(self):
+        # Daniel 6 Nov 2026 11:52: never the passwords file. A Hebrew name and an upper-case copy, anywhere.
+        for rel in ("cases/work/סיסמת_תלושים_והכנסה.md", "x/Payslip-PASSWORD.txt"):
+            path = os.path.join(self.root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x")
+        self.write_conf(f'attach_dir = "{self.root}"\nattach_deny = ["*סיסמ*", "*password*"]\n')
+        for rel in ("cases/work/סיסמת_תלושים_והכנסה.md", "x/Payslip-PASSWORD.txt"):
+            self.assertIn("attach_deny", self.run_cmd(os.path.join(self.root, rel)), rel)
+        self.assertEqual(self.puts, [])
+
     def test_no_attach_dir_means_nothing_attached(self):
         self.write_conf("")
         self.assertIn("attach_dir is not set", self.run_cmd(self.pdf))
