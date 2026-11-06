@@ -12,6 +12,7 @@ import test_threads  # noqa: E402
 import gmail_send as gs  # noqa: E402
 
 DRAFT = "r9222184318451542730"
+OK_FUTURE = 3600  # an OK stamped an hour ahead of the clock
 
 
 def raw(body):
@@ -90,10 +91,51 @@ class SendGate(unittest.TestCase):
                 gs.main(["send", DRAFT, self.conf])
         self.assertIn("no config argument", str(e.exception))
         self.run_cmd("show")
-        for where in ("#134", "poll", None):
+        for where in ("#134", "poll", "tag", "reaction", "media", None):
             self.owner_says("ok", where=where)
             self.assertIn("for a thread or a poll", self.run_cmd("send"), where)
+        with open(os.path.join(self.tmp, "owner-last.json"), "w") as f:  # an old record with no "where" key
+            json.dump({"time": time.time() + 1, "text": "ok"}, f)
+        self.assertIn("for a thread or a poll", self.run_cmd("send"))
+        with mock.patch.object(gs, "CONF", ""), redirect_stdout(io.StringIO()):  # not started by the relay
+            with self.assertRaises(SystemExit) as e:
+                gs.main(["send", DRAFT])
+        self.assertIn("RELAY_CONFIG is not set", str(e.exception))
         self.assertEqual(self.sent, [])
+
+    def test_the_window_runs_from_the_show_and_no_future_ok(self):
+        self.run_cmd("show")
+        self.owner_says("שלח", later=OK_FUTURE)
+        self.assertIn("in the future", self.run_cmd("send"))
+        self.owner_says("שלח", later=60)
+        later = time.time() + gs.OK_HOURS * 3600 + 120  # an OK 1 min after the show, the send 2 h later
+        with mock.patch.object(gs.time, "time", return_value=later):
+            self.assertIn("too late", self.run_cmd("send"))
+        self.assertEqual(self.sent, [])
+
+    def test_an_attach_show_never_opens_a_send(self):
+        gs.save(os.path.join(self.tmp, "mail-send", "pending.json"),
+                {"kind": "attach", "draft": DRAFT, "key": "k", "time": time.time()})  # the shared slot
+        self.owner_says("שלח")
+        self.assertIn("not shown to the owner first", self.run_cmd("send"))
+        self.assertEqual(self.sent, [])
+
+    def test_the_relay_hands_its_config_to_the_scripts(self):
+        cfg = {"owner": {"jid": "x"}, "config_path": os.path.join(self.tmp, "relay.config.toml"),
+               "paths": {"state_dir": self.tmp}}
+        saved = (relay.CFG, relay.OWNER)
+        self.addCleanup(lambda: (setattr(relay, "CFG", saved[0]), setattr(relay, "OWNER", saved[1])))
+        with mock.patch.dict(os.environ, {"RELAY_CONFIG": ""}):
+            relay.setup(cfg)
+            self.assertEqual(os.environ["RELAY_CONFIG"], cfg["config_path"])  # claude runs inherit it
+
+    def test_save_is_atomic(self):
+        path = os.path.join(self.tmp, "mail-send", "pending.json")
+        gs.save(path, {"draft": "a"})
+        with mock.patch.object(gs.json, "dump", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                gs.save(path, {"draft": "b"})
+        self.assertEqual(gs.load(path, {}), {"draft": "a"})  # the old version stays whole
 
     def test_changed_draft_needs_a_new_show(self):
         self.run_cmd("show")
@@ -115,6 +157,30 @@ class SendGate(unittest.TestCase):
             self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "#134")
             relay.owner_prep("m3", 'ANSWER to "Send?": Yes', None)
             self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "poll")
+            relay.owner_prep("m4", "#999 ok", None)  # no thread 999: it stays with the coordinator (review N4)
+            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "tag")
+            relay.owner_prep("m5", "ok", None)
+            relay.owner_prep("m6", 'REACTION ✅ to your message: "ok send"', "reaction")  # a ✅ never sends (1 Nov)
+            last = json.loads(relay.read(relay.st("owner-last.json")))
+            self.assertEqual(last["where"], "reaction")
+            relay.owner_prep("m7", "ok", None)
+            with mock.patch.object(relay, "download", return_value="/x.ogg"), \
+                    mock.patch.object(relay, "transcribe", return_value=""), mock.patch.object(relay, "send_text"):
+                self.assertIsNone(relay.owner_prep("m8", "", "audio"))  # "wait, not that file", not understood
+            self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "media")
+            with mock.patch.object(relay, "download", return_value="/x.ogg"), \
+                    mock.patch.object(relay, "transcribe", return_value="ok"):
+                relay.owner_prep("m9", "", "audio")  # a voice "ok" in the owner chat still counts
+            last = json.loads(relay.read(relay.st("owner-last.json")))
+            self.assertEqual((last["where"], last["text"]), ("", "ok"))
+        relay.threads_db("134", title="apply", state="waiting")  # "#134 ok" through the real thread_route
+        with mock.patch.object(relay, "enqueue_job", lambda k, fn, d: fn()), \
+                mock.patch.object(relay, "with_feedback", lambda c, m, o, fn: fn()), \
+                mock.patch.object(relay, "thread_run", lambda n, p: None), mock.patch.object(relay, "main_log"), \
+                mock.patch.object(relay, "quoted_text", return_value=""), mock.patch.object(relay, "resume_note", return_value=""):
+            self.assertTrue(relay.thread_route("m10", "#134 ok", None))
+        self.assertEqual(json.loads(relay.read(relay.st("owner-last.json")))["where"], "#134")
+        self.assertIn("A thread run never runs gmail_send.py or gmail_draft.py", relay.MAIL_RULES)
         self.assertIn("gmail_send.py show", relay.MAIL_RULES)
         self.assertIn("only after the owner's explicit OK on that exact draft", relay.MAIL_RULES)
 

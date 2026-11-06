@@ -1400,10 +1400,21 @@ def keep_media(path):
     return dest
 
 
+def last_owner_words(text, where):
+    """owner-last.json: what the mail gates read. where: "" owner chat, "#n" thread, "poll", "tag", "reaction",
+    "media". The gates count only where == ""."""
+    write(st("owner-last.json"), json.dumps({"time": time.time(), "where": where, "text": text}))
+
+
 def owner_prep(msg_id, text, media_type, where=""):
     """One owner message -> (prompt text, wants voice). Sends its own error and returns None.
     where: "" = the owner chat, "#n" = a message routed to thread n."""
     text, voice = text or "", False
+    # scripts/gmail_send.py / gmail_draft.py act only when the owner's LAST message is a clear OK, typed in the
+    # owner chat (where ""). So every message replaces the record first: a reaction (👎, also ✅), a voice note
+    # that is not understood or a failed download is never an OK and cancels an earlier one (review #139 N3).
+    last_owner_words("(reaction) " + text if media_type == "reaction" else "(media not understood)",
+                     "reaction" if media_type == "reaction" else "media")
     if media_type == "reaction":
         return f"{text}\n{CFG['prompts']['reaction']}", False
     if media_type:
@@ -1421,11 +1432,9 @@ def owner_prep(msg_id, text, media_type, where=""):
         else:
             path = keep_media(path)
             text = f"[{CFG['owner']['name']} sent a {media_type}: {path}]\n{text}".strip()
-    # scripts/gmail_send.py / gmail_draft.py act only when this, the owner's own words in the owner chat (not a
-    # thread note, not a poll answer), is a clear OK after the show (review #139 F3)
-    where = "poll" if text.startswith('ANSWER to "') else where
-    write(st("owner-last.json"), json.dumps({"time": time.time(), "where": where,
-                                             "text": text.removeprefix("(voice note, transcribed) ")}))
+    # Not a thread note, not a poll answer, not "#999 ok" for a thread that does not exist (review #139 F3, N4)
+    where = "poll" if text.startswith('ANSWER to "') else "tag" if not where and TAG_RE.match(text) else where
+    last_owner_words(text.removeprefix("(voice note, transcribed) "), where)
     text = quoted_text(OWNER, msg_id) + text
     return resume_note(msg_id) + text, voice or text.lower().startswith("voice")
 
@@ -3867,6 +3876,7 @@ def due_checkins():
 def setup(cfg):
     global CFG, OWNER
     CFG, OWNER = cfg, cfg["owner"]["jid"]
+    os.environ["RELAY_CONFIG"] = cfg["config_path"]  # scripts/gmail_*.py read it: never a path from argv (#139 N6)
     os.makedirs(cfg["paths"]["state_dir"], mode=0o700, exist_ok=True)
 
 
@@ -3943,6 +3953,8 @@ MAIL_RULES = (
     "subject, text) and ask; only when the owner's next message is a clear OK ('שלח', 'ok send'), run "
     "'... gmail_send.py send <draft-id>'. One draft at a time. The script refuses without that OK or when the "
     "draft changed: then show it again. Say an email went out only when the script printed SENT. "
+    "A thread run never runs gmail_send.py or gmail_draft.py (the owner's OK to a thread never opens them): "
+    "it makes the draft and gives the draft id and the files to the coordinator. "
     "To put a file (PDF, image) on a Gmail draft, make the draft with its recipients first, then run "
     f"'python3 -I {HERE}/scripts/gmail_draft.py show <draft-id> <file> ...', show the owner the recipients and "
     "files it prints and ask, naming them; only when the owner's next message is a clear OK, run '... "

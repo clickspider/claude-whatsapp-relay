@@ -4,7 +4,8 @@ given BEFORE the upload (Daniel + Instinct, 6 Nov 2026 12:25, #139). Drafts only
 
 Usage: python3 -I scripts/gmail_draft.py show   <draft-id> <file> [<file> ...]
        python3 -I scripts/gmail_draft.py attach <draft-id> <file> [<file> ...]
-The config is always gs.CONF, never an argument: a caller-picked config = a caller-written owner-last.json.
+The config is the relay's RELAY_CONFIG (gs.CONF), never an argument: a caller-picked config = a caller-written
+owner-last.json.
 
 Why a gate here too: an upload to a draft already moves the file out of the dossier, even when it is never sent,
 and "an address I mailed before" is no permission for a file. So, like gmail_send.py:
@@ -78,7 +79,9 @@ def fingerprint(did, msg, files):
 
 
 def main(argv):
-    conf = gs.CONF  # fixed: never a config path from argv (review #139 F1)
+    conf = gs.CONF  # the relay's RELAY_CONFIG, never a config path from argv (review #139 F1, N6)
+    if not conf:
+        sys.exit("NOT ATTACHED: RELAY_CONFIG is not set (run this from the relay).")
     if len(argv) < 3 or argv[0] not in ("show", "attach") or not gs.ID_RE.match(argv[1]):
         sys.exit(__doc__)
     cmd, did = argv[0], argv[1]
@@ -112,7 +115,7 @@ def main(argv):
         print("\n".join(f"{h}: {msg[h]}" for h in ("To", "Cc", "Bcc", "Subject") if msg[h]))
         print("Files to attach:")
         for p in files:
-            print(f"  {os.path.basename(p)} ({os.path.getsize(p) // 1024} KB) from {p}")
+            print(f"  {os.path.basename(p)} ({len(files[p])} bytes) from {p}")
         print(f"\nNothing is uploaded yet. Show the owner exactly these recipients and files and ask, naming them. "
               f"Attach only after the owner's next message is a clear OK: gmail_draft.py attach {did} <same files>")
         return

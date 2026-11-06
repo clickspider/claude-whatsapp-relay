@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Send ONE existing Gmail draft, only after the owner's OK on exactly that draft (rule 5 Nov 2026).
 
-Usage: python3 -I scripts/gmail_send.py show <draft-id> [relay.config.toml]
-       python3 -I scripts/gmail_send.py send <draft-id> [relay.config.toml]
+Usage: python3 -I scripts/gmail_send.py show <draft-id>
+       python3 -I scripts/gmail_send.py send <draft-id>
+The config is RELAY_CONFIG, set by the relay for the claude it starts; never an argument (review #139 F1, N6).
 
 show: prints To, Cc, Bcc, Subject, attachments and the text, and remembers this exact version (a hash of the
       whole mail). Only the newest shown draft waits for an OK. Show the owner what it prints, then ask.
 send: sends it (Gmail drafts.send) only when all of this holds, else nothing goes out:
-      1. the owner wrote after the show, at most OK_HOURS later, and that message is a short clear OK
+      1. the owner wrote after the show (the show at most OK_HOURS ago, no OK time in the future), in the owner
+         chat (not a thread, poll, reaction or media), and that message is a short clear OK
          ('שלח', 'ok send', 'כן') with no 'no', 'wait', 'but' or change in it;
       2. the draft is still exactly the version that was shown (any edit = show it again);
       3. that OK did not already send another mail: one OK = one mail.
@@ -20,7 +22,7 @@ import urllib.parse, urllib.request
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me/"
 TOKEN = "https://oauth2.googleapis.com/token"
-CONF = "~/projects/whatsapp-claude-relay/relay.config.toml"
+CONF = os.environ.get("RELAY_CONFIG", "")  # set by the relay for the claude it starts; never from argv (#139 F1, N6)
 ID_RE = re.compile(r"^r-?\d{6,25}$")  # Gmail draft ids: 'r123...' or 'r-123...'
 OK_HOURS = 2
 MAX_OK_WORDS = 8
@@ -95,9 +97,14 @@ def load(path, default):
 
 
 def save(path, data):
+    """tmp + fsync + rename: a crash or a reader never sees half a file (review #139 N7)."""
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def main(argv):
@@ -105,7 +112,9 @@ def main(argv):
         sys.exit(__doc__)
     cmd, did = argv[0], argv[1]
     if len(argv) > 2:  # review #139 F1: a config from argv = a state folder (owner-last.json) the caller wrote
-        sys.exit("NOT SENT: the config path is fixed (gmail_send.CONF); no config argument.")
+        sys.exit("NOT SENT: the config comes from the relay (RELAY_CONFIG); no config argument.")
+    if not CONF:
+        sys.exit("NOT SENT: RELAY_CONFIG is not set (run this from the relay).")
     m, here, state = conf_paths(os.path.abspath(os.path.expanduser(CONF)))
     pending_path, log_path = os.path.join(state, "mail-send", "pending.json"), os.path.join(state, "mail-send", "sent.log")  # also gmail_draft's slot
     tok = access(m, here)

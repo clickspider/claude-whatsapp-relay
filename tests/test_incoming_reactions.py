@@ -1,5 +1,5 @@
 """feedback.incoming_reactions: an emoji on a message reaches the agent. Run: python3 -m unittest discover tests"""
-import copy, os, sqlite3, sys, tempfile, unittest
+import json, copy, os, sqlite3, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import relay  # noqa: E402
@@ -138,8 +138,10 @@ class Rows(Base):
 
 class ReachesTheAgent(Base):
     def test_owner_prompt_needs_no_download(self):
-        with Patch(CFG=self.cfg, download=lambda *a: self.fail("download"), RESUMED=set()):
+        with Patch(CFG=self.cfg, download=lambda *a: self.fail("download"), RESUMED=set(),
+                   st=lambda f: os.path.join(self.dir.name, f)):
             text, voice = relay.owner_prep("r", 'REACTION ✅ to your message: "x"', "reaction")
+            self.assertEqual(json.load(open(relay.st("owner-last.json")))["where"], "reaction")  # never an OK (#139)
         self.assertIn('REACTION ✅ to your message: "x"', text)
         self.assertIn("@@SKIP", text)
         self.assertFalse(voice)

@@ -220,6 +220,18 @@ class Attach(unittest.TestCase):
         self.assertIn("not shown to the owner first", self.cmd("attach", self.pdf))
         self.assertEqual(self.puts, [])
 
+    def test_a_config_argument_is_never_read(self):
+        # review #139 F1/N2: a caller-written config could point attach_dir at "/" and state at its own OK
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        with open(os.path.join(other, "relay.config.toml"), "w") as f:
+            f.write('[paths]\nstate_dir = "."\n[mail]\nuser = "me@gmail.com"\nattach_dir = "/"\n')
+        self.assertIn("NOT ATTACHED", self.cmd("show", self.pdf, "--config", os.path.join(other, "relay.config.toml")))
+        with mock.patch.object(gs, "CONF", ""), self.assertRaises(SystemExit) as e:  # not started by the relay
+            gd.main(["show", DRAFT, self.pdf])
+        self.assertIn("RELAY_CONFIG is not set", str(e.exception))
+        self.assertEqual(self.puts, [])
+
     def test_a_thread_or_poll_ok_never_attaches(self):
         self.cmd("show", self.pdf)
         for where in ("#134", "poll", None):
