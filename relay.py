@@ -3676,8 +3676,9 @@ def restart_if_changed():
     me = os.path.abspath(__file__)
     conf = CFG.get("config_path", "")
     cm = os.path.getmtime(conf) if conf and os.path.exists(conf) else 0
+    mm = os.path.getmtime(me)  # before the check: a save during it is seen at the next tick
     CFG_MTIME.setdefault("start", cm)
-    if os.path.getmtime(me) == START_MTIME and cm == CFG_MTIME["start"]:
+    if mm == START_MTIME and cm == CFG_MTIME["start"]:
         return
     if cm != CFG_MTIME["start"]:  # 29 Oct 2026: mom's images = true was ignored until the next code change
         try:
@@ -3688,7 +3689,7 @@ def restart_if_changed():
             return
     err = load_check(me, conf)
     if err:
-        globals()["START_MTIME"] = os.path.getmtime(me)  # report once, keep running old code
+        globals()["START_MTIME"] = mm  # report once, keep running old code
         CFG_MTIME["start"] = cm  # a config that parses but fails validate: also once
         agent_note("relay", "relay.py changed but does not load, so I did NOT restart (still on the old code):\n"
                    + err[-800:])

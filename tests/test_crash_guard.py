@@ -92,7 +92,7 @@ class CrashGuard(unittest.TestCase):
             def down(s, text):
                 calls.append(text)
                 if len(calls) == 1:
-                    raise ConnectionRefusedError("bridge down")  # not sent: try again
+                    raise watchdog.urllib.error.URLError(ConnectionRefusedError(61, "refused"))  # what urlopen raises: not sent, try again
                 return "MID"
             for t in range(150, 700, 60):
                 watchdog.tick(s, t0 + t, down)

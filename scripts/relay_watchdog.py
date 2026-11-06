@@ -11,7 +11,7 @@ and <state>/watchdog-down.json; one more restart RETRY_AFTER later, without a se
 itself says "back" after its next start (only when that file exists, so only after a message) and removes
 that file. Asleep (a gap between two ticks) = no alarm; owner.night (or watchdog.night) = wait for the morning.
 Usage: relay_watchdog.py --config path/to/relay.config.toml"""
-import datetime, json, os, sqlite3, subprocess, sys, time, tomllib, urllib.request
+import datetime, http.client, json, os, sqlite3, subprocess, sys, time, tomllib, urllib.error, urllib.request
 from zoneinfo import ZoneInfo
 
 STALE = 120  # seconds without a heartbeat before the watchdog starts counting
@@ -126,9 +126,11 @@ def tick(s, now=None, sender=send, kicker=kick):
             text = s["text"].format(since=t, log=os.path.join(s["log"], "relay.log"))
             try:
                 mid, what = sender(s, text), "alerted"
-            except TimeoutError:  # the bridge may have sent it: outcome unknown, never a second message
-                mid, what = "", "alerted (outcome unknown)"
-            except Exception as e:  # not sent (bridge down): no down file, try again next tick
+            except urllib.error.URLError as e:  # never reached the bridge, or the bridge said "not sent": again next tick
+                mid, what = None, f"alert failed: {e}"
+            except (TimeoutError, ConnectionError, http.client.HTTPException):  # after the request went out: the
+                mid, what = "", "alerted (outcome unknown)"  # bridge may have sent it, never a second message
+            except Exception as e:  # not sent (no token): no down file, try again next tick
                 mid, what = None, f"alert failed: {e}"
             if mid is not None:
                 with open(down, "w") as f:
