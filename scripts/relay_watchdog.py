@@ -124,10 +124,15 @@ def tick(s, now=None, sender=send, kicker=kick):
         else:
             t = datetime.datetime.fromtimestamp(beat, ZoneInfo(s["tz"])).strftime("%H:%M")
             text = s["text"].format(since=t, log=os.path.join(s["log"], "relay.log"))
-            mid = sender(s, text)
-            with open(down, "w") as f:
-                json.dump({"since": beat, "at": now, "id": mid, "text": text}, f)
-            what = "alerted"
+            try:
+                mid, what = sender(s, text), "alerted"
+            except TimeoutError:  # the bridge may have sent it: outcome unknown, never a second message
+                mid, what = "", "alerted (outcome unknown)"
+            except Exception as e:  # not sent (bridge down): no down file, try again next tick
+                mid, what = None, f"alert failed: {e}"
+            if mid is not None:
+                with open(down, "w") as f:
+                    json.dump({"since": beat, "at": now, "id": mid, "text": text}, f)
     with open(st, "w") as f:
         json.dump({"last_tick": now, "stale_since": since, "kicks": kicks, "retried": retried, "beat": beat}, f)
     return what

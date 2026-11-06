@@ -55,6 +55,49 @@ class CrashGuard(unittest.TestCase):
         self.assertIn("did NOT restart", self.notes[0][1])
         self.assertIn("NameError", self.notes[0][1])
 
+    def test_config_that_fails_validate_is_reported_once(self):  # reviewer 6 Nov 13:45: a note every 6 s before
+        with mock.patch.object(relay, "START_MTIME", os.path.getmtime(relay.__file__)), \
+                mock.patch.dict(relay.CFG_MTIME, {"start": 0}), \
+                mock.patch.object(relay, "load_check", return_value="ValueError: owner.night must be 2 hours"), \
+                mock.patch.object(relay.os, "_exit", side_effect=AssertionError("restarted on a bad config")):
+            for _ in range(3):
+                relay.restart_if_changed()
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("ValueError", self.notes[0][1])
+
+    def test_watchdog_alert_that_times_out_is_never_sent_twice(self):  # reviewer: 21 alerts in one outage
+        with tempfile.TemporaryDirectory() as d:
+            s = {"state": d, "night": [], "tz": "UTC", "minutes": 3, "text": "down since {since}", "log": d, "label": ""}
+            hb = os.path.join(d, "heartbeat")
+            open(hb, "w").close()
+            t0, calls = os.path.getmtime(hb), []
+
+            def slow(s, text):
+                calls.append(text)
+                raise TimeoutError("timed out")  # the bridge may have sent it
+            for t in range(150, 1500, 60):
+                try:
+                    watchdog.tick(s, t0 + t, slow)
+                except TimeoutError:
+                    pass
+            self.assertEqual(len(calls), 1)
+
+    def test_watchdog_alert_that_could_not_go_out_is_tried_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = {"state": d, "night": [], "tz": "UTC", "minutes": 3, "text": "down since {since}", "log": d, "label": ""}
+            hb = os.path.join(d, "heartbeat")
+            open(hb, "w").close()
+            t0, calls = os.path.getmtime(hb), []
+
+            def down(s, text):
+                calls.append(text)
+                if len(calls) == 1:
+                    raise ConnectionRefusedError("bridge down")  # not sent: try again
+                return "MID"
+            for t in range(150, 700, 60):
+                watchdog.tick(s, t0 + t, down)
+            self.assertEqual(len(calls), 2)
+
     def test_watchdog_demo(self):
         watchdog.demo()
 

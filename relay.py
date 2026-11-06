@@ -1224,18 +1224,13 @@ def stop_runs(keys=None):
         except Exception:  # one that will not end never keeps the others running; its output is not sent
             pass
     for k, q in list(workers.items()):
-        fresh = []
-        while hit(k):
-            try:
-                job = q.get_nowait()
-            except queue.Empty:
-                break
-            if job[1] == stop_mark(k):  # queued after this /stop: new work, it stays
-                fresh.append(job)
-            else:
-                dropped += 1
-        for job in fresh:
-            q.put(job)
+        if not hit(k):
+            continue
+        with q.mutex:  # one step: a job put by another thread meanwhile waits, so kept work keeps its order
+            fresh = [job for job in q.queue if job[1] == stop_mark(k)]  # queued after this /stop: it stays
+            dropped += len(q.queue) - len(fresh)
+            q.queue.clear()
+            q.queue.extend(fresh)
     if hit("owner"):
         running = {getattr(p, "vote", None) for p in runs}
         for key, rec in votes.items():  # the snapshot: a killed run may end and drop its record meanwhile
@@ -3694,6 +3689,7 @@ def restart_if_changed():
     err = load_check(me, conf)
     if err:
         globals()["START_MTIME"] = os.path.getmtime(me)  # report once, keep running old code
+        CFG_MTIME["start"] = cm  # a config that parses but fails validate: also once
         agent_note("relay", "relay.py changed but does not load, so I did NOT restart (still on the old code):\n"
                    + err[-800:])
         return
