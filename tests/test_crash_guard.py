@@ -100,3 +100,52 @@ class WatchdogNight(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+
+
+class WatchdogHeals(unittest.TestCase):
+    """6 Nov 2026, the owner: no spam, fix it yourself. A restart first; a message only when that fails."""
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.s = {"state": self.d, "night": [], "tz": "UTC", "minutes": 3, "text": "down since {since}",
+                  "log": self.d, "label": "relay"}
+        self.hb = os.path.join(self.d, "heartbeat")
+        open(self.hb, "w").close()
+        self.t0 = os.path.getmtime(self.hb)
+        self.sent, self.kicks = [], []
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def run_to(self, *offsets):
+        return [watchdog.tick(self.s, self.t0 + t, lambda s, text: self.sent.append(text) or "M1",
+                              lambda s: self.kicks.append(t)) for t in offsets]
+
+    def test_a_restart_that_works_sends_nothing(self):
+        self.assertEqual(self.run_to(70, 130, 190, 250, 310, 370), ["ok", "stale", "stale", "stale", "restarted", "waiting"])
+        os.utime(self.hb, (self.t0 + 380, self.t0 + 380))  # the relay is back
+        self.assertEqual(self.run_to(400), ["healed"])
+        self.assertEqual(self.sent, [])
+        self.assertFalse(os.path.exists(os.path.join(self.d, "watchdog-down.json")))  # so no "back" message
+
+    def test_a_restart_that_fails_sends_one_message_and_retries_once(self):
+        whats = self.run_to(*range(70, 1600, 60))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(whats.count("restarted"), 1)
+        self.assertEqual(whats.count("retry"), 1)  # 10 min after: one more restart, no second message
+        self.assertEqual(len(self.kicks), 2)
+
+    def test_three_restarts_an_hour_then_it_only_tells(self):
+        with open(os.path.join(self.d, "watchdog.json"), "w") as f:
+            json.dump({"last_tick": self.t0, "stale_since": None,
+                       "kicks": [self.t0 - 1000, self.t0 - 800, self.t0 - 600]}, f)
+        self.run_to(*range(60, 1600, 60))
+        self.assertEqual(self.kicks, [])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_restart_that_cannot_run_still_tells(self):
+        def broken(s):
+            raise OSError("no launchctl")
+        whats = [watchdog.tick(self.s, self.t0 + t, lambda s, text: self.sent.append(text) or "M1", broken)
+                 for t in range(70, 700, 60)]
+        self.assertIn("alerted", whats)
+        self.assertEqual(len(self.sent), 1)

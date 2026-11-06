@@ -4,14 +4,20 @@
 
 launchd runs it every minute (launchd/watchdog.plist.template). The relay touches <state>/heartbeat
 about every 20 s. When the heartbeat is older than 2 minutes for [watchdog] down_minutes in a row
-(a crash loop, a hang, a job that is gone), it sends ONE message straight through the bridge and
-writes <state>/watchdog-down.json. The relay itself says "back" after its next start and removes
+(a crash loop, a hang, a job that is gone), it first restarts the relay itself (launchctl kickstart -k,
+max KICKS_PER_HOUR) and waits WAIT_AFTER_KICK for a fresh heartbeat: back = one log line, no message
+(the owner, 6 Nov 2026: no spam, fix it yourself). Still down = ONE message straight through the bridge,
+and <state>/watchdog-down.json; one more restart RETRY_AFTER later, without a second message. The relay
+itself says "back" after its next start (only when that file exists, so only after a message) and removes
 that file. Asleep (a gap between two ticks) = no alarm; owner.night (or watchdog.night) = wait for the morning.
 Usage: relay_watchdog.py --config path/to/relay.config.toml"""
-import datetime, json, os, sqlite3, sys, time, tomllib, urllib.request
+import datetime, json, os, sqlite3, subprocess, sys, time, tomllib, urllib.request
 from zoneinfo import ZoneInfo
 
 STALE = 120  # seconds without a heartbeat before the watchdog starts counting
+WAIT_AFTER_KICK = 120  # a restart gets this long to touch the heartbeat before the owner hears of it
+RETRY_AFTER = 600  # after the message: one more restart this much later, no second message
+KICKS_PER_HOUR = 3  # then it only waits (and tells the owner once)
 GAP = 180    # a gap this long between two ticks = the Mac slept: start counting again
 
 
@@ -28,7 +34,7 @@ def settings(conf):
     return {"state": path(raw.get("paths", {}).get("state_dir", "state"), base),
             "store": path(b.get("store", ""), base), "api": b.get("api", "http://127.0.0.1:8080/api"),
             "owner": o.get("jid", ""), "tz": o.get("timezone", "UTC"), "night": w.get("night", o.get("night", [])),
-            "enabled": w.get("enabled", True), "minutes": w.get("down_minutes", 3),
+            "label": raw.get("launchd", {}).get("label", ""), "enabled": w.get("enabled", True), "minutes": w.get("down_minutes", 3),
             "text": w.get("down_text", "The relay is down since {since} and does not answer. Log: {log}"),
             "log": path(raw.get("launchd", {}).get("log_dir", "~/Library/Logs/claude-whatsapp-relay"), base)}
 
@@ -65,7 +71,13 @@ def send(s, text):
         return ""
 
 
-def tick(s, now=None, sender=send):
+def kick(s):
+    """Restart the relay job (-k: also a hung one). From this separate process, never from the relay."""
+    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{s['label']}"], capture_output=True,
+                   timeout=30, check=True)
+
+
+def tick(s, now=None, sender=send, kicker=kick):
     """One check. Returns what happened (for the log and the test)."""
     now = now or time.time()
     st = os.path.join(s["state"], "watchdog.json")
@@ -85,8 +97,30 @@ def tick(s, now=None, sender=send):
     elif since is None:
         since = now
     what = "ok" if since is None else "stale"
-    if since is not None and now - since >= s["minutes"] * 60 and not os.path.exists(down):
-        if at_night(s, now):
+    kicks = [k for k in mem.get("kicks", []) if now - k < 3600]
+    last_kick = kicks[-1] if kicks else 0
+    retried = mem.get("retried", False) and since is not None
+    if since is None and mem.get("stale_since") and last_kick >= mem["stale_since"]:
+        what = "healed"  # a restart of ours brought it back: log only
+    def restart():
+        if not s["label"]:  # no relay job to restart (or a test): straight to the message
+            return False
+        try:
+            kicker(s)
+            kicks.append(now)
+            return True
+        except Exception as e:  # launchctl missing or refused: tell the owner like before
+            print(f"{time.strftime('%H:%M')} watchdog: restart failed: {e}", flush=True)
+            return False
+    if since is not None and now - since >= s["minutes"] * 60 and os.path.exists(down):
+        if not retried and now - last_kick >= RETRY_AFTER and len(kicks) < KICKS_PER_HOUR and restart():
+            retried, what = True, "retry"  # one more try after the message, no second message
+    elif since is not None and now - since >= s["minutes"] * 60:
+        if last_kick < since and len(kicks) < KICKS_PER_HOUR and restart():
+            what = "restarted"
+        elif last_kick >= since and now - last_kick < WAIT_AFTER_KICK:
+            what = "waiting"
+        elif at_night(s, now):
             what = "night"
         else:
             t = datetime.datetime.fromtimestamp(beat, ZoneInfo(s["tz"])).strftime("%H:%M")
@@ -96,7 +130,7 @@ def tick(s, now=None, sender=send):
                 json.dump({"since": beat, "at": now, "id": mid, "text": text}, f)
             what = "alerted"
     with open(st, "w") as f:
-        json.dump({"last_tick": now, "stale_since": since}, f)
+        json.dump({"last_tick": now, "stale_since": since, "kicks": kicks, "retried": retried}, f)
     return what
 
 
@@ -110,7 +144,7 @@ def main(argv):
     except OSError as e:
         print(f"{time.strftime('%H:%M')} watchdog: cannot read the bridge token: {e}", flush=True)
     what = tick(s)
-    if what != "ok":
+    if what != "ok":  # "restarted", "healed" and "retry" only here in the log, never on WhatsApp
         print(f"{time.strftime('%H:%M')} watchdog: {what}", flush=True)
     return 0
 
@@ -118,7 +152,7 @@ def main(argv):
 def demo():
     import tempfile
     with tempfile.TemporaryDirectory() as d:
-        s = {"state": d, "night": [], "tz": "UTC", "minutes": 3, "text": "down since {since}", "log": d}
+        s = {"state": d, "night": [], "tz": "UTC", "minutes": 3, "text": "down since {since}", "log": d, "label": ""}
         sent = []
         assert tick(s, 1000, None) == "no heartbeat yet"
         fake = lambda s, text: sent.append(text) or "MID1"  # noqa: E731

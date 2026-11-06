@@ -961,6 +961,53 @@ class NinthReview(unittest.TestCase):
         self.assertTrue(any("Stopped" in t for t in self.sent))
 
 
+class TenthReview(unittest.TestCase):
+    """Instinct's re-review of 232b288: a durable stopped-vote marker, and the kill scan spares newer work."""
+    setUp = ReviewFixes.setUp
+    tearDown = NinthReview.tearDown
+
+    def vote(self, v, worker, choice="Send"):
+        return EighthReview.vote(self, v, worker, choice)
+
+    def test_t1_a_crash_inside_the_stop_never_replays_a_vote(self):  # a real kill: no finally block runs
+        a = {"name": "busy30", "jid": "c30@s"}
+        relay.polls({"PV30": {"chat": relay.OWNER, "question": "send?", "kind": "draft", "agent": "busy30", "draft": "d", "done": True},
+                     "PV31": {"chat": relay.OWNER, "question": "send?", "kind": "draft", "agent": "busy30", "draft": "d", "done": True}})
+        parked = self.vote("V30", "busy30")
+        relay.parked(lambda j: j.update({relay.job_id(parked): {"rec": parked, "at": 0, "since": 0, "tries": 0}}))
+        relay.inflight("V31", self.vote("V31", "busy30"))
+        real = relay.inflight
+
+        def crash(key, rec=None):
+            if rec is None:
+                raise SystemExit("killed")  # the process dies at its first removal
+            return real(key, rec)
+        with mock.patch.object(relay, "inflight", crash):
+            with self.assertRaises(SystemExit):
+                relay.stop_runs({"owner"})
+        relay._stopped_votes.clear(), relay._inflight.clear()  # the restart: memory is gone, the disk stays
+        with mock.patch.object(relay, "by_name", return_value=("c30@s", a)), \
+                mock.patch.object(relay, "vote_job") as vj, mock.patch.object(relay, "route"):
+            relay.resume_jobs()
+            relay.resume_parked(now=time.time() + 10)
+        vj.assert_not_called()
+
+    def test_t2_the_kill_scan_spares_work_that_started_after_the_stop(self):
+        old = mock.Mock(relay_key="owner", vote=None, stops=(-1, -1))
+        new = mock.Mock(relay_key="owner", vote=None)
+        real = relay.parked
+
+        def during(change=None):  # inside the stop, after its count went up: an idle worker starts new work
+            new.stops = relay.stop_mark("owner")
+            procs.add(new)
+            return real(change)
+        procs = {old}
+        with mock.patch.object(relay, "_procs", procs), mock.patch.object(relay, "parked", during):
+            relay.stop_runs({"owner"})
+        old.terminate.assert_called_once()
+        new.terminate.assert_not_called()
+
+
 class JobDedupThreadsOff(unittest.TestCase):
     """6. the job-end dedup also holds with threads off (the default): a crash before the job file is
     removed never sends the note twice."""

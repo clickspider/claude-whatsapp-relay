@@ -1197,6 +1197,10 @@ def stop_runs(keys=None):
         send_text(OWNER, "A send is on its way: stopping right after it.")
     with _vote_lock:  # a vote send on its way ends first; after this no vote job of these sends (vote_queue)
         votes = {k: rec for k, rec in list(_inflight.items()) if own_vote(rec)}
+        votes.update({j["rec"]["vote"][0]: j["rec"] for j in parked().values()  # parked: not in _inflight
+                      if "digest" not in j["rec"] and own_vote(j["rec"])})
+        if votes:  # the durable marker first (Instinct round 10): a crash after it never replays these
+            stopped_votes(votes)
         # off the disk first, then stopped in memory (Instinct round 8): a crash in between never replays one
         for key in votes:
             inflight(key)
@@ -1208,7 +1212,11 @@ def stop_runs(keys=None):
         if key in old and hit(job_worker(rec)):
             _claimed.discard(key)
             inflight(key)
-    runs = [p for p in list(_procs) if hit(getattr(p, "relay_key", None)) or getattr(p, "vote", None) in votes]
+    # Work queued after this /stop (its count is the new one) is spared, like in the queues below (Instinct
+    # round 10): a message that reached an idle worker while the stop waited for a send still gets its answer.
+    new = lambda p: getattr(p, "stops", None) is not None and p.stops == stop_mark(getattr(p, "relay_key", None))
+    runs = [p for p in list(_procs) if getattr(p, "vote", None) in votes
+            or hit(getattr(p, "relay_key", None)) and not new(p)]
     for p in runs:
         _stopped.add(p)
         try:
@@ -1259,7 +1267,7 @@ def run_claude(args, cwd, prompt):
     p.vote = getattr(_wk, "vote", None)  # a vote job's run: an owner-chat /stop ends it too (stop_runs)
     p.preempt = getattr(_wk, "preempt", False)
     _procs.add(p)  # registered first, then checked (Instinct round 8): a /stop in between sees one or the other
-    stops = getattr(_wk, "stops", None)
+    stops = p.stops = getattr(_wk, "stops", None)  # the job's /stop count: stop_runs spares newer work
     if p.vote in _stopped_votes or (stops and stops != stop_mark(p.relay_key)):  # /stop since the job started
         _stopped.add(p)
         p.terminate()
@@ -2326,6 +2334,8 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
     choice = (choice or "").split("\n")[0].strip()
     if not rec or rec.get("done") and not resumed or rec["chat"] != chat or choice in ("", "(none)"):
         return
+    if resumed and vote_id in stopped_votes():  # a /stop stopped it before the crash or the limit
+        return
     name = rec.get("agent", "")
     jid, a = by_name(name) if name else (None, None)
     if name and not a:
@@ -2343,6 +2353,21 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
 
 
 _stopped_votes = set()  # vote ids a /stop stopped while their job waited in a queue
+
+
+def stopped_votes(add=()):
+    """Vote ids a /stop stopped, on disk (Instinct round 10): written before the stop removes anything, and
+    both recovery paths (resume_one, resume_parked) run a vote through on_vote(resumed=True), which skips
+    these. A crash anywhere in the stop then never replays the vote. Kept 7 days."""
+    try:
+        d = load_state("stopped-votes.json")
+        if add:
+            now = time.time()
+            d = {k: v for k, v in d.items() if now - v < 7 * 86400} | {k: now for k in add}
+            write(st("stopped-votes.json"), json.dumps(d))
+        return d
+    except (OSError, KeyError):  # no state folder (tests, broken setup): the memory set still holds
+        return {}
 _vote_lock = threading.Lock()  # a vote's check + send against /stop (stop_runs): no send after "Stopped"
 
 
