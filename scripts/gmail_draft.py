@@ -10,7 +10,7 @@ Files: only real files inside mail.attach_dir (relay.config.toml; no setting = n
 resolved first, at most MAX_MB together. Uses the gmail.compose token of scripts/gmail_send.py (Keychain
 mail.send_keychain_service, made by 'scripts/gmail_auth.py <config> --send'). The draft changes, so a later
 'gmail_send.py send' refuses until it is shown again: the owner always sees the version with the files."""
-import base64, json, mimetypes, os, sys, tomllib, urllib.request
+import base64, fnmatch, json, mimetypes, os, sys, tomllib, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gmail_send as gs  # noqa: E402  same config, token and draft-id rules
@@ -18,8 +18,9 @@ import gmail_send as gs  # noqa: E402  same config, token and draft-id rules
 MAX_MB = 10  # ponytail: JSON drafts.update, no resumable upload; raise it with the upload endpoint if needed
 
 
-def allowed(paths, root):
-    """Real paths of the files, or exit when one is missing, outside root, or the total is too big."""
+def allowed(paths, root, deny=()):
+    """Real paths of the files, or exit when one is missing, outside root, hidden (.git, .env, ...), matches a
+    mail.attach_deny pattern (relative to root), or the total is too big."""
     if not root:
         sys.exit("NOT ATTACHED: mail.attach_dir is not set in relay.config.toml.")
     root = os.path.realpath(os.path.expanduser(root))
@@ -28,6 +29,11 @@ def allowed(paths, root):
         real = os.path.realpath(os.path.expanduser(p))
         if os.path.commonpath([real, root]) != root:
             sys.exit(f"NOT ATTACHED: {p} is outside {root}.")
+        rel = os.path.relpath(real, root)
+        if any(part.startswith(".") for part in rel.split(os.sep)):
+            sys.exit(f"NOT ATTACHED: {p} is in a hidden folder or is a hidden file.")
+        if any(fnmatch.fnmatch(rel, pat) for pat in deny):
+            sys.exit(f"NOT ATTACHED: {p} is on the attach_deny list.")
         if not os.path.isfile(real):
             sys.exit(f"NOT ATTACHED: {p} is not a file.")
         out.append(real)
@@ -54,8 +60,10 @@ def main(argv):
     did = argv[1]
     conf = os.path.abspath(os.path.expanduser(conf))
     with open(conf, "rb") as f:
-        root = tomllib.load(f).get("mail", {}).get("attach_dir", "")
-    files = allowed(argv[2:], root and os.path.join(os.path.dirname(conf), os.path.expanduser(root)))
+        mail = tomllib.load(f).get("mail", {})
+    root = mail.get("attach_dir", "")
+    files = allowed(argv[2:], root and os.path.join(os.path.dirname(conf), os.path.expanduser(root)),
+                    mail.get("attach_deny", []))
     m, here, _ = gs.conf_paths(conf)
     tok = gs.access(m, here)
     d = gs.api(tok, f"drafts/{did}?format=raw")["message"]

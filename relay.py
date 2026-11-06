@@ -73,7 +73,7 @@ DEFAULTS = {
                 "check_hours": 6},
     "power": {"keep_awake": True},
     "mail": {"enabled": False, "user": "", "client_file": "gmail-client.json", "keychain_service": "relay-gmail-oauth",
-             "send_keychain_service": "relay-gmail-send", "attach_dir": "", "check_minutes": 5, "digest_hour": 8, "watch": {}},
+             "send_keychain_service": "relay-gmail-send", "attach_dir": "", "attach_deny": [], "check_minutes": 5, "digest_hour": 8, "watch": {}},
     "threads": {"enabled": False, "max_parallel": 3, "main_chat_chars": 10000, "auto_close_hours": 24,
                 "blocked_ask_days": 7, "blocked_close_hours": 48,
                 "digest_seconds": 120, "effort_default": "", "effort_high": "", "effort_high_words": []},

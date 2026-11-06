@@ -81,6 +81,18 @@ class Attach(unittest.TestCase):
         self.assertIn("NOT ATTACHED", self.run_cmd(self.pdf, outside))  # one bad file = nothing attached
         self.assertEqual(self.puts, [])
 
+    def test_hidden_folders_and_denied_files_are_refused(self):
+        # 6 Nov 2026 (Daniel + coordinator): never .git or other hidden folders, never the files in attach_deny
+        for rel in (".git/config", ".env", "a/.claude/settings.json", "money/pay-secret.txt", "money/x/pay-secret.txt"):
+            path = os.path.join(self.root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x")
+        self.write_conf(f'attach_dir = "{self.root}"\nattach_deny = ["money/*secret*", "**/pay-secret.txt"]\n')
+        for rel in (".git/config", ".env", "a/.claude/settings.json", "money/pay-secret.txt", "money/x/pay-secret.txt"):
+            self.assertIn("NOT ATTACHED", self.run_cmd(os.path.join(self.root, rel)), rel)
+        self.assertIn("ATTACHED to draft", self.run_cmd(self.pdf))  # a normal file still goes
+
     def test_no_attach_dir_means_nothing_attached(self):
         self.write_conf("")
         self.assertIn("attach_dir is not set", self.run_cmd(self.pdf))
