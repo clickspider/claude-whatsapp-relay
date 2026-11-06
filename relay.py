@@ -1181,8 +1181,15 @@ def stop_runs(keys=None):
     # A vote tapped in the owner chat is the owner's, also when its job waits or runs in an agent's queue (a
     # draft "Send"): plain /stop stops it there too (Instinct round 6). Its job checks _stopped_votes first.
     own_vote = lambda rec: hit("owner") and "vote" in rec and rec["vote"][1] == OWNER
-    for k in keys or ["*"]:  # before the scan of _procs: a run registered after it ends itself (run_claude)
-        _stop_n[k] += 1
+    dropped = 0
+    with owner_lock:  # one step with the owner_buf clear: owner_drain takes its batch under this lock
+        for k in keys or ["*"]:  # before the scan of _procs: a run registered after it ends itself (run_claude)
+            _stop_n[k] += 1
+        old = set(_inflight)  # what came before this /stop; a message after it is new work
+        if hit("owner"):
+            dropped += len(owner_buf)
+            owner_buf.clear()
+            owner_sched[0] = False  # its queued drain is dropped below: the next message queues a new one
     if _vote_lock.locked():  # a long bundle or a slow send: say why the "Stopped" line waits (Instinct round 8)
         send_text(OWNER, "A send is on its way: stopping right after it.")
     with _vote_lock:  # a vote send on its way ends first; after this no vote job of these sends (vote_queue)
@@ -1194,30 +1201,35 @@ def stop_runs(keys=None):
         parked(lambda jobs: [jobs.pop(k) for k, j in list(jobs.items())  # not the digest: it is thread news
                              if "digest" not in j["rec"] and (hit(job_worker(j["rec"])) or own_vote(j["rec"]))])
         _stopped_votes.update(votes)
+    for key, rec in list(_inflight.items()):  # off the disk before the kills (Instinct round 9)
+        if key in old and hit(job_worker(rec)):
+            _claimed.discard(key)
+            inflight(key)
     runs = [p for p in list(_procs) if hit(getattr(p, "relay_key", None)) or getattr(p, "vote", None) in votes]
     for p in runs:
         _stopped.add(p)
-        p.terminate()
-    dropped = 0
+        try:
+            p.terminate()
+        except Exception:  # one that will not end never keeps the others running; its output is not sent
+            pass
     for k, q in list(workers.items()):
+        fresh = []
         while hit(k):
             try:
-                q.get_nowait()
-                dropped += 1
+                job = q.get_nowait()
             except queue.Empty:
                 break
+            if job[1] == stop_mark(k):  # queued after this /stop: new work, it stays
+                fresh.append(job)
+            else:
+                dropped += 1
+        for job in fresh:
+            q.put(job)
     if hit("owner"):
-        with owner_lock:
-            dropped += len(owner_buf)
-            owner_buf.clear()
         running = {getattr(p, "vote", None) for p in runs}
         for key, rec in votes.items():  # the snapshot: a killed run may end and drop its record meanwhile
             dropped += not hit(job_worker(rec)) and key not in running  # else counted already
             _claimed.discard(key)
-    for key, rec in list(_inflight.items()):
-        if hit(job_worker(rec)):
-            _claimed.discard(key)
-            inflight(key)
     for n, t in threads_db().items():
         if t["state"] == "working" and hit(f"#{n}"):
             threads_db(n, state="blocked", last="Stopped by the owner (/stop). Reply to go on.")
@@ -2990,6 +3002,7 @@ def owner_drain():
         items = [m[:3] for m in owner_buf]
         owner_buf.clear()
         owner_sched[0] = False
+        _wk.stops = stop_mark("owner")  # these came after any /stop (it clears owner_buf in the same lock)
     try:
         limit_guard([m[0] for m in items], lambda: owner_batch(items))
     finally:  # an update kills the process before this: the batch then runs again after it
@@ -3262,9 +3275,10 @@ def enqueue(key, fn):
 
         def loop():
             while True:
-                job = q.get()
+                # the /stop count from when the job was QUEUED (Instinct round 9): a /stop after that, also
+                # one between q.get() and here, ends the job's runs
+                job, _wk.stops = q.get()
                 _wk.key = key  # run_claude tags its process with it, for '/stop'
-                _wk.stops = stop_mark(key)  # a /stop after this ends the job's runs, also one not started yet
                 busy[0] += 1
                 try:
                     job()
@@ -3283,7 +3297,7 @@ def enqueue(key, fn):
                 finally:
                     busy[0] -= 1
         threading.Thread(target=loop, daemon=True).start()
-    workers[key].put(fn)
+    workers[key].put((fn, stop_mark(key)))
 
 
 def _finish(job, done):

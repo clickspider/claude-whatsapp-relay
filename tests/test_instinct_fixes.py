@@ -82,7 +82,7 @@ class InstinctFixes(unittest.TestCase):
     def stop_setup(self):
         mine, other = mock.Mock(relay_key="owner"), mock.Mock(relay_key="#4")
         qo, q4 = queue.Queue(), queue.Queue()
-        qo.put(lambda: None), q4.put(lambda: None)
+        qo.put((lambda: None, relay.stop_mark("owner"))), q4.put((lambda: None, relay.stop_mark("#4")))  # (job, /stop count when queued)
         relay.threads_db("4", title="t", state="working", sid="s", last="")
         relay.inflight("thread-4-1", {"thread": ["4", "go"]})
         relay.inflight("m7", {"route": ["m7", relay.OWNER, "s", "plan", ""]})

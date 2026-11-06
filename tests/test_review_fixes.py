@@ -4,6 +4,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import relay  # noqa: E402
+REAL_ENQUEUE = relay.enqueue  # setUp patches it; the round 9 test needs a real worker thread
 import test_threads  # noqa: E402
 
 
@@ -882,6 +883,82 @@ class EighthReview(unittest.TestCase):
         relay._inflight["V24"] = dict(self.vote("V24", "busy24", "Send"), sending=True)
         relay.stop_runs({"owner"})
         self.assertFalse(any("busy24" in t for t in self.sent))
+
+
+class NinthReview(unittest.TestCase):
+    """Instinct's re-review of 9c70f41: ordinary runs, the stop count and the disk cleanup."""
+    setUp = ReviewFixes.setUp
+
+    def tearDown(self):
+        relay._wk.stops = None
+        relay.owner_buf.clear()
+        relay.owner_sched[0] = False
+        ReviewFixes.tearDown(self)
+
+    def test_r9_a_stop_between_take_and_start_still_ends_an_ordinary_job(self):  # with a real worker thread
+        import queue, threading
+        taken, go, done, out = threading.Event(), threading.Event(), threading.Event(), []
+        real = queue.Queue
+
+        class Q(real):
+            def get(s, *a, **k):
+                item = super().get(*a, **k)
+                taken.set(), go.wait(5)  # the /stop lands between q.get() and the job's start
+                return item
+        fake = mock.Mock()
+        fake.communicate.return_value = ("ok", "")
+        fake.returncode = 0
+
+        def job():
+            try:
+                relay.run_claude(["claude"], "/tmp", "hi")
+                out.append("ran")
+            finally:
+                done.set()
+        relay.workers.pop("w9", None)
+        with mock.patch.object(relay.subprocess, "Popen", return_value=fake), \
+                mock.patch.object(relay, "hold_if_stopping"), mock.patch.object(relay, "limit_hit", return_value=None):
+            with mock.patch.object(relay.queue, "Queue", Q):
+                REAL_ENQUEUE("w9", job)
+            self.assertTrue(taken.wait(5))
+            relay.stop_runs({"w9"})
+            go.set()
+            self.assertTrue(done.wait(5))
+            self.assertEqual(out, [])  # the stopped job never ran on
+            done.clear()
+            REAL_ENQUEUE("w9", job)  # new work after the /stop still runs
+            self.assertTrue(done.wait(5))
+        self.assertEqual(out, ["ran"])
+
+    def test_r9_the_owner_chat_answers_again_after_a_stop_drops_its_queued_batch(self):
+        relay.owner_sched[0] = True  # a batch waits in the owner queue
+        relay.stop_runs({"owner"})
+        relay.owner_add("m9", "hello?", "text")
+        self.assertIn("owner", [k for k, _ in self.jobs])
+        relay._claimed.discard("m9")
+
+    def test_r9_a_batch_taken_before_the_stop_answers_what_came_after_it(self):
+        relay.stop_runs({"owner"})
+        relay._wk.stops = (-1, -1)  # this drain was taken from the queue before the /stop
+        relay.owner_buf.append(("m10", "after the stop", "text", 0))
+        seen = []
+        with mock.patch.object(relay, "owner_batch", lambda items: seen.append(relay._wk.stops)), \
+                mock.patch.object(relay, "done_job"):
+            relay.owner_drain()
+        self.assertEqual(seen, [relay.stop_mark("owner")])  # a new baseline: its run is not ended
+
+    def test_r9_a_kill_that_fails_still_clears_the_disk(self):
+        relay.inflight("o9", {"route": ["o9", relay.OWNER, relay.OWNER, "hi", ""]})
+        p = mock.Mock(relay_key="owner", vote=None)
+        p.terminate.side_effect = OSError("no such process")
+        with mock.patch.object(relay, "_procs", {p}):
+            try:
+                relay.stop_runs({"owner"})
+            except OSError:
+                pass
+        with open(relay.st("inflight.json")) as f:
+            self.assertNotIn("o9", json.load(f))
+        self.assertTrue(any("Stopped" in t for t in self.sent))
 
 
 class JobDedupThreadsOff(unittest.TestCase):
