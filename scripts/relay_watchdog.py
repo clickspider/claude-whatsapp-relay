@@ -6,7 +6,7 @@ launchd runs it every minute (launchd/watchdog.plist.template). The relay touche
 about every 20 s. When the heartbeat is older than 2 minutes for [watchdog] down_minutes in a row
 (a crash loop, a hang, a job that is gone), it sends ONE message straight through the bridge and
 writes <state>/watchdog-down.json. The relay itself says "back" after its next start and removes
-that file. Asleep (a gap between two ticks) = no alarm; owner.night = wait for the morning.
+that file. Asleep (a gap between two ticks) = no alarm; owner.night (or watchdog.night) = wait for the morning.
 Usage: relay_watchdog.py --config path/to/relay.config.toml"""
 import datetime, json, os, sqlite3, sys, time, tomllib, urllib.request
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ def settings(conf):
     o, b, w = raw.get("owner", {}), raw.get("bridge", {}), raw.get("watchdog", {})
     return {"state": path(raw.get("paths", {}).get("state_dir", "state"), base),
             "store": path(b.get("store", ""), base), "api": b.get("api", "http://127.0.0.1:8080/api"),
-            "owner": o.get("jid", ""), "tz": o.get("timezone", "UTC"), "night": o.get("night", []),
+            "owner": o.get("jid", ""), "tz": o.get("timezone", "UTC"), "night": w.get("night", o.get("night", [])),
             "enabled": w.get("enabled", True), "minutes": w.get("down_minutes", 3),
             "text": w.get("down_text", "The relay is down since {since} and does not answer. Log: {log}"),
             "log": path(raw.get("launchd", {}).get("log_dir", "~/Library/Logs/claude-whatsapp-relay"), base)}

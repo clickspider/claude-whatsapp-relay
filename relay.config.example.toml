@@ -289,7 +289,8 @@ effort_high_words = []
 [watchdog]
 # scripts/relay_watchdog.py runs every minute (its own launchd job, installed by scripts/install-launchd.sh).
 # When the relay's heartbeat stops for down_minutes, it sends you ONE WhatsApp message through the bridge;
-# the relay says "back" after its next start. Plain code, no AI. owner.night = it waits for the morning.
+# the relay says "back" after its next start. Plain code, no AI. owner.night = it waits for the morning;
+# night = [] here alerts at once, also at night.
 enabled = true
 down_minutes = 3
 down_text = "The relay is down since {since} and does not answer. Log: {log}"

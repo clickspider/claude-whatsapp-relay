@@ -84,3 +84,19 @@ class CrashGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchdogNight(unittest.TestCase):
+    def test_watchdog_night_overrides_the_owner_night(self):  # 6 Nov 2026: the owner wants the alarm at night too
+        d = tempfile.mkdtemp()
+        try:
+            conf = os.path.join(d, "c.toml")
+            with open(conf, "w") as f:
+                f.write("[owner]\nnight = [23, 8]\n[watchdog]\nnight = []\n")
+            self.assertEqual(watchdog.settings(conf)["night"], [])
+            with open(conf, "w") as f:
+                f.write("[owner]\nnight = [23, 8]\n")
+            self.assertEqual(watchdog.settings(conf)["night"], [23, 8])
+        finally:
+            shutil.rmtree(d)
+
