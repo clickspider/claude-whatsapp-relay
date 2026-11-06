@@ -88,9 +88,8 @@ def tick(s, now=None, sender=send, kicker=kick):
     except (OSError, ValueError):
         mem = {}
     hb = os.path.join(s["state"], "heartbeat")
-    if not os.path.exists(hb):
-        return "no heartbeat yet"  # a relay older than the watchdog, or never started: nothing to judge
-    beat = os.path.getmtime(hb)
+    # fail closed: no heartbeat file (never written, or gone) ages from the last beat seen, else from now
+    beat = os.path.getmtime(hb) if os.path.exists(hb) else mem.get("beat", now)
     since = mem.get("stale_since")
     if now - mem.get("last_tick", 0) > GAP or now - beat < STALE:
         since = None
@@ -130,7 +129,7 @@ def tick(s, now=None, sender=send, kicker=kick):
                 json.dump({"since": beat, "at": now, "id": mid, "text": text}, f)
             what = "alerted"
     with open(st, "w") as f:
-        json.dump({"last_tick": now, "stale_since": since, "kicks": kicks, "retried": retried}, f)
+        json.dump({"last_tick": now, "stale_since": since, "kicks": kicks, "retried": retried, "beat": beat}, f)
     return what
 
 
@@ -154,7 +153,14 @@ def demo():
     with tempfile.TemporaryDirectory() as d:
         s = {"state": d, "night": [], "tz": "UTC", "minutes": 3, "text": "down since {since}", "log": d, "label": ""}
         sent = []
-        assert tick(s, 1000, None) == "no heartbeat yet"
+        assert tick(s, 1000, None) == "ok"                  # no heartbeat file yet: the clock starts now
+        nohb = lambda s, text: sent.append(text) or "MID0"  # noqa: E731
+        for t in range(1060, 1500, 60):
+            tick(s, t, nohb)
+        assert len(sent) == 1, "a heartbeat that never comes is down, not fine"
+        sent.clear()
+        os.remove(os.path.join(d, "watchdog-down.json"))
+        os.remove(os.path.join(d, "watchdog.json"))
         fake = lambda s, text: sent.append(text) or "MID1"  # noqa: E731
         hb = os.path.join(d, "heartbeat")
         open(hb, "w").close()
