@@ -101,6 +101,22 @@ class ContactGate(unittest.TestCase):
                 relay.os.stat = real
         self.assertEqual(open(self.conf).read(), before + "\n# hand edit\n")
         self.assertEqual([x for x in os.listdir(self.tmp.name) if x.startswith(".contact-")], [])  # temp gone
+        with self.patch():  # N2: a note written after the block stops the add; N3: a too long note is not shown
+            with open(os.path.join(inbox, "2-late.md"), "w") as f:
+                f.write("late")
+            self.assertIn("inbox notes changed", relay.contact_gate_add(rec))
+            with open(os.path.join(inbox, "3-long.md"), "w") as f:
+                f.write("A" * 1501)
+            relay.contact_gate_ask(LINE)
+            self.assertIn("longer than", self.notes[-1])
+            os.remove(os.path.join(inbox, "3-long.md"))
+            os.remove(os.path.join(inbox, "2-late.md"))
+            self.calls.clear()
+            relay.contact_gate_ask(LINE)  # P1 again, then a second poll P2 for the same contact (N4)
+            relay.on_vote("V1", "o@s.whatsapp.net", "o", "P1", "Add")
+            relay.polls({"P2": dict(relay.polls()["P1"], poll_id="P2", done=False, adding=False)})
+            relay.on_vote("V2", "o@s.whatsapp.net", "o", "P2", "Add")
+            self.assertIn("bob is already in the config.", self.sent[-1])
         hand = write_cfg(self.tmp.name, '[[agent]]\nname = "stop"\njid = "972501234567@s.whatsapp.net"')
         self.assertTrue(any("'stop'" in e for e in relay.validate(relay.load_config(hand))[0]))  # hand edit too
 

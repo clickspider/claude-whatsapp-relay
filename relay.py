@@ -2566,11 +2566,12 @@ def contact_gate_ask(line):
     err += check_contact(f, CFG)
     if err:
         return agent_note("relay", f"@@CONTACT not proposed ({line[:80]}): " + "; ".join(err))
-    block = contact_block(f, note)
-    inbox = os.path.join(CFG["paths"]["agents_dir"], f["name"], "inbox")
-    waiting = sorted(x for x in os.listdir(inbox) if x.endswith(".md")) if f["inbox"] and os.path.isdir(inbox) else []
-    first = "".join(f"\n\n{x} (goes to {f['name']} right after Add, no draft step):\n{read(os.path.join(inbox, x))[:1500]}"
-                    for x in waiting)
+    block, notes = contact_block(f, note), contact_inbox(f)
+    if any(len(t) > CONTACT_NOTE_MAX for _, t in notes):  # shown whole or not at all (review #154 N3)
+        return agent_note("relay", f"@@CONTACT not proposed: an inbox note of {f['name']} is longer than "
+                                   f"{CONTACT_NOTE_MAX} characters, so the owner could not see all of it")
+    first = "".join(f"\n\nInbox note {x}: {f['name']}'s helper writes its first message from it, right after "
+                    f"Add, with no draft step:\n{t}" for x, t in notes)
     send_text(OWNER, f"New contact agent for relay.config.toml:\n\n{block}{first}")
     question = f"Add contact {f['name']} (+{f['jid'].split('@')[0]})?"
     try:
@@ -2581,7 +2582,18 @@ def contact_gate_ask(line):
     if not mid:
         return send_text(OWNER, "(could not make the poll, so nothing will be added. Ask me again.)")
     polls({mid: {"kind": "contactgate", "chat": OWNER, "question": question, "contact": f, "note": note,
-                 "time": time.time()}})
+                 "time": time.time(), "poll_id": mid, "inbox": digest(json.dumps(notes))}})
+
+
+CONTACT_NOTE_MAX = 1500
+
+
+def contact_inbox(f):
+    """[(file, text)] of the notes the new agent sends right after the Add (deliver_inbox has no draft step)."""
+    inbox = os.path.join(CFG["paths"]["agents_dir"], f["name"], "inbox")
+    if not f.get("inbox") or not os.path.isdir(inbox):
+        return []
+    return [(x, read(os.path.join(inbox, x))) for x in sorted(os.listdir(inbox)) if x.endswith(".md")]
 
 
 def contact_gate_add(rec):
@@ -2598,10 +2610,13 @@ def contact_gate_add(rec):
         except Exception as e:
             return f"relay.config.toml does not load now, so nothing was added: {e}"
         if any(a["name"] == f.get("name") and a["jid"] == f.get("jid") for a in agents(cur)):
-            return ""  # a vote resumed after the restart the add itself caused: the owner was told (F4)
+            mine = (polls().get(rec.get("poll_id")) or {}).get("adding")
+            return "" if mine else f"{f['name']} is already in the config."  # "": resumed after its own add (F4)
         err = check_contact(f, cur)
         if err:
             return "Nothing was added: " + "; ".join(err)
+        if digest(json.dumps(contact_inbox(f))) != rec.get("inbox"):  # review #154 N2
+            return "Nothing was added: the waiting inbox notes changed after you saw them. Ask me again."
         if validate(cur)[0]:  # fail closed, and say why (review #154 F10)
             return "Nothing was added: relay.config.toml has errors already. Run: python3 relay.py check"
         with open(conf, encoding="utf-8") as h:
@@ -2628,7 +2643,12 @@ def contact_gate_add(rec):
             os.remove(tmp)  # a hand edit came in meanwhile: never overwrite it (review #154 F3)
             return "Nothing was added: relay.config.toml changed just now. Ask me again."
         shutil.copymode(conf, tmp)
-        shutil.copy2(conf, conf + ".bak")  # the config before the last contact add (review #154 F5)
+        bfd, bak = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".contact-", suffix=".bak")
+        os.close(bfd)
+        shutil.copy2(conf, bak)
+        os.replace(bak, conf + ".bak")  # the config before the last contact add (review #154 F5, N1)
+        if rec.get("poll_id"):
+            polls({rec["poll_id"]: dict(polls().get(rec["poll_id"]) or rec, adding=True)})  # before the replace
         os.replace(tmp, conf)
     return contact_added_text(f["name"])
 
