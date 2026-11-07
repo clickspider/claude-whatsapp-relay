@@ -31,6 +31,7 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")  # claude --effort; "" = the
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 JID_RE = re.compile(r"^\d{5,25}@(s\.whatsapp\.net|g\.us|lid)$")
 NAME_RE = re.compile(r"^[a-z]+$")  # owner commands are /<name>
+RESERVED_NAMES = ("new", "stop", "publish", "threads")  # owner command words: an agent of that name hides them
 UNTRUSTED_OPEN, UNTRUSTED_CLOSE = "<<<UNTRUSTED", "UNTRUSTED>>>"
 
 DEFAULTS = {
@@ -224,8 +225,8 @@ def validate(cfg):
     names = set()
     for a in agents(cfg):
         n = a["name"]
-        if not NAME_RE.match(n) or n in ("new",) or n.startswith("as"):
-            err.append(f"agent name '{n}' must be lowercase letters only, not 'new', not starting with 'as'.")
+        if not NAME_RE.match(n) or n in RESERVED_NAMES or n.startswith("as"):
+            err.append(f"agent name '{n}' must be lowercase letters only, not {RESERVED_NAMES}, not starting with 'as'.")
         if n in names:
             err.append(f"agent name '{n}' is used twice.")
         names.add(n)
@@ -1590,7 +1591,10 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
     send_tail(tail, track)
     mail_gate_ask()  # a mail the turn showed: its summary, files and poll come after the answer
     for c in contacts:
-        contact_gate_ask(c)
+        try:
+            contact_gate_ask(c)
+        except Exception as e:
+            agent_note("relay", f"@@CONTACT failed ({c[:80]}): {e}")
 
 
 def send_tail(tail, track=None, start=0):
@@ -2507,8 +2511,8 @@ def check_contact(f, cfg):
     Run again at the vote on the stored fields: the poll record is never trusted as text."""
     err = [f"'{k}' is not allowed" for k in f if k not in CONTACT_KEYS]
     n, jid = str(f.get("name", "")), str(f.get("jid", ""))
-    if not NAME_RE.match(n) or n == "new" or n.startswith("as"):
-        err.append(f"name '{n}' must be lowercase letters only, not 'new', not starting with 'as'")
+    if not NAME_RE.match(n) or n in RESERVED_NAMES or n.startswith("as"):
+        err.append(f"name '{n}' must be lowercase letters only, not {RESERVED_NAMES}, not starting with 'as'")
     elif any(a["name"] == n for a in agents(cfg)):
         err.append(f"an agent '{n}' already exists")
     if not CONTACT_JID_RE.match(jid):
@@ -2563,7 +2567,11 @@ def contact_gate_ask(line):
     if err:
         return agent_note("relay", f"@@CONTACT not proposed ({line[:80]}): " + "; ".join(err))
     block = contact_block(f, note)
-    send_text(OWNER, f"New contact agent for relay.config.toml:\n\n{block}")
+    inbox = os.path.join(CFG["paths"]["agents_dir"], f["name"], "inbox")
+    waiting = sorted(x for x in os.listdir(inbox) if x.endswith(".md")) if f["inbox"] and os.path.isdir(inbox) else []
+    first = "".join(f"\n\n{x} (goes to {f['name']} right after Add, no draft step):\n{read(os.path.join(inbox, x))[:1500]}"
+                    for x in waiting)
+    send_text(OWNER, f"New contact agent for relay.config.toml:\n\n{block}{first}")
     question = f"Add contact {f['name']} (+{f['jid'].split('@')[0]})?"
     try:
         mid = api("poll", {"recipient": OWNER, "question": question, "options": [CONTACT_ADD, CONTACT_NO],
@@ -2590,15 +2598,20 @@ def contact_gate_add(rec):
         except Exception as e:
             return f"relay.config.toml does not load now, so nothing was added: {e}"
         if any(a["name"] == f.get("name") and a["jid"] == f.get("jid") for a in agents(cur)):
-            return f"{f['name']} is already in the config."  # a resumed vote after the add went through
+            return ""  # a vote resumed after the restart the add itself caused: the owner was told (F4)
         err = check_contact(f, cur)
         if err:
             return "Nothing was added: " + "; ".join(err)
+        if validate(cur)[0]:  # fail closed, and say why (review #154 F10)
+            return "Nothing was added: relay.config.toml has errors already. Run: python3 relay.py check"
         with open(conf, encoding="utf-8") as h:
+            seen = os.fstat(h.fileno())
             text = h.read()
-        tmp = conf + ".contact-new"
-        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as h:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".contact-", suffix=".toml")  # O_EXCL, 0600
+        with os.fdopen(fd, "w", encoding="utf-8") as h:
             h.write(text.rstrip("\n") + "\n\n" + contact_block(f, note))
+            h.flush()
+            os.fsync(h.fileno())
         try:
             new = load_config(tmp)
             err = validate(new)[0]
@@ -2609,10 +2622,20 @@ def contact_gate_add(rec):
             err = [str(e)]
         if err:
             os.remove(tmp)
-            return "Nothing was added, the new config would not load: " + "; ".join(err)
+            return "Nothing was added, the new config would fail its check: " + "; ".join(err)
+        now = os.stat(conf)
+        if (now.st_ino, now.st_mtime_ns, now.st_size) != (seen.st_ino, seen.st_mtime_ns, seen.st_size):
+            os.remove(tmp)  # a hand edit came in meanwhile: never overwrite it (review #154 F3)
+            return "Nothing was added: relay.config.toml changed just now. Ask me again."
         shutil.copymode(conf, tmp)
+        shutil.copy2(conf, conf + ".bak")  # the config before the last contact add (review #154 F5)
         os.replace(tmp, conf)
-    return f"Added {f['name']}. The relay restarts in a few seconds, then {f['name']} is live."
+    return contact_added_text(f["name"])
+
+
+def contact_added_text(name):
+    return (f"Added {name}. The relay restarts in a few seconds, then {name} is live." if CFG["danger"]["self_edit"]
+            else f"Added {name}. Restart the relay, then {name} is live.")
 
 
 def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
@@ -2696,8 +2719,9 @@ def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
         return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}", None)
     if rec["kind"] == "contactgate":  # on_vote checked: our poll, in the owner chat, acts once
         msg = contact_gate_add(rec) if choice == CONTACT_ADD else "OK, not added."
-        send_text(OWNER, msg)
-        return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}. Relay: {msg}", None)
+        if msg:
+            send_text(OWNER, msg)
+        return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}. Relay: {msg or 'added'}", None)
     if rec["kind"] == "draft":
         draft = flag(a, "pending")
         if not draft or digest(draft) != rec["draft"]:

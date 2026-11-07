@@ -47,7 +47,8 @@ class ContactGate(unittest.TestCase):
             self.assertEqual(relay.validate(cfg)[0], [])
             self.assertIn("Added bob", self.sent[1])
             self.assertIn("closed", self.sent[2])
-            self.assertIn("is already in the config", relay.contact_gate_add(relay.polls()["P1"]))  # resumed vote
+            self.assertEqual(relay.contact_gate_add(relay.polls()["P1"]), "")  # resumed vote: no 2nd message
+            self.assertTrue(os.path.isfile(self.conf + ".bak"))
 
     def test_no_vote_bad_keys_tamper_and_old_add_nothing(self):
         before = open(self.conf).read()
@@ -68,6 +69,40 @@ class ContactGate(unittest.TestCase):
             self.assertNotIn("\u202e", evil)
         self.assertEqual(open(self.conf).read(), before)
         self.assertIn("OK, not added.", self.sent)
+
+    def test_reserved_names_inbox_shown_stored_fields_rechecked_and_hand_edit_wins(self):
+        os.makedirs(os.path.join(self.tmp.name, "agents", "stop"))
+        open(os.path.join(self.tmp.name, "agents", "stop", "RULES.md"), "w").close()
+        inbox = os.path.join(self.tmp.name, "agents", "bob", "inbox")
+        os.makedirs(inbox)
+        with open(os.path.join(inbox, "1-hi.md"), "w") as f:
+            f.write("SAY HELLO TO BOB")
+        before = open(self.conf).read()
+        with self.patch():
+            relay.contact_gate_ask("stop | 972501234567")  # would hide /stop (review #154 F1)
+            self.assertEqual((len(self.notes), self.calls), (1, []))
+            relay.contact_gate_ask(LINE)
+            self.assertIn("SAY HELLO TO BOB", self.sent[-1])  # the first message is seen before the vote (F2)
+            rec = dict(relay.polls()["P1"])
+            for k, v in (("trust", "auto"), ("trigger", "mention:x"), ("timezone", "../../etc"), ("live", "yes"),
+                         ("max_context_tokens", 10 ** 9), ("jid", "1@g.us")):
+                self.assertIn("Nothing was added", relay.contact_gate_add(dict(rec, contact=dict(rec["contact"], **{k: v}))))
+            real = os.stat
+            def bump(path, *a, **kw):  # a hand edit lands between the read and the replace (F3)
+                if path == os.path.realpath(self.conf):
+                    with open(self.conf, "a") as h:
+                        h.write("\n# hand edit\n")
+                    relay.os.stat = real
+                return real(path, *a, **kw)
+            relay.os.stat = bump
+            try:
+                self.assertIn("changed just now", relay.contact_gate_add(rec))
+            finally:
+                relay.os.stat = real
+        self.assertEqual(open(self.conf).read(), before + "\n# hand edit\n")
+        self.assertEqual([x for x in os.listdir(self.tmp.name) if x.startswith(".contact-")], [])  # temp gone
+        hand = write_cfg(self.tmp.name, '[[agent]]\nname = "stop"\njid = "972501234567@s.whatsapp.net"')
+        self.assertTrue(any("'stop'" in e for e in relay.validate(relay.load_config(hand))[0]))  # hand edit too
 
 
 if __name__ == "__main__":
