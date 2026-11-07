@@ -2408,8 +2408,10 @@ def mail_gate_sweep():
         p = load_state(MAIL_GATE)
         if p.get("status") != "asking":
             return
-        write(st(MAIL_GATE), json.dumps(dict(p, status="cut")))
     send_text(OWNER, "(a mail approval was cut by a restart: nothing will be sent. Ask me to show it again.)")
+    with mail_gate_lock():  # after the line: a failed line stays "asking" and is told at the next start
+        if load_state(MAIL_GATE).get("time") == p.get("time"):
+            write(st(MAIL_GATE), json.dumps(dict(p, status="cut")))
 
 
 def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
@@ -4455,8 +4457,11 @@ def main_loop():
         last = c.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
     tick, grace = 0, CFG["limits"]["history_grace_seconds"]
     cutoff = time.time() - grace if grace else 0
-    try:
+    try:  # its own try: a bridge not up yet must never skip resume_jobs (that loses inflight.json)
         mail_gate_sweep()
+    except Exception as e:
+        print(f"mail gate sweep failed: {e}", flush=True)
+    try:
         resume_jobs()
     except Exception as e:
         print(f"resume failed: {e}", flush=True)

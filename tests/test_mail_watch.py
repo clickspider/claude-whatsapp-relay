@@ -180,7 +180,9 @@ class MailWatch(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertIn("grant_type=refresh_token", seen[0])
         relay._mail["token"] = ("", 0.0)
-        no = mock.Mock(side_effect=urllib.error.HTTPError("u", 400, "Bad Request", {}, None))
+        bad = urllib.error.HTTPError("u", 400, "Bad Request", {}, None)
+        self.addCleanup(bad.close)  # else its temp body warns at a random later GC (ResourceWarning in another test)
+        no = mock.Mock(side_effect=bad)
         with mock.patch.object(relay.urllib.request, "urlopen", no), self.assertRaises(RuntimeError) as e:
             relay.mail_access("R")
         self.assertIn("gmail_auth.py", str(e.exception))

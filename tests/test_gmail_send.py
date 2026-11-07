@@ -404,7 +404,8 @@ class RelaySide(unittest.TestCase):
 
     def test_the_start_up_sweeps_before_it_resumes(self):  # review P1-2: the sweep must run at all
         import inspect
-        self.assertIn("mail_gate_sweep()\n        resume_jobs()", inspect.getsource(relay.main_loop))
+        src = inspect.getsource(relay.main_loop)
+        self.assertLess(src.index("mail_gate_sweep()"), src.index("resume_jobs()"))
 
     def test_an_untick_takes_the_send_back(self):  # review P1-3: "(none)" counts as a change too
         self.show()
