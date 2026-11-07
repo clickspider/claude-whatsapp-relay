@@ -27,17 +27,21 @@ class Attach(unittest.TestCase):
             f.write(b"%PDF-1.7 fake")
         self.conf = os.path.join(self.tmp, "relay.config.toml")
         self.write_conf(f'attach_dir = "{self.root}"\n')
-        self.raw, self.puts, self.drop_on_save = MAIL.encode(), [], False
+        self.raw, self.puts, self.drop_on_save, self.msgid = MAIL.encode(), [], False, "m1"
+        self.before_put = lambda: None
 
         def api(tok, path, body=None):
             self.assertIsNone(body)  # GET only: never drafts/send
-            self.assertEqual(path, f"drafts/{DRAFT}?format=raw")
-            return {"id": DRAFT, "message": {"raw": b64(self.raw), "threadId": "t1"}}
+            self.assertIn(path, (f"drafts/{DRAFT}?format=raw", f"drafts/{DRAFT}?format=minimal"))
+            if path.endswith("minimal"):
+                self.before_put()
+            return {"id": DRAFT, "message": {"id": self.msgid, "raw": b64(self.raw), "threadId": "t1"}}
 
         def put(tok, did, body):
             self.puts.append(body)
             if not self.drop_on_save:
                 self.raw = base64.urlsafe_b64decode(body["message"]["raw"])
+                self.msgid += "+"
             return {"id": did}
         for p in (mock.patch.object(gs, "access", return_value="tok"), mock.patch.object(gs, "api", api),
                   mock.patch.object(gd, "put", put)):
@@ -308,3 +312,29 @@ class Attach(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewF6(Attach):
+    """Review F6: a Gmail web edit after the show, or between the read and the save, is never overwritten."""
+    def test_an_edit_in_gmail_after_the_show_needs_a_new_show(self):
+        self.cmd("show", self.pdf)
+        self.approve()
+        self.msgid = "m2"  # he edited the draft in Gmail
+        out = self.cmd("attach", self.pdf)
+        self.assertIn("changed in Gmail after the show", out)
+        self.assertEqual(self.puts, [])
+
+    def test_an_edit_in_gmail_just_before_the_save_is_kept(self):
+        self.cmd("show", self.pdf)
+        self.approve()
+        self.before_put = lambda: setattr(self, "msgid", "m3")
+        out = self.cmd("attach", self.pdf)
+        self.assertIn("changed in Gmail just now", out)
+        self.assertEqual(self.puts, [])
+
+    def test_a_long_text_says_it_was_cut(self):  # short round P2-4
+        self.raw = MAIL.replace("Hi, see the file.", "x" * 2000).encode()
+        self.cmd("show", self.pdf)
+        p = gs.load(os.path.join(self.tmp, "mail-send", "pending.json"), {})
+        self.assertIn("(... cut: the rest is in the draft)", p["summary"])
+        self.assertNotIn("cut:", gd.cut("short"))

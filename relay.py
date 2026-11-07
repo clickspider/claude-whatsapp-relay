@@ -1614,7 +1614,7 @@ def send_owner_file(path, root=None):
     root = os.path.realpath(os.path.expanduser(root or CFG["owner"]["folder"]))
     p = os.path.realpath(os.path.join(root, os.path.expanduser(path.strip().strip("'\""))))
     if not (p.startswith(root + os.sep) and os.path.isfile(p)):
-        send_text(OWNER, f"(file not sent: {path} is not a file in {CFG['owner']['folder']})")
+        send_text(OWNER, f"(file not sent: {path} is not a file in {root})")  # the folder really checked (P2-4)
         return False
     # unique folder, not a name prefix: WhatsApp shows the file name as is
     out = os.path.join(CFG["bridge"]["outbox"], uuid.uuid4().hex[:8], os.path.basename(p))
@@ -2394,12 +2394,23 @@ def mail_gate_vote(poll_id, choice):
 
 
 def mail_gate_retract(poll_id):
+    """His tap changed away from Send. The line he gets says what really happened (review short round P2-4)."""
     with mail_gate_lock():
         p = load_state(MAIL_GATE)
-        if p.get("poll") != poll_id or p.get("used"):
-            return False
+        if p.get("poll") != poll_id:
+            return "That poll is no longer open: a newer mail took its place. Nothing changed."
+        if p.get("used"):
+            return "Too late to change: that mail was already being sent."
         write(st(MAIL_GATE), json.dumps(dict(p, vote={"poll": poll_id, "choice": MAIL_NO, "time": time.time()})))
-        return True
+        return "Changed: not sent."
+
+
+def mail_gate_reopen_tried(poll_id):
+    """A Send tap after he took it back never reopens it (fail closed), but he is told (review short round P2-4)."""
+    with mail_gate_lock():
+        p = load_state(MAIL_GATE)
+    if p.get("poll") == poll_id and (p.get("vote") or {}).get("choice") == MAIL_NO and not p.get("used"):
+        send_text(OWNER, "That vote is closed: nothing will be sent. Ask me to show the mail again.")
 
 
 def mail_gate_sweep():
@@ -2419,10 +2430,10 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
     resumed = run again after a restart (resume_one): the poll is already done, the vote is not handled yet."""
     rec = polls().get(poll_id)
     choice = (choice or "").split("\n")[0].strip()
-    if rec and rec.get("kind") == "mailgate" and rec.get("done") and not resumed and rec["chat"] == chat \
-            and choice != MAIL_SEND:  # he changed his tap to Don't send (or took it back): that wins until used
-        return send_text(OWNER, "Changed: not sent." if mail_gate_retract(poll_id) else
-                         "Too late to change: that mail was already handled.")
+    if rec and rec.get("kind") == "mailgate" and rec.get("done") and not resumed and rec["chat"] == chat:
+        if choice != MAIL_SEND:  # he changed his tap to Don't send (or took it back): that wins until used
+            return send_text(OWNER, mail_gate_retract(poll_id))
+        return mail_gate_reopen_tried(poll_id)
     if not rec or rec.get("done") and not resumed or rec["chat"] != chat or choice in ("", "(none)"):
         return
     if resumed and vote_id in stopped_votes():  # a /stop stopped it before the crash or the limit

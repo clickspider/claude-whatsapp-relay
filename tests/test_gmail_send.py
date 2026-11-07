@@ -218,6 +218,40 @@ class Describe(unittest.TestCase):
             self.assertEqual(f.read(), b"%PDF one")
 
 
+class ShortRoundP2(unittest.TestCase):
+    """Reviewer short round 6 Nov, P2-2/P2-3/P2-4 (gmail_send side)."""
+    def test_a_forwarded_mail_is_saved_whole(self):  # P2-2: was a 0-byte .eml
+        from email.message import EmailMessage
+        inner = EmailMessage()
+        inner["Subject"] = "the old mail"
+        inner.set_content("inner text")
+        m = EmailMessage()
+        m["To"] = "a@example.nl"
+        m.set_content("see below")
+        m.add_attachment(inner, filename="fwd.eml")
+        msg = gs.email.message_from_bytes(m.as_bytes(), policy=gs.email.policy.default)
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        [path] = gs.save_files(msg, folder)
+        with open(path, "rb") as f:
+            data = f.read()
+        self.assertIn(b"inner text", data)
+        self.assertIn(b"the old mail", data)
+
+    def test_html_entities_do_not_make_a_second_version(self):  # P2-3
+        out = Describe.mail(None, "Tom's offer & more.", "<p>Tom&#39;s offer &amp; more.</p>")
+        self.assertNotIn("HTML version", gs.describe(out))
+
+    def test_a_new_show_removes_the_old_copies(self):  # P2-4
+        t = SendGate("test_no_vote_means_no_send")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        old = os.path.join(t.tmp, "mail-send", "files", "oldhash", "0")
+        os.makedirs(old)
+        open(os.path.join(old, "x.pdf"), "w").close()
+        t.run_cmd("show")
+        self.assertFalse(os.path.exists(os.path.dirname(old)))  # this draft has no files, so nothing new
+
+
 class RelaySide(unittest.TestCase):
     """relay.mail_gate_ask / mail_gate_vote / vote_job: the relay, not Claude, asks and records the tap."""
     def setUp(self):
@@ -280,6 +314,7 @@ class RelaySide(unittest.TestCase):
         relay.on_vote("v3", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)  # back to Send never opens it again
         self.assertEqual(gs.load(self.path, {})["vote"]["choice"], gs.NO)
         self.assertEqual(len(self.added), 1)
+        self.assertEqual(self.texts[-1], "That vote is closed: nothing will be sent. Ask me to show the mail again.")
 
     def test_one_tap_is_written_once(self):
         self.show()
@@ -400,7 +435,7 @@ class RelaySide(unittest.TestCase):
         relay.mail_gate_ask()  # P2 for the new mail
         relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)
         self.assertNotIn("vote", gs.load(self.path, {}))
-        self.assertEqual(self.texts[-1], "Too late to change: that mail was already handled.")
+        self.assertEqual(self.texts[-1], "That poll is no longer open: a newer mail took its place. Nothing changed.")
 
     def test_the_start_up_sweeps_before_it_resumes(self):  # review P1-2: the sweep must run at all
         import inspect
@@ -420,7 +455,7 @@ class RelaySide(unittest.TestCase):
         relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
         gs.save(self.path, dict(gs.load(self.path, {}), used=True))
         relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)
-        self.assertEqual(self.texts[-1], "Too late to change: that mail was already handled.")
+        self.assertEqual(self.texts[-1], "Too late to change: that mail was already being sent.")
         self.assertEqual(gs.load(self.path, {})["vote"]["choice"], gs.SEND)
 
     def test_an_old_show_gets_no_poll(self):  # review P2-7
@@ -430,6 +465,28 @@ class RelaySide(unittest.TestCase):
         self.assertEqual(self.polls_sent, [])
         self.assertIn("waited too long", self.texts[-1])
         self.assertEqual(relay.MAIL_OK_HOURS, gs.OK_HOURS)
+
+    def test_a_resumed_dont_send_reaches_the_coordinator_not_the_retract(self):  # short round M2
+        self.show()
+        relay.mail_gate_ask()
+        relay.polls({"P1": dict(relay.polls()["P1"], done=True)})  # done on disk, then the relay died
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO, resumed=True)
+        self.assertEqual([a[1] for a in self.added], [f'ANSWER to "{relay.polls()["P1"]["question"]}": {relay.MAIL_NO}'])
+        self.assertNotIn("Changed: not sent.", self.texts)
+
+    def test_a_change_from_another_chat_never_retracts(self):  # short round M3
+        self.show()
+        relay.mail_gate_ask()
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        n = len(self.texts)
+        relay.on_vote("v2", "123@g.us", "123", "P1", relay.MAIL_NO)
+        self.assertEqual(gs.load(self.path, {})["vote"]["choice"], gs.SEND)
+        self.assertEqual(len(self.texts), n)
+
+    def test_a_refused_file_names_the_folder_really_checked(self):  # short round P2-4
+        other = os.path.realpath(self.enterContext(tempfile.TemporaryDirectory()))
+        self.assertFalse(ORIG_SEND_OWNER_FILE("nope.pdf", root=other))
+        self.assertEqual(self.texts[-1], f"(file not sent: nope.pdf is not a file in {other})")
 
     def test_the_coordinator_is_told_how(self):
         for want in ("gmail_send.py show", "gmail_draft.py show", "A typed 'ok' never sends",

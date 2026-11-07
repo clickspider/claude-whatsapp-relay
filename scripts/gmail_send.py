@@ -17,7 +17,8 @@ send: sends it (Gmail drafts.send) only when the slot is this draft, the draft i
 Access: a separate gmail.compose refresh token in the Keychain (mail.send_keychain_service, made by
 'scripts/gmail_auth.py <config> --send'); the mail watch keeps its read-only token. This script never deletes,
 archives, labels or marks mail."""
-import base64, contextlib, email, email.policy, fcntl, hashlib, json, os, re, subprocess, sys, time, tomllib
+import base64, contextlib, email, email.policy, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib
+from html import unescape
 import urllib.parse, urllib.request
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me/"
@@ -81,7 +82,8 @@ def describe(msg):
 
 
 def strip_html(t):
-    return re.sub(r"<[^>]+>", " ", t)
+    """Tags out, entities decoded (review short round P2-3: '&#39;' kept the plain and html parts apart)."""
+    return unescape(re.sub(r"<[^>]+>", " ", t))
 
 
 def squash(t):
@@ -95,8 +97,11 @@ def save_files(msg, folder):
         name = os.path.basename(part.get_filename()).lstrip(".") or "file"
         path = os.path.join(folder, str(i), name)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        # review short round P2-2: a forwarded mail (message/rfc822) has no decoded payload; save the mail itself
+        data = (part.get_payload(0).as_bytes() if part.get_content_type() == "message/rfc822"
+                else part.get_payload(decode=True) or b"")
         with open(path, "wb") as f:
-            f.write(part.get_payload(decode=True) or b"")
+            f.write(data)
         out.append(path)
     return out
 
@@ -167,7 +172,11 @@ def main(argv):
     h, msg = draft(tok, did)
     if cmd == "show":
         text = describe(msg)
-        files = save_files(msg, os.path.join(state, "mail-send", "files", h))  # = relay MAIL_FILES
+        files_dir = os.path.join(state, "mail-send", "files")  # = relay MAIL_FILES
+        for old in os.listdir(files_dir) if os.path.isdir(files_dir) else ():  # one slot: older copies are void
+            if old != h:  # review short round P2-4: copies never cleaned
+                shutil.rmtree(os.path.join(files_dir, old), ignore_errors=True)
+        files = save_files(msg, os.path.join(files_dir, h))
         request(pending_path, {"kind": "send", "draft": did, "hash": h, "subject": str(msg["Subject"] or ""),
                                "files": files, "summary": "Mail to send:\n" + text})
         print(text)

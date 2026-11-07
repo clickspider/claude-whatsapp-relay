@@ -68,6 +68,11 @@ def pages(data):
     return f", {n} page{'s' if n != 1 else ''}" if n else ""
 
 
+def cut(t, n=1500):
+    """The first n characters, with a mark when there was more (review short round P2-4)."""
+    return t[:n] + ("\n(... cut: the rest is in the draft)" if len(t) > n else "")
+
+
 def recipients(msg):
     """Sorted, lower-case addresses in To, Cc and Bcc."""
     return sorted({a.lower() for _, a in email.utils.getaddresses(
@@ -120,7 +125,8 @@ def main(argv):
         gs.request(pending_path, {"kind": "attach", "draft": did, "key": key, "subject": str(msg["Subject"] or ""),
                                   "files": list(files),
                                   "summary": f"Files to put on this draft (nothing is uploaded yet):\n{head}\n" + "\n".join(lines)
-                                             + "\n\nThe mail text now:\n" + gs.describe(msg).split("\n\n", 1)[-1][:1500]})
+                                             + "\n\nThe mail text now:\n" + cut(gs.describe(msg).split("\n\n", 1)[-1]),
+                                  "msgid": d.get("id")})  # review F6: Gmail gives every saved edit a new id
         print(head + "\nFiles to attach:\n" + "\n".join(f"{q} from {p}" for q, p in zip(lines, files)))
         print(f"\nNothing is uploaded. After your reply the relay sends the owner these recipients, the files "
               f"themselves and a '{gs.SEND} / {gs.NO}' poll. Do not ask in text. A typed 'ok' never attaches. Only "
@@ -129,7 +135,9 @@ def main(argv):
     with gs.slot_lock(pending_path):
         p = gs.load(pending_path, {})
         why = ("these files were not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "attach" else
-               "the recipients or files changed after the show: run show again" if p.get("key") != key else gs.vote_ok(p))
+               "the recipients or files changed after the show: run show again" if p.get("key") != key else
+               "the draft changed in Gmail after the show: run show again" if p.get("msgid") != d.get("id") else
+               gs.vote_ok(p))
         if why:
             sys.exit(f"NOT ATTACHED: {why}.")
         gs.save(pending_path, dict(p, used=True))  # before the upload: one vote can never upload twice
@@ -144,6 +152,12 @@ def main(argv):
     line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "draft": did, "to": recipients(msg),
             "files": list(files), "poll": p["poll"]}
     os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
+    # review F6: the PUT writes the whole mail as read above; a Gmail edit since then would be lost. Check
+    # once more right before it (the gap left is the seconds of this call; the API has no if-match).
+    if gs.api(tok, f"drafts/{did}?format=minimal")["message"].get("id") != d.get("id"):
+        with open(log_path, "a") as f:
+            f.write(json.dumps(dict(line, outcome="NOT ATTACHED: draft changed in Gmail"), ensure_ascii=False) + "\n")
+        sys.exit("NOT ATTACHED: the draft changed in Gmail just now. Nothing was uploaded: run show again.")
     try:
         new_id = put(tok, did, body).get("id", did)
     except Exception as e:  # a timeout can come after Gmail saved it: never say ATTACHED, never retry here
