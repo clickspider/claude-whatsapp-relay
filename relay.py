@@ -1564,6 +1564,7 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
     answer, drafts = take_drafts(answer)
     answer, asks = take_asks(answer)
     answer = take_watchmail(answer)
+    answer, contacts = take_contacts(answer)
     files = re.findall(r"^\s*@@FILE\s*:?\s*(.+?)\s*$", answer, re.M)
     answer = re.sub(r"^\s*@@FILE\s*:?.*$\n?", "", answer, flags=re.M).strip()
     tail = [["ask", q, opts] for q, opts in asks] + [["file", f] for f in files]
@@ -1588,6 +1589,8 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
         _digest["sent"] = True  # the body is out: an error after this never repeats the digest
     send_tail(tail, track)
     mail_gate_ask()  # a mail the turn showed: its summary, files and poll come after the answer
+    for c in contacts:
+        contact_gate_ask(c)
 
 
 def send_tail(tail, track=None, start=0):
@@ -1656,6 +1659,15 @@ COORDINATOR_RULES = (
     "as '🔔 <agent>' entries: handle them yourself (for example with an inbox note to that agent) "
     "and tell the owner only what the owner must know or decide. Finished work the owner asked for is "
     "something they must know: one short line when it is done, never @@SKIP.")
+CONTACT_RULES = (
+    "\nCONTACTS: to add a contact agent (a new person the relay talks to), never edit relay.config.toml. "
+    "First write {agents}/<name>/RULES.md (and an inbox note if it starts the chat). Then add one line "
+    "'@@CONTACT: <name> | <phone with country code> | key=value | ... | note=<who, one line>'. Keys: live, "
+    "use_owner_voice, status_marks, quiet_hours, inbox (true/false), trust (reply/draft), trigger (all/listen), "
+    "timezone, max_context_tokens, self_per_day, turns_per_day, trial_hours. Defaults: live, trust=reply, "
+    "trigger=all, the owner's voice, no status marks, inbox on. The relay shows the owner the block and an "
+    "'Add / Don't add' poll; only that vote adds it, and the relay restarts by itself. Do not ask in text "
+    "too. A thread that needs a contact writes the RULES.md and gives you the @@CONTACT line.")
 THREAD_RULES = (
     "\nTHREAD: you work on ONE thread (#{n}: {title}) of the owner's project. Other sessions handle "
     "the main chat and the other threads. Work until the task is done or you need the owner. Reply "
@@ -1917,6 +1929,7 @@ def auto_effort(*texts):
 def coordinator_rules(cfg):
     words = cfg["threads"]["effort_high_words"]
     return COORDINATOR_RULES.replace("{high}", f" (for example: {', '.join(words)})" if words else "") + \
+        CONTACT_RULES.replace("{agents}", cfg["paths"]["agents_dir"]) + \
         (MAIL_RULES if cfg["mail"]["enabled"] else "")
 
 
@@ -2445,6 +2458,163 @@ def mail_gate_sweep():
             write(st(MAIL_GATE), json.dumps(dict(p, status="cut")))
 
 
+# ---------- contact gate (#154, owner 7 Nov 2026 15:32: "add contacts yourself, with my OK in the chat") ----------
+# The config is closed to every claude run (audit H2: an edit = code execution). This is the one narrow way in:
+# the coordinator writes '@@CONTACT: ...', the relay shows the exact block + an Add / Don't add poll, and only the
+# owner's vote makes the RELAY (not a run) append it. Only the keys below exist; no tools, MCP, paths or homes.
+
+CONTACT_RE = re.compile(r"^\s*@@CONTACT\s*:?\s*(.*)$")
+CONTACT_ADD, CONTACT_NO = "Add", "Don't add"
+CONTACT_OK_HOURS = 2  # an older proposal is never added: propose it again
+CONTACT_JID_RE = re.compile(r"^[1-9]\d{7,14}@s\.whatsapp\.net$")  # one person; groups stay a hand edit
+CONTACT_TZ_RE = re.compile(r"^[A-Za-z]+(/[A-Za-z0-9_+-]+){0,2}$")
+CONTACT_BOOL = ("live", "use_owner_voice", "status_marks", "quiet_hours", "inbox")
+CONTACT_INT = {"max_context_tokens": (10_000, 200_000), "self_per_day": (0, 50), "turns_per_day": (0, 200),
+               "trial_hours": (0, 720)}
+CONTACT_BASE = {"live": True, "trust": "reply", "trigger": "all", "use_owner_voice": True, "status_marks": False,
+                "inbox": True, "max_context_tokens": 100_000}
+CONTACT_KEYS = ("name", "jid", "live", "trust", "trigger", "use_owner_voice", "status_marks", "timezone",
+                "quiet_hours", "inbox") + tuple(CONTACT_INT)
+
+
+def parse_contact(line):
+    """'<name> | <phone with country code> | key=value | ... | note=<who>' -> (fields, note, errors)."""
+    parts = [p.strip() for p in (line or "").split("|")]
+    f, note, err = dict(CONTACT_BASE), "", []
+    if len(parts) < 2:
+        return f, note, ["give at least '<name> | <phone>'"]
+    f["name"] = parts[0].lower()
+    num = re.sub(r"[\s+()-]", "", parts[1])
+    f["jid"] = num if "@" in num else num + "@s.whatsapp.net"
+    for p in parts[2:]:
+        k, eq, v = (x.strip() for x in p.partition("="))
+        k = k.lower()
+        if k == "note" and eq:
+            note = v
+        elif k in CONTACT_BOOL and v.lower() in ("true", "false"):
+            f[k] = v.lower() == "true"
+        elif k in CONTACT_INT and re.fullmatch(r"\d{1,6}", v):
+            f[k] = int(v)
+        elif k in ("trust", "trigger", "timezone") and eq:
+            f[k] = v
+        elif p:
+            err.append(f"'{p}' is not allowed (keys: {', '.join(CONTACT_KEYS[2:])}, note)")
+    return f, note, err
+
+
+def check_contact(f, cfg):
+    """Every rule a proposed contact must pass, against cfg (the config as it is on disk). [] = fine.
+    Run again at the vote on the stored fields: the poll record is never trusted as text."""
+    err = [f"'{k}' is not allowed" for k in f if k not in CONTACT_KEYS]
+    n, jid = str(f.get("name", "")), str(f.get("jid", ""))
+    if not NAME_RE.match(n) or n == "new" or n.startswith("as"):
+        err.append(f"name '{n}' must be lowercase letters only, not 'new', not starting with 'as'")
+    elif any(a["name"] == n for a in agents(cfg)):
+        err.append(f"an agent '{n}' already exists")
+    if not CONTACT_JID_RE.match(jid):
+        err.append(f"'{jid}' is not a phone number with country code (e.g. 972501234567)")
+    elif jid == cfg["owner"]["jid"] or any(a["jid"] == jid for a in agents(cfg)):
+        err.append(f"{jid} is already the owner or an agent")
+    if f.get("trust") not in ("reply", "draft"):
+        err.append("trust must be reply or draft")
+    if f.get("trigger") not in ("all", "listen"):
+        err.append("trigger must be all or listen")
+    for k in CONTACT_BOOL:
+        if k in f and not isinstance(f[k], bool):
+            err.append(f"{k} must be true or false")
+    for k, (lo, hi) in CONTACT_INT.items():
+        if k in f and (not isinstance(f[k], int) or isinstance(f[k], bool) or not lo <= f[k] <= hi):
+            err.append(f"{k} must be a whole number {lo}-{hi}")
+    if "timezone" in f:
+        try:
+            if not CONTACT_TZ_RE.match(str(f["timezone"])):
+                raise ValueError
+            ZoneInfo(f["timezone"])
+        except (ZoneInfoNotFoundError, ValueError):
+            err.append(f"timezone '{f['timezone']}' is not a valid name (e.g. Asia/Jerusalem)")
+    if NAME_RE.match(n) and not os.path.isfile(os.path.join(cfg["paths"]["agents_dir"], n, "RULES.md")):
+        err.append(f"write {os.path.join(cfg['paths']['agents_dir'], n, 'RULES.md')} first")
+    return err
+
+
+def contact_block(f, note):
+    """The TOML lines, made only from checked values (strings are regex-checked, then JSON-quoted)."""
+    val = lambda v: ("true" if v else "false") if isinstance(v, bool) else str(v) if isinstance(v, int) else json.dumps(v)
+    note = "".join(c for c in str(note or "") if c.isprintable())[:120]  # here, not at parse: the poll record is a file
+    head = f"# {note + ', ' if note else ''}added {owner_now():%d %b %Y %H:%M} on {CFG['owner']['name']}'s vote (contact gate)"
+    return "\n".join([head, "[[agent]]"] + [f"{k} = {val(f[k])}" for k in CONTACT_KEYS if k in f]) + "\n"
+
+
+def take_contacts(text):
+    """'@@CONTACT: ...' lines -> (rest of the text, [line]). Handled after the answer (contact_gate_ask)."""
+    keep, found = [], []
+    for line in (text or "").splitlines():
+        m = CONTACT_RE.match(line)
+        (found.append(m.group(1)) if m else keep.append(line))
+    return "\n".join(keep).strip(), found
+
+
+def contact_gate_ask(line):
+    """One proposal -> the exact block + an Add / Don't add poll to the owner. A bad one: a note to the
+    coordinator, nothing to the owner. No poll = nothing can be added.
+    ponytail: a crash between the block and the poll loses the poll; the coordinator proposes it again."""
+    f, note, err = parse_contact(line)
+    err += check_contact(f, CFG)
+    if err:
+        return agent_note("relay", f"@@CONTACT not proposed ({line[:80]}): " + "; ".join(err))
+    block = contact_block(f, note)
+    send_text(OWNER, f"New contact agent for relay.config.toml:\n\n{block}")
+    question = f"Add contact {f['name']} (+{f['jid'].split('@')[0]})?"
+    try:
+        mid = api("poll", {"recipient": OWNER, "question": question, "options": [CONTACT_ADD, CONTACT_NO],
+                           "selectable_count": 1}).get("message_id")
+    except Exception:
+        mid = None
+    if not mid:
+        return send_text(OWNER, "(could not make the poll, so nothing will be added. Ask me again.)")
+    polls({mid: {"kind": "contactgate", "chat": OWNER, "question": question, "contact": f, "note": note,
+                 "time": time.time()}})
+
+
+def contact_gate_add(rec):
+    """The owner voted Add -> check again on the config as it is on disk, append, load + validate the result
+    as a copy, and only then replace the config. The relay sees the new mtime and restarts by itself."""
+    f, note = rec.get("contact") or {}, rec.get("note", "")
+    if time.time() - rec.get("time", 0) > CONTACT_OK_HOURS * 3600:
+        return f"That proposal is older than {CONTACT_OK_HOURS} hours, so nothing was added. Ask me again."
+    conf = os.path.realpath(CFG["config_path"])
+    with open(os.open(st("contact-gate.lock"), os.O_WRONLY | os.O_CREAT, 0o600)) as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            cur = load_config(conf)
+        except Exception as e:
+            return f"relay.config.toml does not load now, so nothing was added: {e}"
+        if any(a["name"] == f.get("name") and a["jid"] == f.get("jid") for a in agents(cur)):
+            return f"{f['name']} is already in the config."  # a resumed vote after the add went through
+        err = check_contact(f, cur)
+        if err:
+            return "Nothing was added: " + "; ".join(err)
+        with open(conf, encoding="utf-8") as h:
+            text = h.read()
+        tmp = conf + ".contact-new"
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as h:
+            h.write(text.rstrip("\n") + "\n\n" + contact_block(f, note))
+        try:
+            new = load_config(tmp)
+            err = validate(new)[0]
+            added = [a for a in agents(new) if a["name"] == f["name"]]
+            if len(agents(new)) != len(agents(cur)) + 1 or len(added) != 1 or added[0]["jid"] != f["jid"]:
+                err.append("the new config does not hold exactly this one new agent")
+        except Exception as e:
+            err = [str(e)]
+        if err:
+            os.remove(tmp)
+            return "Nothing was added, the new config would not load: " + "; ".join(err)
+        shutil.copymode(conf, tmp)
+        os.replace(tmp, conf)
+    return f"Added {f['name']}. The relay restarts in a few seconds, then {f['name']} is live."
+
+
 def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
     """A vote on one of our polls. Only the chat the poll went to counts; each poll acts once.
     resumed = run again after a restart (resume_one): the poll is already done, the vote is not handled yet."""
@@ -2454,6 +2624,8 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
         if choice != MAIL_SEND:  # he changed his tap to Don't send (or took it back): that wins until used
             return send_text(OWNER, mail_gate_retract(poll_id))
         return mail_gate_reopen_tried(poll_id)
+    if rec and rec.get("kind") == "contactgate" and rec.get("done") and not resumed and rec["chat"] == chat:
+        return send_text(OWNER, "That contact poll is closed: a new tap changes nothing. Ask me if it must change.")
     if not rec or rec.get("done") and not resumed or rec["chat"] != chat or choice in ("", "(none)"):
         return
     if resumed and vote_id in stopped_votes():  # a /stop stopped it before the crash or the limit
@@ -2522,6 +2694,10 @@ def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
         if choice != MAIL_SEND:
             send_text(OWNER, "OK, not sent.")
         return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}", None)
+    if rec["kind"] == "contactgate":  # on_vote checked: our poll, in the owner chat, acts once
+        msg = contact_gate_add(rec) if choice == CONTACT_ADD else "OK, not added."
+        send_text(OWNER, msg)
+        return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}. Relay: {msg}", None)
     if rec["kind"] == "draft":
         draft = flag(a, "pending")
         if not draft or digest(draft) != rec["draft"]:
