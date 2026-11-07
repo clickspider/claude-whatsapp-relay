@@ -136,6 +136,7 @@ def main(argv):
         p = gs.load(pending_path, {})
         why = ("these files were not shown to the owner first (run show)" if p.get("draft") != did or p.get("kind") != "attach" else
                "the recipients or files changed after the show: run show again" if p.get("key") != key else
+               "this show is from an older version of this script: run show again" if "msgid" not in p else
                "the draft changed in Gmail after the show: run show again" if p.get("msgid") != d.get("id") else
                gs.vote_ok(p))
         if why:
@@ -154,10 +155,15 @@ def main(argv):
     os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
     # review F6: the PUT writes the whole mail as read above; a Gmail edit since then would be lost. Check
     # once more right before it (the gap left is the seconds of this call; the API has no if-match).
-    if gs.api(tok, f"drafts/{did}?format=minimal")["message"].get("id") != d.get("id"):
+    try:
+        why = ("the draft changed in Gmail just now" if
+               gs.api(tok, f"drafts/{did}?format=minimal")["message"].get("id") != d.get("id") else "")
+    except Exception as e:  # review #148 N7: logged too, never silent
+        why = f"the check before the upload failed ({e})"
+    if why:
         with open(log_path, "a") as f:
-            f.write(json.dumps(dict(line, outcome="NOT ATTACHED: draft changed in Gmail"), ensure_ascii=False) + "\n")
-        sys.exit("NOT ATTACHED: the draft changed in Gmail just now. Nothing was uploaded: run show again.")
+            f.write(json.dumps(dict(line, outcome=f"NOT ATTACHED: {why}"), ensure_ascii=False) + "\n")
+        sys.exit(f"NOT ATTACHED: {why}. Nothing was uploaded: run show again.")
     try:
         new_id = put(tok, did, body).get("id", did)
     except Exception as e:  # a timeout can come after Gmail saved it: never say ATTACHED, never retry here

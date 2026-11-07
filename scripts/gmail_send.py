@@ -17,7 +17,7 @@ send: sends it (Gmail drafts.send) only when the slot is this draft, the draft i
 Access: a separate gmail.compose refresh token in the Keychain (mail.send_keychain_service, made by
 'scripts/gmail_auth.py <config> --send'); the mail watch keeps its read-only token. This script never deletes,
 archives, labels or marks mail."""
-import base64, contextlib, email, email.policy, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib
+import base64, contextlib, quopri, email, email.policy, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib
 from html import unescape
 import urllib.parse, urllib.request
 
@@ -98,8 +98,12 @@ def save_files(msg, folder):
         path = os.path.join(folder, str(i), name)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         # review short round P2-2: a forwarded mail (message/rfc822) has no decoded payload; save the mail itself
-        data = (part.get_payload(0).as_bytes() if part.get_content_type() == "message/rfc822"
-                else part.get_payload(decode=True) or b"")
+        inner = part.get_payload() if part.get_content_type() == "message/rfc822" else None
+        cte = str(part.get("Content-Transfer-Encoding", "")).strip().lower()
+        data = (part.get_payload(decode=True) or b"" if not (isinstance(inner, list) and inner) else
+                base64.b64decode(inner[0].get_payload()) if cte == "base64" else  # review #148 N6: the parser keeps
+                quopri.decodestring(inner[0].get_payload().encode()) if cte == "quoted-printable" else  # it encoded
+                inner[0].as_bytes())
         with open(path, "wb") as f:
             f.write(data)
         out.append(path)
@@ -173,6 +177,8 @@ def main(argv):
     if cmd == "show":
         text = describe(msg)
         files_dir = os.path.join(state, "mail-send", "files")  # = relay MAIL_FILES
+        if os.path.islink(files_dir):  # review #148 N5: never clean (or write) through a planted link
+            sys.exit("NOT SHOWN: mail-send/files is a link, not a folder. Nothing changed.")
         for old in os.listdir(files_dir) if os.path.isdir(files_dir) else ():  # one slot: older copies are void
             if old != h:  # review short round P2-4: copies never cleaned
                 shutil.rmtree(os.path.join(files_dir, old), ignore_errors=True)

@@ -2326,7 +2326,7 @@ def ask(chat, question, options, **record):
 
 
 MAIL_GATE = "mail-send/pending.json"  # the one waiting slot of scripts/gmail_send.py and gmail_draft.py
-MAIL_FILES = "mail-send/files"  # gmail_send.py show copies a draft's attachments here, so the owner gets them too
+MAIL_COPIES = "mail-send/files"  # gmail_send.py show copies a draft's attachments here, so the owner gets them too
 MAIL_OK_HOURS = 2  # = gmail_send.OK_HOURS: an older show gets no poll
 
 
@@ -2354,7 +2354,7 @@ def mail_gate_ask():
     if old:
         return send_text(OWNER, "(a mail approval waited too long: nothing will be sent. Ask me to show it again.)")
     send_text(OWNER, p.get("summary") or "(a mail waits for approval)")
-    root = st(MAIL_FILES) if p.get("kind") == "send" else None  # a send: the draft's own files, copied by show
+    root = st(MAIL_COPIES) if p.get("kind") == "send" else None  # a send: the draft's own files, copied by show
     if not all(send_owner_file(f, root) for f in p.get("files") or []):  # decision 14:27: the files BEFORE the poll
         return mail_gate_failed(p, "(a file did not reach you, so there is no poll: nothing will be sent. Ask me to show it again.)")
     question = (f"{'Attach these files' if p.get('kind') == 'attach' else 'Send this mail'}? "
@@ -2397,12 +2397,32 @@ def mail_gate_retract(poll_id):
     """His tap changed away from Send. The line he gets says what really happened (review short round P2-4)."""
     with mail_gate_lock():
         p = load_state(MAIL_GATE)
-        if p.get("poll") != poll_id:
-            return "That poll is no longer open: a newer mail took its place. Nothing changed."
-        if p.get("used"):
-            return "Too late to change: that mail was already being sent."
+        if p.get("poll") != poll_id:  # review #148 N3: say what happened to that old mail, if we know it
+            done = mail_gate_done(poll_id)
+            return (f"That poll is closed: that mail was already {done}; that cannot be taken back." if done else
+                    "That poll is closed: a newer mail replaced it. Your tap changes nothing.")
+        if p.get("used"):  # review #148 N2: an attach never sends
+            return ("Too late to change: the files were already being put on the draft. Nothing was sent."
+                    if p.get("kind") == "attach" else "Too late to change: that mail was already being sent.")
         write(st(MAIL_GATE), json.dumps(dict(p, vote={"poll": poll_id, "choice": MAIL_NO, "time": time.time()})))
         return "Changed: not sent."
+
+
+def mail_gate_done(poll_id):
+    """'sent' / 'given its files' when the gate logs show that poll's action went through, else ''."""
+    for log, word in (("mail-send/sent.log", "sent"), ("mail-attach/attach.log", "given its files")):
+        try:
+            with open(st(log), encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("poll") == poll_id and (word == "sent" and r.get("message") or r.get("outcome") == "ATTACHED"):
+                        return word
+        except OSError:
+            pass
+    return ""
 
 
 def mail_gate_reopen_tried(poll_id):

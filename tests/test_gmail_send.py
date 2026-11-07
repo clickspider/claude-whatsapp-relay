@@ -237,6 +237,27 @@ class ShortRoundP2(unittest.TestCase):
         self.assertIn(b"inner text", data)
         self.assertIn(b"the old mail", data)
 
+    def test_a_base64_forwarded_mail_is_saved_decoded(self):  # review #148 N6
+        raw = (b"To: a@example.nl\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\n"
+               b"Content-Type: text/plain\r\n\r\nsee below\r\n--B\r\nContent-Type: message/rfc822\r\n"
+               b"Content-Disposition: attachment; filename=fwd.eml\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+               + base64.encodebytes(b"Subject: the old mail\r\n\r\ninner text\r\n") + b"--B--\r\n")
+        msg = gs.email.message_from_bytes(raw, policy=gs.email.policy.default)
+        [path] = gs.save_files(msg, self.enterContext(tempfile.TemporaryDirectory()))
+        with open(path, "rb") as f:
+            self.assertIn(b"inner text", f.read())
+
+    def test_a_linked_files_folder_is_never_cleaned(self):  # review #148 N5
+        t = SendGate("test_no_vote_means_no_send")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        victim = os.path.join(t.tmp, "victim", "keep")
+        os.makedirs(victim)
+        os.makedirs(os.path.join(t.tmp, "mail-send"))
+        os.symlink(os.path.join(t.tmp, "victim"), os.path.join(t.tmp, "mail-send", "files"))
+        self.assertIn("is a link", t.run_cmd("show"))
+        self.assertTrue(os.path.isdir(victim))
+
     def test_html_entities_do_not_make_a_second_version(self):  # P2-3
         out = Describe.mail(None, "Tom's offer & more.", "<p>Tom&#39;s offer &amp; more.</p>")
         self.assertNotIn("HTML version", gs.describe(out))
@@ -386,7 +407,7 @@ class RelaySide(unittest.TestCase):
         roots = []
         with mock.patch.object(relay, "send_owner_file", lambda f, root=None: roots.append(root) or True):
             relay.mail_gate_ask()
-        self.assertEqual(roots, [relay.st(relay.MAIL_FILES)])
+        self.assertEqual(roots, [relay.st("mail-send/files")])  # the literal: review #148 N1 (MAIL_FILES was redefined)
         roots.clear()
         self.show()
         with mock.patch.object(relay, "send_owner_file", lambda f, root=None: roots.append(root) or True):
@@ -426,6 +447,7 @@ class RelaySide(unittest.TestCase):
         relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
         self.assertEqual(gs.vote_ok(gs.load(self.path, {})), "")
         self.assertNotIn("Changed: not sent.", self.texts)
+        self.assertFalse(any("vote is closed" in t for t in self.texts))  # review #148 N4
 
     def test_a_change_on_an_old_poll_never_touches_the_new_mail(self):  # review P1-3
         self.show()
@@ -435,7 +457,36 @@ class RelaySide(unittest.TestCase):
         relay.mail_gate_ask()  # P2 for the new mail
         relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)
         self.assertNotIn("vote", gs.load(self.path, {}))
-        self.assertEqual(self.texts[-1], "That poll is no longer open: a newer mail took its place. Nothing changed.")
+        self.assertEqual(self.texts[-1], "That poll is closed: a newer mail replaced it. Your tap changes nothing.")
+
+    def test_a_change_on_an_old_poll_says_the_old_mail_went(self):  # review #148 N3
+        self.show(kind="send")
+        relay.mail_gate_ask()
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        os.makedirs(os.path.dirname(relay.st("mail-send/sent.log")), exist_ok=True)
+        with open(relay.st("mail-send/sent.log"), "a") as f:
+            f.write(json.dumps({"poll": "P1", "message": "m1"}) + "\n")
+        self.show(draft="r1234567")
+        relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)
+        self.assertEqual(self.texts[-1], "That poll is closed: that mail was already sent; that cannot be taken back.")
+
+    def test_a_late_change_on_an_attach_never_says_sent(self):  # review #148 N2
+        self.show()
+        relay.mail_gate_ask()
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        gs.save(self.path, dict(gs.load(self.path, {}), used=True))
+        relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)
+        self.assertEqual(self.texts[-1], "Too late to change: the files were already being put on the draft. Nothing was sent.")
+
+    def test_send_again_on_a_replaced_poll_is_silent(self):  # review #148 N4
+        self.show()
+        relay.mail_gate_ask()
+        relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        relay.on_vote("v2", relay.OWNER, relay.OWNER, "P1", relay.MAIL_NO)
+        self.show(draft="r1234567")
+        n = len(self.texts)
+        relay.on_vote("v3", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
+        self.assertEqual(len(self.texts), n)
 
     def test_the_start_up_sweeps_before_it_resumes(self):  # review P1-2: the sweep must run at all
         import inspect
@@ -450,7 +501,7 @@ class RelaySide(unittest.TestCase):
         self.assertEqual(gs.load(self.path, {})["vote"]["choice"], gs.NO)
 
     def test_a_change_after_the_mail_went_is_too_late(self):  # review P1-3
-        self.show()
+        self.show(kind="send")
         relay.mail_gate_ask()
         relay.on_vote("v1", relay.OWNER, relay.OWNER, "P1", relay.MAIL_SEND)
         gs.save(self.path, dict(gs.load(self.path, {}), used=True))

@@ -310,9 +310,6 @@ class Attach(unittest.TestCase):
         self.assertIn("CHECK FAILED", self.run_cmd(self.pdf))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class ReviewF6(Attach):
     """Review F6: a Gmail web edit after the show, or between the read and the save, is never overwritten."""
@@ -332,9 +329,34 @@ class ReviewF6(Attach):
         self.assertIn("changed in Gmail just now", out)
         self.assertEqual(self.puts, [])
 
+    def test_a_failed_check_before_the_save_is_logged(self):  # review #148 N7
+        self.cmd("show", self.pdf)
+        self.approve()
+        def boom():
+            raise OSError("net down")
+        self.before_put = boom
+        out = self.cmd("attach", self.pdf)
+        self.assertIn("check before the upload failed", out)
+        self.assertEqual(self.puts, [])
+        with open(os.path.join(self.tmp, "mail-attach", "attach.log")) as f:
+            self.assertIn("NOT ATTACHED", f.read())
+
+    def test_a_show_from_before_this_version_needs_a_new_show(self):  # review #148 N7
+        self.cmd("show", self.pdf)
+        path = os.path.join(self.tmp, "mail-send", "pending.json")
+        p = gs.load(path, {})
+        del p["msgid"]
+        gs.save(path, p)
+        self.approve()
+        self.assertIn("older version", self.cmd("attach", self.pdf))
+
     def test_a_long_text_says_it_was_cut(self):  # short round P2-4
         self.raw = MAIL.replace("Hi, see the file.", "x" * 2000).encode()
         self.cmd("show", self.pdf)
         p = gs.load(os.path.join(self.tmp, "mail-send", "pending.json"), {})
         self.assertIn("(... cut: the rest is in the draft)", p["summary"])
         self.assertNotIn("cut:", gd.cut("short"))
+
+
+if __name__ == "__main__":
+    unittest.main()
