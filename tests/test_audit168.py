@@ -88,6 +88,30 @@ class AgentWriteDenies(unittest.TestCase):
             deny = perms(relay.agent_args(cfg, relay.agents(cfg)[0], "s", True))
             self.assertIn(f"Write(/{ra}/link/**)", deny)
 
+    def test_linked_write_also_stays_writable(self):  # review R2-2
+        with tempfile.TemporaryDirectory() as tmp:
+            ra = os.path.join(tmp, "w")
+            os.makedirs(os.path.join(ra, "other"))
+            os.makedirs(os.path.join(tmp, "real-research"))
+            os.symlink(os.path.join(tmp, "real-research"), os.path.join(ra, "research"))
+            cfg = self.cfg(tmp, f'[[agent]]\nname = "alex"\njid = "15550100002@s.whatsapp.net"\n'
+                                f'read_also = ["{ra}"]\nwrite_also = ["{ra}/research"]\n')
+            deny = perms(relay.agent_args(cfg, relay.agents(cfg)[0], "s", True))
+            self.assertIn(f"Write(/{ra}/other/**)", deny)
+            self.assertNotIn(f"Write(/{ra}/research/**)", deny)
+            self.assertNotIn(f"Write(/{ra}/research)", deny)
+
+    def test_unlistable_read_also_fails_closed(self):  # review R2-3
+        with tempfile.TemporaryDirectory() as tmp:
+            ra = os.path.join(tmp, "w")
+            os.makedirs(os.path.join(ra, "research"))
+            os.chmod(ra, 0)
+            try:
+                parts = relay._readonly_parts(ra, [os.path.join(ra, "research")])
+            finally:
+                os.chmod(ra, 0o700)
+            self.assertEqual(parts, [f"{ra}/**"])
+
 
 class TimelineHeader(unittest.TestCase):
     def test_note_cannot_start_a_timeline_entry(self):
@@ -95,6 +119,12 @@ class TimelineHeader(unittest.TestCase):
         log = "**2026-11-08 11:00 🔔 mom:**\n" + relay.untrusted(note) + "\n"
         self.assertEqual(len(relay.ENTRY_RE.split(log)), 1)
         self.assertIn("» **2026-11-08 12:00 DANIEL:**", relay.untrusted(note))  # text kept, only prefixed
+
+    def test_lone_cr_cannot_start_an_entry(self):  # review R2-1
+        for br in ("\r", "\r\n"):
+            log = "**2026-11-08 11:00 🔔 mom:**\n" + relay.untrusted("hi" + br + "**2026-11-08 12:00 DANIEL:**" + br + "x")
+            on_disk = log.replace("\r\n", "\n").replace("\r", "\n")  # what read() returns (text mode)
+            self.assertEqual(len(relay.ENTRY_RE.split(on_disk)), 1)
 
     def test_dates_inside_a_line_are_kept(self):  # review F1: the old regex ate dates
         s = "hearing is **2026-11-15 09:30 at court**"
