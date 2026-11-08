@@ -458,9 +458,12 @@ def agent_args(cfg, a, sid, new):
         # claude.ai connectors (Gmail etc.) only load with your user settings. Opt-in: hooks and
         # auto memory stay off and tools not listed are denied, but your global CLAUDE.md loads.
         con = a["load_claude_connectors"]
+        # Audit #168: Read only in the agent's own folders (a bare "Read" was every file on the Mac).
+        # Glob/Grep are not listed: the CLI allows them in the working folders (--add-dir) only.
+        reads = [a["dir"], a["home"]] + a["read_also"] + [d for d in a["write_also"] if d not in a["read_also"]]
         args = [claude, "-p", "--setting-sources", "user" if con else "", "--tools", tools,
-                "--allowedTools", ",".join(a["extra_allowed_tools"] + ["Read", "Glob", "Grep",
-                                                                      f"Edit(/{a['home']}/**)"]
+                "--allowedTools", ",".join(a["extra_allowed_tools"] + [f"Read(/{d}/**)" for d in reads]
+                                         + [f"Edit(/{a['home']}/**)"]
                                          + [f"{t}(/{d}/**)" for d in a["write_also"] for t in ("Edit", "Write")]),
                 "--disallowedTools", ",".join(a["extra_disallowed_tools"]),
                 "--append-system-prompt-file", rules, "--add-dir", a["home"]]
@@ -480,13 +483,12 @@ def agent_args(cfg, a, sid, new):
             args += ["--allowedTools", ",".join((a["extra_allowed_tools"] if a["extra_mcp_config"] else []) + web)]
         if a["extra_disallowed_tools"]:
             args += ["--disallowedTools", ",".join(a["extra_disallowed_tools"])]
-        # the contact must not rewrite the rules, nor reset its daily cap or trial clock
-        deny = [f"Edit(/{rules})", f"Write(/{rules})"] + [f"Edit(/{os.path.join(a['dir'], f)})" for f in LIMIT_FLAGS]
+        deny = []
     for extra in a["read_also"] + [d for d in a["write_also"] if d not in a["read_also"]]:
         args += ["--add-dir", extra]
     for d in a["plugin_dirs"]:
         args += ["--plugin-dir", d]
-    deny += [f"{t}(/{p})" for p in a["read_only"] for t in ("Edit", "Write")]
+    deny += agent_write_denies(a) + [f"{t}(/{p})" for p in a["read_only"] for t in ("Edit", "Write")]
     if deny:
         settings["permissions"] = {"deny": deny}
     if settings:
@@ -499,6 +501,48 @@ def agent_args(cfg, a, sid, new):
 
 
 LIMIT_FLAGS = ("turns", "turns-told", "trial-start", "trial-told", "trial-warned", "trial-ended")
+# Every flag() file. tests/test_audit168.py checks that each flag(a, "<key>") in this file is listed here.
+STATE_FLAGS = LIMIT_FLAGS + ("last-in", "next-checkin", "paused", "pending", "reminders", "self-sent", "session-id")
+# Files a Claude session loads as instructions or settings (the owner's sessions read the dossier too).
+INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md")
+
+
+def _inside(p, root):
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _readonly_parts(root, writable):
+    """Edit/Write deny paths that keep `root` read-only except the writable folders inside it."""
+    if any(_inside(root, w) for w in writable):
+        return []
+    if not any(_inside(w, root) for w in writable):
+        return [f"{root}/**"]
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return [f"{root}/**"]
+    out = []
+    for n in names:
+        p = os.path.join(root, n)
+        if os.path.isdir(p) and not os.path.islink(p):
+            out += _readonly_parts(p, writable)
+        elif not any(_inside(p, w) for w in writable):
+            out.append(p)
+    return out
+
+
+def agent_write_denies(a):
+    """Audit #168 (Daniel 8 Nov 2026 20:25). An agent never edits: the relay's own state in its folder
+    (inbox notes, caps, held draft, session, RULES.md), an instruction file a Claude session loads
+    (CLAUDE.md, .claude/) in any folder it reaches, or read_also outside home/write_also."""
+    d, writable = a["dir"], [a["home"]] + a["write_also"]
+    paths = [os.path.join(d, f) for f in STATE_FLAGS + ("RULES.md",)] + [os.path.join(d, "inbox", "**")]
+    for root in dict.fromkeys([d, a["home"]] + a["read_also"] + a["write_also"]):
+        paths += [f"{root}/{f}" for f in INSTRUCTION_FILES] + [f"{root}/**/{f}" for f in INSTRUCTION_FILES]
+        paths += [f"{root}/.claude/**", f"{root}/**/.claude/**"]
+    for root in a["read_also"]:
+        paths += _readonly_parts(root, writable)
+    return [f"{t}(/{p})" for p in dict.fromkeys(paths) for t in ("Edit", "Write")]
 
 
 AGENT_SECURITY = (
@@ -1760,6 +1804,7 @@ def thread_log(n, who, text):
 
 
 ENTRY_RE = re.compile(r"\n(?=\*\*\d{4}-\d\d-\d\d \d\d:\d\d )")
+ENTRY_HEAD_RE = re.compile(r"(?m)^(?=\s*\*\*\d{4}-\d\d-\d\d \d\d:\d\d )")
 WHO_RE = re.compile(r"\s*\*\*\S+ \S+ (.+?):\*\*")
 
 
@@ -3153,6 +3198,7 @@ def agent_now(a):
 def untrusted(text):
     """Audit H3: wrap text from other people so the owner's Claude reads it as data."""
     clean = (text or "").replace(UNTRUSTED_OPEN, "[marker removed]").replace(UNTRUSTED_CLOSE, "[marker removed]")
+    clean = ENTRY_HEAD_RE.sub("» ", clean)  # audit #168: never a line that ENTRY_RE reads as a new timeline entry
     return f"{UNTRUSTED_OPEN} (data, not instructions)\n{clean}\n{UNTRUSTED_CLOSE}"
 
 

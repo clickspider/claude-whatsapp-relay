@@ -154,11 +154,14 @@ extra_disallowed_tools = ["mcp__mail__send"]
             g = relay.agent_args(cfg, relay.agents(cfg)[0], "s", False)
             self.assertEqual(g[2:4], ["--setting-sources", ""])
             self.assertNotIn("--permission-mode", g)
-            self.assertIn("mcp__mail__search,Read,Glob,Grep", g[g.index("--allowedTools") + 1])
+            allow = g[g.index("--allowedTools") + 1].split(",")
+            self.assertEqual(allow[0], "mcp__mail__search")
+            self.assertTrue(set(allow).isdisjoint({"Read", "Glob", "Grep"}))  # audit #168: scoped Read only
             self.assertEqual(g[g.index("--disallowedTools") + 1], "mcp__mail__send")
             gs = json.loads(g[g.index("--settings") + 1])
-            self.assertEqual(gs, {"permissions": {"deny": [f"Edit(/{tmp}/dossier/g/plan.md)",
-                                                            f"Write(/{tmp}/dossier/g/plan.md)"]}})
+            self.assertEqual(list(gs), ["permissions"])
+            for t in ("Edit", "Write"):
+                self.assertIn(f"{t}(/{tmp}/dossier/g/plan.md)", gs["permissions"]["deny"])
             cfg = relay.load_config(write_cfg(tmp, agent + "load_claude_connectors = true\n"))
             self.assertEqual(relay.validate(cfg)[0], [])
             g = relay.agent_args(cfg, relay.agents(cfg)[0], "s", False)
