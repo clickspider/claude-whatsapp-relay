@@ -22,7 +22,7 @@ send: sends it (Gmail drafts.send) only when the slot is this draft, the draft i
 Access: a separate gmail.compose refresh token in the Keychain (mail.send_keychain_service, made by
 'scripts/gmail_auth.py <config> --send'); the mail watch keeps its read-only token. This script never deletes,
 archives, labels or marks mail."""
-import base64, contextlib, quopri, email, email.policy, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib
+import base64, contextlib, quopri, email, email.policy, email.utils, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib
 from html import unescape
 import urllib.parse, urllib.request
 
@@ -80,18 +80,27 @@ def parse(raw):
     return email.message_from_bytes(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)), policy=email.policy.default)
 
 
-def thread_old(m, here, tid):
+def thread_old(m, here, tid, draft_msg):
     """{"text": the earlier mails of the thread, without spaces (bare); "files": sha256 of their files}, read with the mail
-    watch's read-only token. None when there is no thread or it cannot be read: then nothing is hidden."""
-    if not tid:
+    watch's read-only token. Only mails that every recipient of the draft was on count (review #180 R2: old to
+    the thread is not old to them). None when there is no thread, no recipient or it cannot be read: then
+    nothing is hidden."""
+    rcpts = {a.lower() for _, a in email.utils.getaddresses([str(v) for h in ("To", "Cc", "Bcc") for v in draft_msg.get_all(h, [])]) if a}
+    if not tid or not rcpts:
         return None
     try:
         tok = access(m, here, read_only=True)
+        # ponytail: the last 30 mails, none over 5 MB (review #180 R5: show stays fast); a quote of a skipped
+        # mail is not proven, so it shows in full
         ids = [x["id"] for x in api(tok, f"threads/{tid}?format=minimal").get("messages", [])
-               if "DRAFT" not in x.get("labelIds", [])][-30:]  # ponytail: last 30 mails; older quotes show in full
+               if "DRAFT" not in x.get("labelIds", []) and x.get("sizeEstimate", 0) <= 5_000_000][-30:]
         text, files = [], set()
         for i in ids:
-            for part in parse(api(tok, f"messages/{i}?format=raw")["raw"]).walk():
+            mail = parse(api(tok, f"messages/{i}?format=raw")["raw"])
+            had = {a.lower() for _, a in email.utils.getaddresses([str(v) for h in ("From", "To", "Cc", "Bcc") for v in mail.get_all(h, [])])}
+            if not rcpts <= had:  # review #180 R2: old to the thread is not old to these recipients
+                continue
+            for part in mail.walk():
                 data = part.get_payload(decode=True) if part.get_filename() else None
                 if data:
                     files.add(hashlib.sha256(data).hexdigest())
@@ -112,7 +121,8 @@ ATTRIBUTION = re.compile(r"^(?:On .{4,200}wrote|Op .{4,200}(?:schreef|geschreven
 
 def split_quote(text, html, old):
     """(the new text, one line about the quote). The quote is cut off only when old proves it: its first line
-    is an attribution ("On ... wrote:") and every other line is in an earlier mail. Else the whole text stays
+    is an attribution ("On ... wrote:") and the rest is ONE unbroken piece of one earlier mail (review #180 R3:
+    line by line, old words could spell a new sentence). Else the whole text stays
     and the quote line is ""."""
     plain = lambda t: tidy(strip_html(t) if html else t)
     at = (QUOTE_HTML if html else QUOTE_TEXT).search(text)
@@ -126,7 +136,7 @@ def split_quote(text, html, old):
     lines = [squash(l.lstrip("> ")) for l in (strip_html(text[start:]) if html else text[start:]).splitlines()]
     lines = ([squash(head)] + lines[head.count("\n") + 1:]) if head else lines
     lines = [l for l in lines if l]
-    if not lines or not ATTRIBUTION.match(lines[0]) or any(bare(l) not in old["text"] for l in lines[1:]):
+    if not lines or not ATTRIBUTION.match(lines[0]) or "".join(map(bare, lines[1:])).replace(">", "") not in old["text"].replace(">", ""):
         return plain(text), ""
     return plain(text[:start]), f"(under it, the earlier mails are quoted: {lines[0]})"
 
@@ -269,14 +279,14 @@ def main(argv):
     tok = access(m, here)
     h, msg, tid = draft(tok, did, thread=True)
     if cmd == "show":
-        old = thread_old(m, here, tid)
+        old = thread_old(m, here, tid, msg)
         text = describe(msg, old)
         files_dir = os.path.join(state, "mail-send", "files")  # = relay MAIL_FILES
         if os.path.islink(files_dir):  # review #148 N5: never clean (or write) through a planted link
             sys.exit("NOT SHOWN: mail-send/files is a link, not a folder. Nothing changed.")
-        for old in os.listdir(files_dir) if os.path.isdir(files_dir) else ():  # one slot: older copies are void
-            if old != h:  # review short round P2-4: copies never cleaned
-                shutil.rmtree(os.path.join(files_dir, old), ignore_errors=True)
+        for gone in os.listdir(files_dir) if os.path.isdir(files_dir) else ():  # one slot: older copies are void
+            if gone != h:  # review short round P2-4: copies never cleaned
+                shutil.rmtree(os.path.join(files_dir, gone), ignore_errors=True)
         files = save_files(msg, os.path.join(files_dir, h), old)
         request(pending_path, {"kind": "send", "draft": did, "hash": h, "subject": str(msg["Subject"] or ""),
                                "files": files, "summary": "Mail to send:\n" + text})

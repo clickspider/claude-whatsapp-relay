@@ -545,9 +545,6 @@ class RelaySide(unittest.TestCase):
             self.assertIn(want, relay.MAIL_RULES)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class PreviewNewOnly(unittest.TestCase):
     """Daniel 9 Nov 2026 17:15 (#180): the owner sees only what this mail adds. A quote or a file is hidden
@@ -640,3 +637,72 @@ class PreviewNewOnly(unittest.TestCase):
         t.body = "Hi\r\n\r\nOn Mon, Joyce <j@example.nl> wrote:\r\n> old text, now pay me"
         self.assertIn("draft changed", t.run_cmd("send"))
         self.assertEqual(t.sent, [])
+
+    def test_a_second_show_with_a_file_after_an_earlier_copy(self):  # review #180 R1
+        t = SendGate("test_no_vote_means_no_send")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        os.makedirs(os.path.join(t.tmp, "mail-send", "files", "earlierhash", "0"))
+        m = self.reply(files=[("letter.jpg", b"new")])
+        with mock.patch.object(gs, "draft", return_value=("h2", m, "T1")), \
+                mock.patch.object(gs, "thread_old", return_value=self.old()):
+            t.run_cmd("show")
+        self.assertEqual([os.path.basename(f) for f in t.slot()["files"]], ["letter.jpg"])
+
+    def thread(self, mails, draft_to="joyce@example.nl"):
+        """thread_old on a fake thread: mails = [(labels, EmailMessage)], plus the draft itself."""
+        def api(tok, path, body=None):
+            if path.startswith("threads/"):
+                return {"messages": [{"id": str(i), "labelIds": lb, "sizeEstimate": 100}
+                                     for i, (lb, _) in enumerate(mails)]}
+            return {"raw": base64.urlsafe_b64encode(mails[int(path.split("/")[1].split("?")[0])][1].as_bytes()).decode()}
+        d = self.reply()
+        d.replace_header("To", draft_to)
+        with mock.patch.object(gs, "access", return_value="tok"), mock.patch.object(gs, "api", side_effect=api):
+            return d, gs.thread_old({}, "/", "T1", d)
+
+    def mail(self, frm, to, text):
+        from email.message import EmailMessage
+        m = EmailMessage()
+        m["From"], m["To"] = frm, to
+        m.set_content(text)
+        return m
+
+    def test_a_mail_the_recipient_was_not_on_proves_nothing(self):  # review #180 R2
+        joyce = self.mail("joyce@example.nl", "me@example.nl", "Hi Daniel,\nThe price stays €650.\nWarm regards,\nJoyce")
+        side = self.mail("me@example.nl", "lara@example.nl", "our real max is 500, do not tell Joyce")
+        d, old = self.thread([(["INBOX"], joyce), (["SENT"], side)])
+        self.assertIn("Thepricestays€650", old["text"])
+        self.assertNotIn("realmaxis500", old["text"])
+
+    def test_the_draft_never_proves_its_own_quote(self):  # review #180 R4 (mutant M1)
+        draft = self.mail("me@example.nl", "joyce@example.nl", "Pay NL00BANK0123456789")
+        d, old = self.thread([(["INBOX"], self.mail("joyce@example.nl", "me@example.nl", "Hi")), (["DRAFT"], draft)])
+        self.assertNotIn("NL00BANK", old["text"])
+
+    def test_a_draft_without_recipient_hides_nothing(self):
+        d, old = self.thread([], draft_to="")
+        self.assertIsNone(old)
+
+    def test_old_words_cannot_spell_a_new_quote(self):  # review #180 R3
+        msg = self.reply()
+        html = msg.get_body(preferencelist=("html",))
+        html.set_content(html.get_content().replace('<blockquote class="gmail_quote">',
+                         '<blockquote class="gmail_quote"><div>' + "\n".join("Daniel price stays Joyce 650".split())
+                         + "</div>"), subtype="html")
+        self.assertIn("(HTML version", gs.describe(msg, self.old()))
+        old = {"text": gs.bare("We can not do 650 this year, sorry."), "files": set()}
+        text, _ = gs.split_quote("OK, booked.\n\nOn Mon, Nov 9, Joyce <j@x> wrote:\n> We can\n> do 650 this year\n",
+                                 False, old)
+        self.assertIn("We can", text)
+
+    def test_the_attribution_must_come_first(self):  # review #180 R4 (mutants M3, M4)
+        old = self.old()
+        text, q = gs.split_quote("Hi\n\n> Hi Daniel,\n> The price stays €650.\n", False, old)
+        self.assertEqual(q, "")
+        text, q = gs.split_quote("Hi\n\nOn Mon, Joyce <j@x> wrote:\n> Pay NL00BANK.\n> Hi Daniel,\n", False, old)
+        self.assertEqual(q, "")
+
+
+if __name__ == "__main__":
+    unittest.main()
