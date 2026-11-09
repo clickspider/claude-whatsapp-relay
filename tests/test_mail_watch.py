@@ -25,8 +25,9 @@ def msg(mid, thr, frm, subject, body, labels=("INBOX", "UNREAD"), bulk=False, da
 
 class FakeGmail:
     """messages by id; history = ids added since history 100. Records every call: only GETs exist here."""
-    def __init__(self, mails=(), threads=None, newest="200"):
+    def __init__(self, mails=(), threads=None, newest="200", hist=None, recent=()):
         self.mails, self.threads, self.newest, self.calls = {m["id"]: m for m in mails}, threads or {}, newest, []
+        self.hist, self.recent = hist, list(recent)  # history ids (default: every mail), unread of the last 2 h
 
     def __call__(self, path, **params):
         self.calls.append((path, params))
@@ -37,7 +38,11 @@ class FakeGmail:
                 raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
             assert params["labelId"] == "INBOX" and params["historyTypes"] == "messageAdded"
             return {"historyId": self.newest,
-                    "history": [{"messagesAdded": [{"message": {"id": i}}]} for i in self.mails]}
+                    "history": [{"messagesAdded": [{"message": {"id": i}}]}
+                                for i in (self.mails if self.hist is None else self.hist)]}
+        if path == "messages":
+            assert params["q"] == relay.MAIL_CATCHUP
+            return {"messages": [{"id": i} for i in self.recent]} if self.recent else {}
         if path.startswith("messages/"):
             return self.mails[path.split("/")[1]]
         if path.startswith("threads/"):
@@ -111,7 +116,7 @@ class MailWatch(unittest.TestCase):
                                        "wait_hurts=yes | ad")
         self.check(g, sort)
         self.assertEqual(asked, [("a1", "Please sign by Friday"), ("a6", "buy now")])  # no haiku for the rest
-        self.assertTrue(all(p in ("history",) or p.startswith("messages/") for p, _ in g.calls))
+        self.assertTrue(all(p in ("history", "messages") or p.startswith("messages/") for p, _ in g.calls))
         self.assertEqual(len(self.notes), 1)
         note = self.notes[0]
         for want in ("Defence draft", "For #5.", "Risk: sign by Fri 6 Nov", "New mail in the email thread of #5",
@@ -141,6 +146,42 @@ class MailWatch(unittest.TestCase):
         self.check(FakeGmail([msg("c1", "42", "office@law.example", "Re: question", "answer")]))  # no haiku
         self.assertIn("The reply you asked to watch (#5)", self.notes[0])
         self.assertEqual([w["key"] for w in relay.mail_state()["watch"]], ["18c2f0a1b2c3d4e5"])
+
+    def test_catchup_finds_mail_the_history_missed_once(self):
+        """#171 (9 Nov 2026): a mail came in during a check; history moved past it and no alert came."""
+        relay.mail_state(lambda s: s.update(history="100", done=[]))
+        hr = msg("h1", "71", "Recruiter <r@corp.example>", "Re: your application", "your availability this week?")
+        g = FakeGmail([hr], hist=[], recent=["h1"])
+        sort = lambda ask: relay.mail_verdicts("<0> | carry=no | decide=yes | risk=no | wait_hurts=no | asks times")
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            self.check(g, sort)
+            self.check(g)  # second check: already done, no sort, no second alert
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("ACTION NEEDED. asks times", self.notes[0])
+        self.assertIn("mail h1 from corp.example: alert", out.getvalue())
+        self.assertNotIn("availability", out.getvalue())  # the log names the domain, never the text
+        self.assertEqual(relay.mail_state()["done"], ["h1"])
+
+    def test_first_catchup_check_skips_mail_handled_before(self):
+        relay.mail_state(lambda s: s.update(history="100"))  # state from before #171: no "done"
+        g = FakeGmail([msg("o1", "1", "a@x.example", "old", "x"), msg("n1", "2", "b@y.example", "new", "y")],
+                      hist=["n1"], recent=["n1", "o1"])
+        asked = []
+        self.check(g, lambda ask: asked.extend(m["id"] for m in ask) or {})
+        self.assertEqual(asked, ["n1"])
+        self.assertEqual(relay.mail_state()["done"], ["o1", "n1"])
+
+    def test_mail_without_verdict_is_never_dropped(self):
+        relay.mail_state(lambda s: s.update(history="100", done=[]))
+        g = FakeGmail([msg("v1", "1", "a@x.example", "one", "x"), msg("v2", "2", "b@y.example", "two", "y")])
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            self.check(g, lambda ask: relay.mail_verdicts("<0> | carry=no | decide=no | risk=no | wait_hurts=no | ad"))
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn('"two". ACTION NEEDED? The sort gave no verdict', self.notes[0])
+        self.assertNotIn('"one"', self.notes[0])
+        self.assertIn("mail v1 from x.example: sorted: not important", out.getvalue())
 
     def test_sort_failure_keeps_the_mail_and_tells_once(self):
         relay.mail_state(lambda s: s.update(history="100"))

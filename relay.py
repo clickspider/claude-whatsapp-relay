@@ -4303,7 +4303,8 @@ MAIL_RULES = (
     "the files to the coordinator. "
     "Never delete, archive, label or mark mail. When the owner wants to hear when someone answers by "
     "email, add a line '@@WATCHMAIL #<n>: <thread-id from the 🔔 mail entry, or the sender address or domain>' "
-    "(#<n> is optional).")
+    "(#<n> is optional). An entry that says 'ACTION NEEDED' or 'The reply you asked to watch' always "
+    "gets your one short message to the owner, never silence (#171, 9 Nov 2026).")
 # Daniel 5 Nov 2026 12:19 (#124): attachments, same read-only access. The coordinator and every thread get this.
 MAIL_FILES = (
     "\nMAIL FILES: the Gmail tools show only attachment ids. To read an attachment (PDF, image, docx), run "
@@ -4331,6 +4332,9 @@ GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 MAIL_OFF = "mail watch off: no Gmail access yet (run scripts/gmail_auth.py once)"
 MAIL_WATCH_DAYS = 30
 MAIL_MAX = 30  # ponytail: mails sorted per check; a bigger burst keeps only the newest, with one line about it
+# #171, 9 Nov 2026: a mail that came in during a check was never seen (history moved past it). Every check also
+# looks at the unread inbox mail of the last 2 hours; mail.json "done" keeps the last MAIL_DONE handled ids.
+MAIL_CATCHUP, MAIL_DONE = "in:inbox is:unread newer_than:2h", 300
 _mlock = threading.Lock()
 _mail = {"busy": False, "next": 0.0, "told": "", "token": ("", 0.0)}
 
@@ -4411,6 +4415,17 @@ def mail_new(start):
             return ids, newest
 
 
+def mail_recent():
+    """Unread inbox mail of the last 2 hours (newest first): the catch-up for mail the history list missed."""
+    return [x["id"] for x in gmail("messages", q=MAIL_CATCHUP, maxResults=50).get("messages") or []]
+
+
+def mail_log(m, fate):
+    """One line per new mail in the relay log, so a missed alert can be traced (#171). Sender domain only."""
+    dom = m["from"].rpartition("@")[2].strip("> ").lower() or "?"
+    print(f"{owner_now():%H:%M} mail {m['id']} from {dom}: {fate}", flush=True)
+
+
 def mail_body(payload):
     """The first text/plain part, else the first text/html part without its tags."""
     parts, html = [payload], ""
@@ -4471,7 +4486,7 @@ def mail_verdicts(out):
                 words.append(p.strip())
         no = lambda k: f.get(k, "no").lower() in ("no", "none", "")
         important = not (no("carry") and no("decide") and no("risk"))
-        res[int(i)] = {"important": important, "urgent": important and not no("wait_hurts"),
+        res[int(i)] = {"important": important, "urgent": important and not no("wait_hurts"), "act": not no("decide"),
                        "carry": "" if no("carry") else f["carry"], "risk": "" if no("risk") else f["risk"],
                        "line": " ".join(words)[:200]}
     return res
@@ -4501,6 +4516,7 @@ def mail_route(mails, s, night, sort=None):
     for m in mails:
         frm = m["from"].lower()
         if m["seen"] or not m["inbox"] or (me and me in frm):
+            mail_log(m, "read already" if m["seen"] else "not in the inbox" if not m["inbox"] else "own mail")
             continue
         w = next((w for w in s["watch"] if w["until"] > now and w not in used
                   and (w["key"] == m["thrid"] or w["key"] in frm)), None)
@@ -4514,13 +4530,21 @@ def mail_route(mails, s, night, sort=None):
             m["topics"] = mail_topics(m)
             if not ((m["bulk"] or m["cat"]) and not m["topics"]):  # ads + newsletters, unless watched
                 ask.append(m)
-    for i, x in ((sort or mail_sort)(ask) if ask else {}).items():
-        if not x["important"] or i >= len(ask):
+            else:
+                mail_log(m, "ad or newsletter, no watch topic")
+    verdicts = (sort or mail_sort)(ask) if ask else {}
+    for i, m in enumerate(ask):
+        x = verdicts.get(i)
+        if x is None:  # #171: a mail the sort skipped is never dropped without a word
+            found.append((m, "ACTION NEEDED? The sort gave no verdict on this mail: read it yourself.", False))
             continue
-        m, c = ask[i], x["carry"].lstrip("#")
+        if not x["important"]:
+            mail_log(m, "sorted: not important")
+            continue
+        c = x["carry"].lstrip("#")
         if c in open_n and m["thrid"]:
             s["threads"][m["thrid"]] = c
-        why = (x["line"] + (f" Risk: {x['risk']}." if x["risk"] else "")
+        why = (("ACTION NEEDED. " if x["act"] else "") + x["line"] + (f" Risk: {x['risk']}." if x["risk"] else "")
                + (f" For #{c}." if c in open_n else f" Topic: {x['carry']}." if x["carry"] else ""))
         found.append((m, why.strip(), x["urgent"]))
     lines, items = [], []
@@ -4529,6 +4553,7 @@ def mail_route(mails, s, night, sort=None):
         items.append({"id": m["id"], "thrid": m["thrid"], "date": m["date"], "line": line})
         if urgent or not night:  # Instinct: at night only when waiting costs a loss or a deadline
             lines.append(line)
+        mail_log(m, "alert" if urgent or not night else "morning digest only (night)")
     return lines, items, used
 
 
@@ -4545,8 +4570,8 @@ def mail_tell(kind, text, note=True):
 
 def mail_baseline():
     """Start from now: mail that came before the watch (or before a long gap) is never reported."""
-    h = gmail("profile")["historyId"]
-    mail_state(lambda s: s.update(history=h))
+    h, done = gmail("profile")["historyId"], mail_recent()
+    mail_state(lambda s: s.update(history=h, done=done))
     return mail_tell("ok", "")
 
 
@@ -4565,6 +4590,11 @@ def mail_check():
         if e.code != 404:
             raise
         return mail_baseline()  # Google keeps the history about a week; older = start again from now
+    recent = mail_recent()
+    done = s.get("done")
+    if done is None:  # first check with the catch-up: unread mail not in this history was handled before
+        done = [i for i in recent if i not in ids]
+    ids = [i for i in dict.fromkeys(ids + recent[::-1]) if i not in done]
     mails = []
     for mid in ids[-MAIL_MAX:]:
         try:
@@ -4578,7 +4608,7 @@ def mail_check():
         lines.append(f"{len(ids) - MAIL_MAX} older new mails came in at once and were not sorted.")
 
     def save(cur):  # saved before the note goes out: a crash may miss one alert, never sends it twice
-        cur.update(history=newest)
+        cur.update(history=newest, done=(done + ids)[-MAIL_DONE:])
         cur["threads"].update(s["threads"])
         cur["watch"] = [w for w in cur["watch"] if w not in used and w["until"] > time.time()]
         cur["digest"] = (cur["digest"] + items)[-50:]
