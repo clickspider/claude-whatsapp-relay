@@ -169,7 +169,7 @@ class SendGate(unittest.TestCase):
         m.add_attachment(b"%PDF x", maintype="application", subtype="pdf", filename="letter.pdf")
         self.body = None
         with mock.patch.object(gs, "draft", return_value=("h1", gs.email.message_from_bytes(
-                m.as_bytes(), policy=gs.email.policy.default))):
+                m.as_bytes(), policy=gs.email.policy.default), "")):
             self.run_cmd("show")
         self.assertEqual(self.slot()["files"], [os.path.join(self.tmp, "mail-send", "files", "h1", "0", "letter.pdf")])
         with open(self.slot()["files"][0], "rb") as f:
@@ -547,3 +547,96 @@ class RelaySide(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreviewNewOnly(unittest.TestCase):
+    """Daniel 9 Nov 2026 17:15 (#180): the owner sees only what this mail adds. A quote or a file is hidden
+    only when the thread proves it old; anything not proven is shown. The hash still covers the whole mail."""
+    OLD_HTML = '<div dir="auto">Hi Daniel,<br><br>The price stays <a href="x">€650</a>.<br>Warm regards,<br>Joyce</div>'
+    PHOTO = b"\xff\xd8 joyce photo"
+
+    def old(self):
+        from email.message import EmailMessage
+        m = EmailMessage()
+        m.set_content("Hi Daniel,\nThe price stays €650.\nWarm regards,\nJoyce")
+        m.add_alternative(self.OLD_HTML, subtype="html")
+        m.add_attachment(self.PHOTO, maintype="image", subtype="jpeg", filename="photo.jpg")
+        return {"text": "\0".join(gs.bare(gs.strip_html(p.get_content())) for p in m.walk()
+                                  if p.get_content_type() in ("text/plain", "text/html")),
+                "files": {gs.hashlib.sha256(self.PHOTO).hexdigest()}}
+
+    def reply(self, quote_extra="", files=()):
+        from email.message import EmailMessage
+        m = EmailMessage()
+        m["To"], m["Subject"] = "joyce@example.nl", "Re: violin"
+        m.set_content("Hi Joyce,\nPlease send the contract.\n\nOn Mon, Nov 09, 2026 04:35 PM, Joyce <joyce@example.nl> wrote:\n"
+                      "> Hi Daniel,\n> The price stays €650.\n" + (f"> {quote_extra}\n" if quote_extra else "") +
+                      "> Warm regards,\n> Joyce\n")
+        m.add_alternative('<div dir="auto">Hi Joyce,<br><br>Please send the contract.</div><div class="gmail_extra">'
+                          'On Mon, Nov 09, 2026 04:35 PM, Joyce &lt;joyce@example.nl&gt; wrote:<br>'
+                          f'<blockquote class="gmail_quote">{self.OLD_HTML}'
+                          + (f"<div>{quote_extra}</div>" if quote_extra else "") + '</blockquote></div>', subtype="html")
+        for name, data in files:
+            m.add_attachment(data, maintype="image", subtype="jpeg", filename=name)
+        return gs.email.message_from_bytes(m.as_bytes(), policy=gs.email.policy.default)
+
+    def test_only_the_new_text_and_one_line_for_the_quote(self):
+        out = gs.describe(self.reply(), self.old())
+        self.assertIn("Hi Joyce,\nPlease send the contract.", out)
+        self.assertNotIn("price stays", out)
+        self.assertNotIn("HTML version", out)
+        self.assertIn("(under it, the earlier mails are quoted: On Mon, Nov 09, 2026 04:35 PM, Joyce", out)
+
+    def test_a_quote_with_a_line_from_no_earlier_mail_is_shown_whole(self):
+        out = gs.describe(self.reply("Please pay to NL00BANK0123456789 instead."), self.old())
+        self.assertIn("NL00BANK0123456789", out)
+        self.assertIn("price stays", out)
+        self.assertNotIn("earlier mails are quoted", out)
+
+    def test_a_thread_that_cannot_be_read_hides_nothing(self):
+        out = gs.describe(self.reply(), None)
+        self.assertIn("price stays", out)
+        self.assertNotIn("earlier mails are quoted", out)
+
+    def test_an_html_quote_not_proven_shows_the_html_whole(self):
+        msg = self.reply()
+        html = msg.get_body(preferencelist=("html",))
+        html.set_content(html.get_content().replace("</blockquote>", "<div>Pay NL00BANK0123456789.</div></blockquote>"),
+                         subtype="html")
+        out = gs.describe(msg, self.old())
+        self.assertIn("(HTML version, what most mail apps show:)", out)
+        self.assertIn("NL00BANK0123456789", out)
+
+    def test_a_file_from_an_earlier_mail_is_named_but_not_sent_to_the_owner(self):
+        msg = self.reply(files=[("photo.jpg", self.PHOTO), ("contract.jpg", b"\xff\xd8 new")])
+        out = gs.describe(msg, self.old())
+        self.assertIn("Attachments: contract.jpg\n", out)
+        self.assertIn("from an earlier mail of this thread, not sent to you again: photo.jpg", out)
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        self.assertEqual([os.path.basename(p) for p in gs.save_files(msg, folder, self.old())], ["contract.jpg"])
+        self.assertEqual(len(gs.save_files(msg, self.enterContext(tempfile.TemporaryDirectory()))), 2)  # unproven: all
+
+    def test_a_same_name_with_other_bytes_is_new(self):
+        out = gs.describe(self.reply(files=[("photo.jpg", b"other bytes")]), self.old())
+        self.assertIn("Attachments: photo.jpg", out)
+
+    def test_gmail_wraps_a_plain_attribution_over_two_lines(self):
+        text, quoted = gs.split_quote("Hi Joyce,\n\nOn Mon, Nov 9, 2026 at 4:35 PM Joyce <\njoyce@example.nl> wrote:\n"
+                                      "> Hi Daniel,\n> The price stays €650.\n", False, self.old())
+        self.assertEqual(text, "Hi Joyce,")
+        self.assertIn("Joyce < joyce@example.nl> wrote:", quoted)
+
+    def test_the_vote_still_covers_the_hidden_quote(self):
+        t = SendGate("test_no_vote_means_no_send")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        t.body = "Hi\r\n\r\nOn Mon, Joyce <j@example.nl> wrote:\r\n> old text"
+        with mock.patch.object(gs, "thread_old", return_value={"text": "oldtext", "files": set()}):
+            out = t.run_cmd("show")
+        self.assertNotIn("old text", t.slot()["summary"])
+        self.assertIn("earlier mails are quoted", out)
+        t.relay_asks()
+        t.owner_votes(gs.SEND)
+        t.body = "Hi\r\n\r\nOn Mon, Joyce <j@example.nl> wrote:\r\n> old text, now pay me"
+        self.assertIn("draft changed", t.run_cmd("send"))
+        self.assertEqual(t.sent, [])

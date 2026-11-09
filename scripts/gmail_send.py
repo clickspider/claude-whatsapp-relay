@@ -14,6 +14,11 @@ send: sends it (Gmail drafts.send) only when the slot is this draft, the draft i
       version, the vote on the slot's own poll is "Send", the show is at most OK_HOURS old, and that vote did
       not already do its action (one vote = one action). A newer show of either gate replaces the slot, so an
       old vote never counts. Every send gets one line in <state_dir>/mail-send/sent.log.
+      The owner sees only what THIS mail adds (Daniel 9 Nov 2026 17:15, #180): the new text and the new files.
+      The quoted earlier mails and the files that came with them get one line each, and only when the mail
+      watch's read-only token proves them old (every quoted line is in an earlier mail of the thread, every
+      hidden file has the bytes of a file in one). Anything not proven is shown. The hash, and so the vote,
+      still covers the whole mail.
 Access: a separate gmail.compose refresh token in the Keychain (mail.send_keychain_service, made by
 'scripts/gmail_auth.py <config> --send'); the mail watch keeps its read-only token. This script never deletes,
 archives, labels or marks mail."""
@@ -36,10 +41,15 @@ def conf_paths(conf):
     return c.get("mail", {}), here, state
 
 
-def access(m, here):
-    r = subprocess.run(["security", "find-generic-password", "-s", m.get("send_keychain_service", "relay-gmail-send"),
-                        "-a", m.get("user", ""), "-w"], capture_output=True, text=True)
+def access(m, here, read_only=False):
+    """An access token: the gmail.compose one, or (read_only) the mail watch's gmail.readonly one."""
+    service = (m.get("keychain_service", "relay-gmail-oauth") if read_only else
+               m.get("send_keychain_service", "relay-gmail-send"))
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", m.get("user", ""), "-w"],
+                       capture_output=True, text=True)
     if r.returncode:
+        if read_only:
+            raise RuntimeError("no read-only Gmail access")
         sys.exit("No send access in the Keychain: the owner runs 'scripts/gmail_auth.py <config> --send' once.")
     with open(os.path.join(here, os.path.expanduser(m.get("client_file", "gmail-client.json")))) as f:
         k = json.load(f)["installed"]
@@ -50,7 +60,7 @@ def access(m, here):
 
 
 def api(tok, path, body=None):
-    """GET drafts/<id>, or POST drafts/send. Nothing else."""
+    """GET drafts/<id>, threads/<id>, messages/<id>, or POST drafts/send. Nothing else."""
     req = urllib.request.Request(GMAIL + path, headers={"Authorization": f"Bearer {tok}",
                                                         "Content-Type": "application/json"},
                                  data=json.dumps(body).encode() if body is not None else None)
@@ -58,42 +68,126 @@ def api(tok, path, body=None):
         return json.load(r)
 
 
-def draft(tok, did):
-    """(hash of the whole raw mail, parsed mail)."""
-    raw = api(tok, f"drafts/{did}?format=raw")["message"]["raw"]
-    data = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
-    return hashlib.sha256(data).hexdigest(), email.message_from_bytes(data, policy=email.policy.default)
+def draft(tok, did, thread=False):
+    """(hash of the whole raw mail, parsed mail[, thread id])."""
+    d = api(tok, f"drafts/{did}?format=raw")["message"]
+    data = base64.urlsafe_b64decode(d["raw"] + "=" * (-len(d["raw"]) % 4))
+    out = hashlib.sha256(data).hexdigest(), email.message_from_bytes(data, policy=email.policy.default)
+    return out + (d.get("threadId", ""),) if thread else out
 
 
-def describe(msg):
+def parse(raw):
+    return email.message_from_bytes(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)), policy=email.policy.default)
+
+
+def thread_old(m, here, tid):
+    """{"text": the earlier mails of the thread, without spaces (bare); "files": sha256 of their files}, read with the mail
+    watch's read-only token. None when there is no thread or it cannot be read: then nothing is hidden."""
+    if not tid:
+        return None
+    try:
+        tok = access(m, here, read_only=True)
+        ids = [x["id"] for x in api(tok, f"threads/{tid}?format=minimal").get("messages", [])
+               if "DRAFT" not in x.get("labelIds", [])][-30:]  # ponytail: last 30 mails; older quotes show in full
+        text, files = [], set()
+        for i in ids:
+            for part in parse(api(tok, f"messages/{i}?format=raw")["raw"]).walk():
+                data = part.get_payload(decode=True) if part.get_filename() else None
+                if data:
+                    files.add(hashlib.sha256(data).hexdigest())
+                elif part.get_content_type() in ("text/plain", "text/html") and not part.get_filename():
+                    t = part.get_content()
+                    text.append(bare(strip_html(t) if part.get_content_type() == "text/html" else t))
+        return {"text": "\0".join(text), "files": files}
+    except Exception:  # fail open to the owner's eyes: a thread we cannot read means the full mail is shown
+        return None
+
+
+QUOTE_HTML = re.compile(r'<div[^>]*class="[^"]*\bgmail_(?:extra|quote)\b|<blockquote|<div[^>]*id="(?:appendonsend|'
+                        r'divRplyFwdMsg)"|<div[^>]*class="moz-cite-prefix"', re.I)
+QUOTE_TEXT = re.compile(r"^(?:>|On .{4,200}wrote:\s*$|Op .{4,200}(?:schreef|geschreven):\s*$|-----Original Message-----|"
+                        r"בתאריך .{4,200}:\s*$)", re.M)
+ATTRIBUTION = re.compile(r"^(?:On .{4,200}wrote|Op .{4,200}(?:schreef|geschreven)|בתאריך .{4,200}):$")
+
+
+def split_quote(text, html, old):
+    """(the new text, one line about the quote). The quote is cut off only when old proves it: its first line
+    is an attribution ("On ... wrote:") and every other line is in an earlier mail. Else the whole text stays
+    and the quote line is ""."""
+    plain = lambda t: tidy(strip_html(t) if html else t)
+    at = (QUOTE_HTML if html else QUOTE_TEXT).search(text)
+    if not at or old is None:
+        return plain(text), ""
+    start, head = at.start(), ""
+    if not html and text[start] == ">":  # a plain attribution Gmail wrapped over two lines, just above the "> "
+        head = text[:start].rstrip("\n").rsplit("\n\n", 1)[-1]
+        head = head if head.count("\n") <= 1 and ATTRIBUTION.match(squash(head)) else ""
+        start = text.rindex(head, 0, start) if head else start
+    lines = [squash(l.lstrip("> ")) for l in (strip_html(text[start:]) if html else text[start:]).splitlines()]
+    lines = ([squash(head)] + lines[head.count("\n") + 1:]) if head else lines
+    lines = [l for l in lines if l]
+    if not lines or not ATTRIBUTION.match(lines[0]) or any(bare(l) not in old["text"] for l in lines[1:]):
+        return plain(text), ""
+    return plain(text[:start]), f"(under it, the earlier mails are quoted: {lines[0]})"
+
+
+def tidy(t):
+    """One space between words, at most one empty line in a row."""
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(" ".join(l.split()) for l in t.splitlines())).strip()
+
+
+def file_parts(msg, old=None):
+    """(the draft's file parts to show and copy, the names of files proven to come from an earlier mail)."""
+    new, seen = [], []
+    for p in msg.walk():
+        if p.get_filename():
+            data = p.get_payload(decode=True)
+            if old and data and hashlib.sha256(data).hexdigest() in old["files"]:
+                seen.append(p.get_filename())
+            else:
+                new.append(p)
+    return new, seen
+
+
+def describe(msg, old=None):
+    """What the owner reads before the poll: only what this mail adds, when old (thread_old) proves the rest."""
     lines = [f"{h}: {msg[h]}" for h in ("To", "Cc", "Bcc", "Subject") if msg[h]]
-    files = [p.get_filename() for p in msg.walk() if p.get_filename()]
-    if files:
-        lines.append("Attachments: " + ", ".join(files))
+    new, seen = file_parts(msg, old)
+    if new:
+        lines.append("Attachments: " + ", ".join(p.get_filename() for p in new))
+    if seen:
+        lines.append(f"(also on it, from an earlier mail of this thread, not sent to you again: {', '.join(seen)})")
     body = msg.get_body(preferencelist=("plain", "html"))
-    text = body.get_content() if body else ""
-    if body and body.get_content_type() == "text/html":
-        text = strip_html(text)
+    text, quoted = (split_quote(body.get_content(), body.get_content_type() == "text/html", old) if body
+                    else ("", ""))
     html = msg.get_body(preferencelist=("html",))
-    if html and html is not body and squash(strip_html(html.get_content())) != squash(text):
-        # review #139 P2-6: most mail apps show the html part; the owner must see it when it says something else
-        text += "\n\n(HTML version, what most mail apps show:)\n" + strip_html(html.get_content()).strip()
-    return "\n".join(lines) + "\n\n" + text.strip()
+    if html and html is not body:
+        h_text = split_quote(html.get_content(), True, old)[0]  # an html quote not proven old stays in it whole
+        if squash(h_text) != squash(text):
+            # review #139 P2-6: most mail apps show the html part; the owner must see it when it says something else
+            text += "\n\n(HTML version, what most mail apps show:)\n" + h_text
+    return "\n".join(lines) + "\n\n" + text.strip() + (f"\n\n{quoted}" if quoted else "")
 
 
 def strip_html(t):
-    """Tags out, entities decoded (review short round P2-3: '&#39;' kept the plain and html parts apart)."""
-    return unescape(re.sub(r"<[^>]+>", " ", t))
+    """Tags out (a line break where the mail breaks a line), entities decoded (review short round P2-3)."""
+    return unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?i)<br\s*/?>|</(?:div|p|li|tr|blockquote|h\d)>", "\n", t)))
 
 
 def squash(t):
     return " ".join(t.split())
 
 
-def save_files(msg, folder):
-    """review #139 P2-5 (decision 14:27): the draft's own attachments, copied for the owner to get before the poll."""
+def bare(t):
+    """No spaces at all: Gmail puts a quote's tags, and so its spaces, in other places than the mail it quotes."""
+    return "".join(t.split())
+
+
+def save_files(msg, folder, old=None):
+    """review #139 P2-5 (decision 14:27): the draft's own NEW attachments, copied for the owner to get before
+    the poll. A file proven to come from an earlier mail of the thread is not sent to him again (#180)."""
     out = []
-    for i, part in enumerate(p for p in msg.walk() if p.get_filename()):
+    for i, part in enumerate(file_parts(msg, old)[0]):
         name = os.path.basename(part.get_filename()).lstrip(".") or "file"
         path = os.path.join(folder, str(i), name)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -173,16 +267,17 @@ def main(argv):
     m, here, state = conf_paths(os.path.abspath(os.path.expanduser(CONF)))
     pending_path, log_path = os.path.join(state, "mail-send", "pending.json"), os.path.join(state, "mail-send", "sent.log")  # also gmail_draft's slot
     tok = access(m, here)
-    h, msg = draft(tok, did)
+    h, msg, tid = draft(tok, did, thread=True)
     if cmd == "show":
-        text = describe(msg)
+        old = thread_old(m, here, tid)
+        text = describe(msg, old)
         files_dir = os.path.join(state, "mail-send", "files")  # = relay MAIL_FILES
         if os.path.islink(files_dir):  # review #148 N5: never clean (or write) through a planted link
             sys.exit("NOT SHOWN: mail-send/files is a link, not a folder. Nothing changed.")
         for old in os.listdir(files_dir) if os.path.isdir(files_dir) else ():  # one slot: older copies are void
             if old != h:  # review short round P2-4: copies never cleaned
                 shutil.rmtree(os.path.join(files_dir, old), ignore_errors=True)
-        files = save_files(msg, os.path.join(files_dir, h))
+        files = save_files(msg, os.path.join(files_dir, h), old)
         request(pending_path, {"kind": "send", "draft": did, "hash": h, "subject": str(msg["Subject"] or ""),
                                "files": files, "summary": "Mail to send:\n" + text})
         print(text)
