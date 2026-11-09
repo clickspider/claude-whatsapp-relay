@@ -4303,7 +4303,7 @@ MAIL_RULES = (
     "the files to the coordinator. "
     "Never delete, archive, label or mark mail. When the owner wants to hear when someone answers by "
     "email, add a line '@@WATCHMAIL #<n>: <thread-id from the 🔔 mail entry, or the sender address or domain>' "
-    "(#<n> is optional). An entry that says 'ACTION NEEDED' or 'The reply you asked to watch' always "
+    "(#<n> is optional). An entry that STARTS with 'ACTION NEEDED' or 'The reply you asked to watch' always "
     "gets your one short message to the owner, never silence (#171, 9 Nov 2026).")
 # Daniel 5 Nov 2026 12:19 (#124): attachments, same read-only access. The coordinator and every thread get this.
 MAIL_FILES = (
@@ -4417,13 +4417,15 @@ def mail_new(start):
 
 def mail_recent():
     """Unread inbox mail of the last 2 hours (newest first): the catch-up for mail the history list missed."""
+    # ponytail: one page of 50; more unread mail in 2 h than that waits for the history list or the next check
     return [x["id"] for x in gmail("messages", q=MAIL_CATCHUP, maxResults=50).get("messages") or []]
 
 
 def mail_log(m, fate):
-    """One line per new mail in the relay log, so a missed alert can be traced (#171). Sender domain only."""
-    dom = m["from"].rpartition("@")[2].strip("> ").lower() or "?"
-    print(f"{owner_now():%H:%M} mail {m['id']} from {dom}: {fate}", flush=True)
+    """One line per new mail in the relay log, so a missed alert can be traced (#171). Sender domain only,
+    never the display name, the subject or the text."""
+    dom = re.search(r"@([\w.-]+)", m["from"])
+    print(f"{owner_now():%H:%M} mail {m['id']} from {dom.group(1).lower() if dom else '?'}: {fate}", flush=True)
 
 
 def mail_body(payload):
@@ -4523,9 +4525,9 @@ def mail_route(mails, s, night, sort=None):
         n = s["threads"].get(m["thrid"])
         if w:
             used.append(w)
-            found.append((m, "The reply you asked to watch" + (f" (#{w['n']})." if w["n"] else "."), False))
+            found.append((m, "The reply you asked to watch" + (f" (#{w['n']}). " if w["n"] else ". "), "", False))
         elif n in open_n:
-            found.append((m, f"New mail in the email thread of #{n}.", False))
+            found.append((m, "", f"New mail in the email thread of #{n}.", False))
         else:
             m["topics"] = mail_topics(m)
             if not ((m["bulk"] or m["cat"]) and not m["topics"]):  # ads + newsletters, unless watched
@@ -4536,7 +4538,7 @@ def mail_route(mails, s, night, sort=None):
     for i, m in enumerate(ask):
         x = verdicts.get(i)
         if x is None:  # #171: a mail the sort skipped is never dropped without a word
-            found.append((m, "ACTION NEEDED? The sort gave no verdict on this mail: read it yourself.", False))
+            found.append((m, "ACTION NEEDED? The sort gave no verdict on this mail, read it yourself. ", "", False))
             continue
         if not x["important"]:
             mail_log(m, "sorted: not important")
@@ -4544,12 +4546,14 @@ def mail_route(mails, s, night, sort=None):
         c = x["carry"].lstrip("#")
         if c in open_n and m["thrid"]:
             s["threads"][m["thrid"]] = c
-        why = (("ACTION NEEDED. " if x["act"] else "") + x["line"] + (f" Risk: {x['risk']}." if x["risk"] else "")
+        why = (x["line"] + (f" Risk: {x['risk']}." if x["risk"] else "")
                + (f" For #{c}." if c in open_n else f" Topic: {x['carry']}." if x["carry"] else ""))
-        found.append((m, why.strip(), x["urgent"]))
+        found.append((m, "ACTION NEEDED. " if x["act"] else "", why.strip(), x["urgent"]))
     lines, items = [], []
-    for m, why, urgent in found:
-        line = f"From {m['from']}: \"{m['subject']}\". {why} (thread-id {m['thrid']})"
+    one = lambda t: " ".join(str(t).split())  # mail text never starts a line of its own (no forged marker)
+    for m, mark, why, urgent in found:
+        # #171: the relay's own marker comes first; the sender's words only after it
+        line = f"{mark}From {one(m['from'])}: \"{one(m['subject'])}\". {one(why)} (thread-id {m['thrid']})"
         items.append({"id": m["id"], "thrid": m["thrid"], "date": m["date"], "line": line})
         if urgent or not night:  # Instinct: at night only when waiting costs a loss or a deadline
             lines.append(line)
@@ -4608,7 +4612,7 @@ def mail_check():
         lines.append(f"{len(ids) - MAIL_MAX} older new mails came in at once and were not sorted.")
 
     def save(cur):  # saved before the note goes out: a crash may miss one alert, never sends it twice
-        cur.update(history=newest, done=(done + ids)[-MAIL_DONE:])
+        cur.update(history=newest, done=(done + ids[-MAIL_MAX:])[-MAIL_DONE:])  # unsorted extras stay open
         cur["threads"].update(s["threads"])
         cur["watch"] = [w for w in cur["watch"] if w not in used and w["until"] > time.time()]
         cur["digest"] = (cur["digest"] + items)[-50:]
