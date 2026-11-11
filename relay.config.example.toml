@@ -290,6 +290,11 @@ blocked_close_hours = 48
 effort_default = ""
 effort_high = "high"
 effort_high_words = []
+# Model per thread (empty = every thread on the CLI default). name = "claude --model value" ("" = the
+# CLI default). The coordinator may add "| model=fable" to a brief; else sonnet when the effort is low,
+# else opus. A thread with high effort or a word above never runs on sonnet. Haiku is refused.
+# Check the values once: claude -p --model <value> "reply ok".
+# models = { opus = "", sonnet = "sonnet[1m]", fable = "claude-fable-5-2[1m]" }
 
 [watchdog]
 # scripts/relay_watchdog.py runs every minute (its own launchd job, installed by scripts/install-launchd.sh).

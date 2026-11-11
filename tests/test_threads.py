@@ -268,6 +268,48 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "xhigh")
         self.assertNotIn("effort=", rc.call_args[0][2])  # the marker is not part of the brief
 
+    def test_model_marked_or_automatic(self):
+        relay.CFG["threads"].update(effort_default="medium", effort_high_words=["budget"],
+                                    models={"opus": "", "sonnet": "sonnet[1m]", "fable": "claude-fable-5-2[1m]"})
+        self.assertIn("model=", relay.owner_system(relay.CFG))
+        relay.thread_dispatch(("new", "a", "research it | model=fable"), "x")  # tag wins
+        relay.thread_dispatch(("new", "b", "rename files | effort=low"), "x")  # low effort -> sonnet
+        relay.thread_dispatch(("new", "Trip budget", "sum | model=sonnet"), "x")  # costly word: never below opus
+        relay.thread_dispatch(("new", "c", "fix | model=haiku"), "x")  # haiku is no thread model
+        relay.thread_dispatch(("new", "d", "plan"), "x")  # no tag -> opus
+        db = relay.threads_db()
+        self.assertEqual([db[k]["model"] for k in "12345"], ["fable", "sonnet", "opus", "opus", "opus"])
+        self.assertIn("model=fable", relay.thread_list())
+        self.assertNotIn("model=opus", relay.thread_list())
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            self.jobs[0][1]()
+            args = rc.call_args[0][0]
+            self.assertEqual(args[args.index("--model") + 1], "claude-fable-5-2[1m]")
+            self.assertNotIn("model=", rc.call_args[0][2])  # the marker is not part of the brief
+            self.jobs[4][1]()
+            self.assertNotIn("--model", rc.call_args[0][0])  # opus = "" = the CLI default
+        relay.thread_dispatch(("to", "2", "harder now | model=fable"), "x")  # @@TO changes it
+        relay.thread_dispatch(("to", "3", "go on | model=sonnet"), "x")  # still a costly title
+        relay.thread_dispatch(("to", "5", "go on"), "x")  # no tag keeps the model
+        db = relay.threads_db()
+        self.assertEqual([db[k]["model"] for k in "235"], ["fable", "opus", "opus"])
+        relay.threads_db("6", title="old", state="working", sid="", last="", effort="low")  # from before #192
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            relay.thread_run("6", "go")
+            args = rc.call_args[0][0]
+            self.assertEqual(args[args.index("--model") + 1], "sonnet[1m]")
+
+    def test_models_off_and_checked(self):
+        relay.thread_dispatch(("new", "a", "go | model=fable"), "x")  # no threads.models: nothing changes
+        self.assertEqual(relay.threads_db()["1"]["model"], "")
+        self.assertNotIn("model=", relay.owner_system(relay.CFG))
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            self.jobs[0][1]()
+            self.assertNotIn("--model", rc.call_args[0][0])
+        for bad in ({"haiku": "haiku"}, {"opus": "claude-haiku-5-5"}, {"opus": 5}, ["opus"]):
+            cfg = dict(relay.CFG, threads=dict(relay.CFG["threads"], models=bad))
+            self.assertTrue([e for e in relay.validate(cfg)[0] if "threads.models" in e], bad)
+
     def test_decisions_by_topic(self):
         relay.thread_dispatch(("new", "a", "plan | topic=budget"), "x")
         relay.thread_dispatch(("new", "b", "plan | topic=mom"), "x")
