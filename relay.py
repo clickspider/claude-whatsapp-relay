@@ -1946,14 +1946,14 @@ MODEL_RULES = (
     "sonnet = simple, fast, light threads; fable = the most ambitious, open-ended, long technical or "
     "research work. No tag = opus (sonnet when the effort is low). Work where a mistake is costly never "
     "runs below opus. Haiku is never a thread model. A thread stuck twice at effort high: "
-    "'@@TO #<n>: model=fable'; once it is solved, add 'model=opus' to your next real note to it. ")
+    "'@@TO #<n>: model=fable'; once it is solved, end your next real note to it with ' | model=opus'. ")
 
 
 def take_model(text):
     """'... | model=fable' -> (text without it, "fable"); no tag -> (text, ""). A name not in threads.models
     (model=haiku) is taken out too and counts as no tag."""
     m = MODEL_RE.search(text or "")
-    if not m:
+    if not m or m.group(1).lower() not in MODEL_NAMES + ("haiku",):  # code like 'model=pick(x)' stays
         return text, ""
     name = m.group(1).lower()
     return (text[:m.start()] + text[m.end():]).strip(), name if name in CFG["threads"]["models"] else ""

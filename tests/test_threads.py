@@ -316,6 +316,8 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(relay.take_model("the old model=gpt4 was wrong | model=fable"),
                          ("the old model=gpt4 was wrong", "fable"))
         self.assertEqual(relay.take_model("fix | model=haiku"), ("fix", ""))  # unknown tag leaves the brief
+        self.assertEqual(relay.take_model("Fix this:\nmodel=pick_model(x)\nthen test"),
+                         ("Fix this:\nmodel=pick_model(x)\nthen test", ""))  # code stays (R2-2)
         line = "You've hit your Fable limit · resets 9:50pm (Europe/Amsterdam)"
         cmd = [sys.executable, "-c", f"import sys; print({line!r}); "
                "sys.stderr.write('[claude-code:unrecognized_model] {\"model\":\"f\"}\\n')"]
