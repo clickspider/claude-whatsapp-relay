@@ -187,6 +187,10 @@ def validate(cfg):
         err.append('threads.models must be name = "claude --model value" lines ("" = the CLI default).')
     elif any("haiku" in f"{k} {v}".lower() for k, v in ms.items()):
         err.append("threads.models: haiku is never a thread model (subagents and background work only).")
+    elif set(ms) - set(MODEL_NAMES):
+        err.append(f"threads.models: names must be from {list(MODEL_NAMES)}.")
+    elif o["max_context_tokens"] > 200_000 and any(v and "[1m]" not in v for v in ms.values()):
+        warn.append("threads.models: a value without [1m] may have a 200k window, below owner.max_context_tokens.")
     if o["permission_mode"] not in PERMISSION_MODES:
         err.append(f"owner.permission_mode must be one of {sorted(PERMISSION_MODES)} "
                    "(bypassPermissions is refused on purpose).")
@@ -1290,6 +1294,9 @@ def run_claude(args, cwd, prompt):
         if p in _preempted:
             _preempted.discard(p)
             raise Preempted()
+    # '[claude-code:unrecognized_model] ...' (a new model name the CLI does not know yet) is no answer:
+    # it broke the one-line limit check and could become a thread report (#192 reviewer F1)
+    err = "\n".join(x for x in (err or "").splitlines() if not x.startswith("[claude-code:"))
     r = subprocess.CompletedProcess(args, p.returncode, out, err)
     if "--resume" in args and NO_SESSION in (out or "") + (err or ""):
         # stopped before its first turn was saved: start that session after all
@@ -1931,22 +1938,25 @@ def take_effort(text):
     return (text[:m.start()] + text[m.end():]).strip(), m.group(1).lower()
 
 
-MODEL_RE = re.compile(r"\|?\s*\bmodel\s*=\s*(\w+)", re.I)
+MODEL_RE = re.compile(r"(?:^|\|)\s*model\s*=\s*(\w+)\b", re.I | re.M)  # a tag, never prose
+MODEL_NAMES = ("opus", "sonnet", "fable")
 MODEL_RULES = (
     "Each thread also runs on a model: add ' | model=<opus|sonnet|fable>' to the brief "
     "('@@TO #<n>: model=fable' changes it). opus = the default for daily work, coding and knowledge work; "
     "sonnet = simple, fast, light threads; fable = the most ambitious, open-ended, long technical or "
     "research work. No tag = opus (sonnet when the effort is low). Work where a mistake is costly never "
     "runs below opus. Haiku is never a thread model. A thread stuck twice at effort high: "
-    "'@@TO #<n>: model=fable'; once it is solved, '@@TO #<n>: model=opus'. ")
+    "'@@TO #<n>: model=fable'; once it is solved, add 'model=opus' to your next real note to it. ")
 
 
 def take_model(text):
-    """'... | model=fable' -> (text without it, "fable"); a name not in threads.models -> (text, "")."""
+    """'... | model=fable' -> (text without it, "fable"); no tag -> (text, ""). A name not in threads.models
+    (model=haiku) is taken out too and counts as no tag."""
     m = MODEL_RE.search(text or "")
-    if not m or m.group(1).lower() not in CFG["threads"]["models"]:
+    if not m:
         return text, ""
-    return (text[:m.start()] + text[m.end():]).strip(), m.group(1).lower()
+    name = m.group(1).lower()
+    return (text[:m.start()] + text[m.end():]).strip(), name if name in CFG["threads"]["models"] else ""
 
 
 def pick_model(model, effort, *texts):
@@ -2033,7 +2043,7 @@ def thread_run(n, prompt):
         prompt = f"MAIN CHAT (since your last turn):\n{ctx}\n\n{prompt}"
     folder, limit = CFG["owner"]["folder"], CFG["owner"]["max_context_tokens"]
     effort = t.get("effort", auto_effort(t["title"]))
-    model = CFG["threads"]["models"].get(t.get("model") or pick_model("", effort, t["title"], t.get("topic", "")), "")
+    model = CFG["threads"]["models"].get(pick_model(t.get("model", ""), effort, t["title"], t.get("topic", ""), task), "")
     try:
         with _tsem[0]:  # max_parallel runs at once; the others wait their turn
             if not new and limit and context_tokens(sid) > limit:  # big session: hand off, start fresh

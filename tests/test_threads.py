@@ -299,6 +299,33 @@ class ThreadTests(unittest.TestCase):
             args = rc.call_args[0][0]
             self.assertEqual(args[args.index("--model") + 1], "sonnet[1m]")
 
+    def test_model_floor_tag_and_cli_warning(self):  # #192 reviewer F1, F2, F4, F7 + the 2 surviving mutants
+        relay.CFG["threads"].update(effort_default="medium", effort_high_words=["budget"],
+                                    models={"opus": "o[1m]", "sonnet": "s[1m]", "fable": "f[1m]"})
+        relay.thread_dispatch(("new", "e", "x | model=sonnet | effort=high"), "x")  # effort alone lifts it
+        relay.thread_dispatch(("new", "Trip budget", "x | model=sonnet | effort=medium"), "x")  # the word alone
+        relay.thread_dispatch(("new", "rename", "rename files | effort=low"), "x")  # sonnet
+        relay.thread_dispatch(("to", "3", "check it | effort=high"), "x")  # no model tag: still lifted at run time
+        db = relay.threads_db()
+        self.assertEqual([db[k]["model"] for k in "12"], ["opus", "opus"])
+        with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
+            relay.thread_run("3", "go")
+            args = rc.call_args[0][0]
+            self.assertEqual(args[args.index("--model") + 1], "o[1m]")
+        self.assertEqual(relay.take_model("set model=sonnet in the toml"), ("set model=sonnet in the toml", ""))
+        self.assertEqual(relay.take_model("the old model=gpt4 was wrong | model=fable"),
+                         ("the old model=gpt4 was wrong", "fable"))
+        self.assertEqual(relay.take_model("fix | model=haiku"), ("fix", ""))  # unknown tag leaves the brief
+        line = "You've hit your Fable limit · resets 9:50pm (Europe/Amsterdam)"
+        cmd = [sys.executable, "-c", f"import sys; print({line!r}); "
+               "sys.stderr.write('[claude-code:unrecognized_model] {\"model\":\"f\"}\\n')"]
+        with mock.patch.object(relay, "hold_if_stopping"):  # an earlier test may leave STOPPING set
+            with self.assertRaises(relay.ClaudeLimit):  # exit 0 + the CLI warning on stderr: still a limit
+                relay.run_claude(cmd, self.tmp.name, "")
+            r = relay.run_claude([sys.executable, "-c", "import sys; sys.stderr.write('[claude-code:x] y\\n')"],
+                                 self.tmp.name, "")
+        self.assertEqual(r.stderr, "")  # the warning never becomes a report
+
     def test_models_off_and_checked(self):
         relay.thread_dispatch(("new", "a", "go | model=fable"), "x")  # no threads.models: nothing changes
         self.assertEqual(relay.threads_db()["1"]["model"], "")
@@ -306,9 +333,11 @@ class ThreadTests(unittest.TestCase):
         with mock.patch.object(relay, "run_claude", return_value=R("ok\n@@STATE: review")) as rc:
             self.jobs[0][1]()
             self.assertNotIn("--model", rc.call_args[0][0])
-        for bad in ({"haiku": "haiku"}, {"opus": "claude-haiku-5-5"}, {"opus": 5}, ["opus"]):
+        for bad in ({"haiku": "haiku"}, {"opus": "claude-haiku-5-5"}, {"opus": 5}, ["opus"], {"Fable": "f"}):
             cfg = dict(relay.CFG, threads=dict(relay.CFG["threads"], models=bad))
             self.assertTrue([e for e in relay.validate(cfg)[0] if "threads.models" in e], bad)
+        cfg = dict(relay.CFG, threads=dict(relay.CFG["threads"], models={"sonnet": "sonnet"}))
+        self.assertTrue([w for w in relay.validate(cfg)[1] if "[1m]" in w])
 
     def test_decisions_by_topic(self):
         relay.thread_dispatch(("new", "a", "plan | topic=budget"), "x")
