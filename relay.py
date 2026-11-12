@@ -3314,7 +3314,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     sending_text(refs, "?" if media else body)
     for spec in images:  # before the text: the question comes after the pictures
         send_agent_image(a, OWNER if dry else jid, spec)
-    for spec in videos:  # #203: mom's washer video to amiel, 12 Nov 2026
+    for spec in videos:  # #203: a contact agent sends a video from its home
         send_agent_image(a, OWNER if dry else jid, spec, exts=(".mp4", ".mov"), max_mb=VIDEO_MAX_MB)
     for spec in files:
         send_agent_image(a, OWNER if dry else jid, spec, exts=(".pdf",))
@@ -3333,7 +3333,7 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         send_gif(OWNER if dry else jid, m["STICKER"] or m["GIF"], sticker=bool(m["STICKER"]))
 
 
-VIDEO_MAX_MB = 16  # WhatsApp's media limit for photos, videos and voice messages
+VIDEO_MAX_MB = 32  # ponytail: keeps the upload inside the bridge's 60 s write timeout on a normal line; raise with care
 
 
 def send_agent_image(a, chat, spec, exts=(".jpg", ".jpeg", ".png", ".webp"), max_mb=None):
@@ -3356,7 +3356,7 @@ def send_agent_image(a, chat, spec, exts=(".jpg", ".jpeg", ".png", ".webp"), max
         api("send", {"recipient": chat, "message": caption.strip(), "media_path": out})
         log_thread(a, "AGENT (image)", f"{os.path.basename(p)} {caption.strip()}".strip())
     except Exception as e:
-        send_text(OWNER, f"🔔 {a['name']}: image not sent ({os.path.basename(p)}: {e})")
+        send_text(OWNER, f"🔔 {a['name']}: media maybe not sent, check the chat before you resend ({os.path.basename(p)}: {e})")
 
 
 def add_mentions(a, body, names):

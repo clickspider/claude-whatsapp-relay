@@ -85,7 +85,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_video_marker_sends_only_small_videos_in_home(self):
-        # #203, 12 Nov 2026: amiel's agent sends mom's washer video
+        # #203: a contact agent sends a video from its home
         import tempfile
         home, out = tempfile.mkdtemp(), tempfile.mkdtemp()
         os.makedirs(os.path.join(home, "media", "out"))
@@ -100,14 +100,22 @@ class ParseTests(unittest.TestCase):
                            ("log_thread", lambda *a, **kw: None), ("pick_react", lambda *a: None)):
             self.addCleanup(setattr, relay, name, getattr(relay, name))
             setattr(relay, name, fake)
-        a = {"name": "amiel", "home": home, "trust": "reply", "checkins": False, "videos": True, "images": False,
+        a = {"name": "carl", "home": home, "trust": "reply", "checkins": False, "videos": True, "images": False,
              "files": False, "mentions": False, "gifs": False, "ask_contact": False}
         out_text = ("הנה הסרטון\n@@VIDEO: media/out/wall.mp4 | הקיר\n@@VIDEO: media/out/big.mov\n"
                     "@@VIDEO: media/out/bed.jpg\n@@VIDEO: ../../../etc/passwd")
-        relay.deliver("amiel@s", a, out_text, False)
+        relay.deliver("carl@s", a, out_text, False)
         self.assertEqual([(os.path.basename(p["media_path"]), p["message"]) for p in sent], [("wall.mp4", "הקיר")])
-        self.assertEqual(texts[-1], ("amiel@s", "הנה הסרטון"))
+        self.assertEqual(texts[-1], ("carl@s", "הנה הסרטון"))
         self.assertEqual(len(texts), 4)  # 3 refused (too big, not a video, outside home): notes to the owner
+        receipts = []  # review F2: a video makes the receipt "?" so a restart never sends it twice
+        self.addCleanup(setattr, relay, "sending_text", relay.sending_text)
+        relay.sending_text = lambda refs, text: receipts.append(text)
+        relay.deliver("carl@s", a, "@@VIDEO: media/out/wall.mp4", False)
+        self.assertEqual(receipts, ["?", ""])
+        receipts.clear()
+        relay.deliver("carl@s", a, "Hi\n@@VIDEO: media/out/wall.mp4", False)
+        self.assertEqual(receipts, ["?", "?"])
         sent.clear()
         relay.deliver("x@s", dict(a, videos=False), "Hi\n@@VIDEO: media/out/wall.mp4", False)  # off = nothing goes out
         relay.deliver("x@s", dict(a, trust="draft", dir=tempfile.mkdtemp()), "Hi\n@@VIDEO: media/out/wall.mp4", False)  # held draft: no video
