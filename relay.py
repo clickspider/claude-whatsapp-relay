@@ -2853,7 +2853,8 @@ def config_gate_ask(line):
     """One proposal -> the exact changed lines (+ the inbox notes it would send) and an Apply / Don't apply
     poll to the owner. A bad one: a note to the coordinator, nothing to the owner. No poll = nothing changes."""
     name, changes, note, err = parse_config(line)
-    stamp = f"{note + ', ' if note else ''}{owner_now():%d %b %Y} on {CFG['owner']['name']}'s vote"
+    short = gate_note(note)[:80]  # the date and "vote" always fit (review #201 R2-1)
+    stamp = f"{short + ', ' if short else ''}{owner_now():%d %b %Y} on {CFG['owner']['name']}'s vote"
     notes = []
     try:
         text = read(CFG["config_path"])
@@ -2877,7 +2878,7 @@ def config_gate_ask(line):
                     for x, t in notes)
     send_text(OWNER, f"Change to relay.config.toml, agent {name}:\n\n" + "\n".join(diff) + first)
     question = f"Apply to {name}: " + ", ".join(f"{k} = {toml_val(v)}" for k, v in changes.items()) + "?"
-    question = question if len(question) <= 250 else question[:240] + "… (see above)?"
+    question = question if len(question) <= 250 else question[:236] + "… (see above)?"
     try:
         mid = api("poll", {"recipient": OWNER, "question": question, "options": [CONFIG_APPLY, CONFIG_NO],
                            "selectable_count": 1}).get("message_id")

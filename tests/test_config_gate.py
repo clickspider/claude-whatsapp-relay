@@ -179,6 +179,38 @@ class ConfigGate(unittest.TestCase):
             self.assertEqual(relay.config_check(text, dan_old, "dan", {"images": True}),
                              ["the new config would change more than these keys"])
 
+    def test_own_dir_cap_shown_equals_written_and_second_poll(self):  # review #201 R2-2
+        other = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(os.path.join(other, "inbox"))
+        open(os.path.join(other, "RULES.md"), "w").close()
+        with open(os.path.join(other, "inbox", "1.md"), "w") as h:
+            h.write("FROM THE OWN DIR")
+        with open(self.conf) as h:
+            text = h.read()
+        with open(self.conf, "w") as h:
+            h.write(text.replace('name = "carl"\n', f'name = "carl"\ndir = "{other}"\nlive = false\n', 1)
+                    .replace('live = true\n', '', 2).replace('jid = "972501234567@s.whatsapp.net"\n',
+                                                         'jid = "972501234567@s.whatsapp.net"\nlive = true\n'))
+        self.cfg = relay.load_config(self.conf)
+        self.cfg["paths"]["state_dir"] = self.tmp.name
+        with self.patch():
+            relay.config_gate_ask("carl | live=true | inbox=true")
+            self.assertIn("FROM THE OWN DIR", self.sent[-1])
+            with open(os.path.join(other, "inbox", "1.md"), "w") as h:
+                h.write("x" * 1501)
+            n = len(self.notes)
+            relay.config_gate_ask("carl | live=true | inbox=true | note=" + "w" * 130)
+            self.assertIn("1500", self.notes[n])
+            os.remove(os.path.join(other, "inbox", "1.md"))
+            relay.config_gate_ask("bob | images=true | note=" + "w" * 130)
+            plus = [x for x in self.sent[-1].split("\n") if x.startswith("+")][0][1:]
+            self.assertRegex(plus, r", \d\d \w{3} \d{4} on \w+'s vote$")
+            rec = dict(relay.polls()["P1"])
+            relay.on_vote("V1", "o@s.whatsapp.net", "o", "P1", "Apply")
+            with open(self.conf) as h:
+                self.assertIn(plus, h.read().split("\n"))  # written line = the shown "+" line
+            self.assertIn("already has", relay.config_gate_apply(dict(rec, poll_id="P9")))
+
 
 if __name__ == "__main__":
     unittest.main()
