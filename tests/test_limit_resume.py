@@ -171,6 +171,15 @@ class Queue(Base):
             relay.resume_parked(relay.time.time() + 3600)
         r.assert_called_once_with("g1", gjid, "15550100003", "@bot what time is dinner?", "")
 
+    def test_resumed_message_skips_the_rate_limit(self):
+        # #204 review N1: a parked batch bigger than per_minute lost its last (tagged) items on resume
+        relay.LIMIT_RESUMED.add("g8")
+        d = mock.Mock()
+        with mock.patch.multiple(relay, allowed=lambda c: False, dispatch=d):
+            relay.route("g8", relay.OWNER, "s", "@bot dinner?", "")
+            relay.route("g9", relay.OWNER, "s", "new one", "")
+        self.assertEqual([c.args[0] for c in d.call_args_list], ["g8"])
+
     def test_owner_message_goes_again_with_the_note(self):
         relay.route("m1", relay.OWNER, "s", "plan my week", "")  # -> owner batch
         relay.CFG["owner"]["batch_seconds"] = 0

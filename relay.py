@@ -3503,6 +3503,7 @@ def group_turn(jid, a, items, addressed):
                 "unless a really important note is needed (see your rules).")
     out = run_agent(a, f"{a['group_label']} {head}\n" + "\n".join(lines))
     for it in items:  # the run is done: a restart from here never runs the batch again (no double answer)
+        unpark(it[1])
         done_job(it[1])
     deliver(jid, a, out, False, refs=refs)
 
@@ -4134,7 +4135,7 @@ def route(msg_id, chat, sender, content, media_type):
     a = None if chat == OWNER else by_jid(chat)
     if chat != OWNER and (not a or not a["live"] or flag(a, "paused") is not None):
         return  # unknown chats are ignored: never counted, never reported
-    if not allowed(chat):
+    if msg_id not in RESUMED and msg_id not in LIMIT_RESUMED and not allowed(chat):  # a re-run was counted once
         if chat not in _limit_noted:  # tell the owner once per chat per limit window
             _limit_noted.add(chat)
             send_text(OWNER, f"Rate limit hit for {'your chat' if chat == OWNER else chat}. "
