@@ -127,6 +127,58 @@ class ConfigGate(unittest.TestCase):
         with self.assertRaises(ValueError):
             relay.config_edit(twice, "bob", {"images": True}, "")
 
+    def test_waking_inbox_notes_are_shown_and_pinned(self):  # review #201 F1
+        inbox = os.path.join(self.tmp.name, "agents", "bob", "inbox")
+        os.makedirs(inbox)
+        with open(os.path.join(inbox, "1-hi.md"), "w") as h:
+            h.write("SAY HELLO TO BOB")
+        with self.patch():
+            relay.config_gate_ask("bob | inbox=true | trust=draft")
+            self.assertIn("SAY HELLO TO BOB", self.sent[0])
+            rec = relay.polls()["P1"]
+            with open(os.path.join(inbox, "2-more.md"), "w") as h:
+                h.write("AND THIS")
+            self.assertIn("inbox notes changed", relay.config_gate_apply(rec))
+            self.assertNotIn("inbox", self.raw("bob"))
+            relay.config_gate_ask("carl | images=true")  # carl's inbox stays off: nothing to show
+            self.assertNotIn("Inbox note", self.sent[-1])
+
+    def test_resume_after_the_age_limit_still_says_nothing(self):  # review #201 F2
+        with self.patch():
+            relay.config_gate_ask("bob | images=true")
+            relay.on_vote("V1", "o@s.whatsapp.net", "o", "P1", "Apply")
+            self.assertEqual(relay.config_gate_apply(dict(relay.polls()["P1"], time=0)), "")
+
+    def test_every_guard_bites(self):  # review #201 F3: each of these must refuse
+        multi = 'trial_message = """\nimages = false\n"""\n'
+        with open(self.conf, "a") as h:
+            h.write('\n[[agent]]\nname = "dan"\njid = "972501234569@s.whatsapp.net"\n' + multi)
+        os.makedirs(os.path.join(self.tmp.name, "agents", "dan"))
+        open(os.path.join(self.tmp.name, "agents", "dan", "RULES.md"), "w").close()
+        self.cfg = relay.load_config(self.conf)
+        self.cfg["paths"]["state_dir"] = self.tmp.name
+        with self.patch():
+            relay.config_gate_ask("dan | images=true")  # the edit lands in the string: config_check refuses
+            self.assertIn("more than these keys", self.notes[-1])
+            relay.config_gate_ask("bob")
+            self.assertIn("at least one", self.notes[-1])
+            relay.config_gate_ask("bob | images=false")
+            self.assertIn("already has", self.notes[-1])
+            relay.config_gate_ask("bob | images=true")
+            rec = relay.polls()["P1"]
+            self.assertIn("broken", relay.config_gate_apply(dict(rec, changes=["images"])))
+            self.assertIn("more than these keys", relay.config_gate_apply(dict(rec, target="dan", old={"images": None})))
+            text = open(self.conf).read()
+            with self.assertRaises(ValueError):
+                relay.config_edit(text.replace("images = false", "images = false\nimages = false"), "bob",
+                                  {"images": True}, "")
+            os.remove(os.path.join(self.tmp.name, "agents", "carl", "RULES.md"))
+            self.assertIn("errors already", relay.config_gate_apply(rec))
+            self.assertEqual(open(self.conf).read(), text)
+            dan_old = relay.config_edit(text, "dan", {"images": True}, "")
+            self.assertEqual(relay.config_check(text, dan_old, "dan", {"images": True}),
+                             ["the new config would change more than these keys"])
+
 
 if __name__ == "__main__":
     unittest.main()

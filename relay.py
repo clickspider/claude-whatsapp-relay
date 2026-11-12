@@ -2696,8 +2696,6 @@ def contact_gate_add(rec):
     """The owner voted Add -> check again on the config as it is on disk, append, load + validate the result
     as a copy, and only then replace the config. The relay sees the new mtime and restarts by itself."""
     f, note = rec.get("contact") or {}, rec.get("note", "")
-    if time.time() - rec.get("time", 0) > CONTACT_OK_HOURS * 3600:
-        return f"That proposal is older than {CONTACT_OK_HOURS} hours, so nothing was added. Ask me again."
     conf = os.path.realpath(CFG["config_path"])
     with open(os.open(st("contact-gate.lock"), os.O_WRONLY | os.O_CREAT, 0o600)) as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
@@ -2708,6 +2706,8 @@ def contact_gate_add(rec):
         if any(a["name"] == f.get("name") and a["jid"] == f.get("jid") for a in agents(cur)):
             mine = (polls().get(rec.get("poll_id")) or {}).get("adding")
             return "" if mine else f"{f['name']} is already in the config."  # "": resumed after its own add (F4)
+        if time.time() - rec.get("time", 0) > CONTACT_OK_HOURS * 3600:  # after the resume check (review #201 F2)
+            return f"That proposal is older than {CONTACT_OK_HOURS} hours, so nothing was added. Ask me again."
         err = check_contact(f, cur)
         if err:
             return "Nothing was added: " + "; ".join(err)
@@ -2775,10 +2775,11 @@ CONFIG_APPLY, CONFIG_NO = "Apply", "Don't apply"
 AGENT_HEAD_RE = re.compile(r"^\s*\[\[\s*agent\s*\]\]\s*(#.*)?$")
 
 
-def config_edit(text, name, changes, note):
+def config_edit(text, name, changes, stamp):
     """The config text with the changes made in the one [[agent]] block of that name: a key line there is
-    replaced, a missing key goes right under the name line. ValueError when the block or a key is not clear.
-    Never trusted alone: config_check compares the parsed result with the parsed original."""
+    replaced, a missing key goes right under the name line. stamp = the end-of-line comment, made once at the
+    ask (the owner sees the same lines that are written, review #201 F4). ValueError when the block or a key is
+    not clear. Never trusted alone: config_check compares the parsed result with the parsed original."""
     lines = text.split("\n")
     blocks = []
     for h, line in enumerate(lines):
@@ -2789,7 +2790,7 @@ def config_edit(text, name, changes, note):
     if len(blocks) != 1:
         raise ValueError(f"found {len(blocks)} [[agent]] blocks named '{name}', not 1")
     h, at, end = blocks[0]
-    tag = f"  # {gate_note(note) + ', ' if gate_note(note) else ''}{owner_now():%d %b %Y} on {CFG['owner']['name']}'s vote"
+    tag = f"  # {gate_note(stamp)}" if gate_note(stamp) else ""
     for k, v in changes.items():
         hit = [j for j in range(h + 1, end) if re.match(rf"^\s*{k}\s*=", lines[j])]
         if len(hit) > 1:
@@ -2820,81 +2821,106 @@ def parse_config(line):
     return name, changes, note, err
 
 
-def config_now(name, changes, cfg):
-    """(errors, the agent's current raw values of these keys: None = not in the file), from the config on disk."""
+def config_now(name, changes, cfg, text):
+    """(errors, the agent (normalized), its current values of these keys in text: None = not in the file)."""
+    if not isinstance(changes, dict):
+        return ["the stored proposal is broken"], None, {}
     err = [f"'{k}' is not allowed (keys: {', '.join(CONTACT_KEYS[2:])})" for k in changes if k not in CONTACT_KEYS[2:]]
     err += check_values(changes)
     if not changes:
         err.append("give at least one key=value")
-    if not NAME_RE.match(name) or not any(a["name"] == name for a in agents(cfg)):
-        return err + [f"there is no agent '{name}'"], {}
-    with open(cfg["config_path"], "rb") as h:
-        raw = next((a for a in tomllib.load(h).get("agent", []) if a.get("name") == name), {})
-    return err, {k: raw.get(k) for k in changes}
+    a = next((x for x in agents(cfg) if x["name"] == name), None) if NAME_RE.match(name) else None
+    if not a:
+        return err + [f"there is no agent '{name}'"], None, {}
+    raw = next((x for x in tomllib.loads(text).get("agent", []) if x.get("name") == name), {})
+    return err, a, {k: raw.get(k) for k in changes}
+
+
+def config_wakes(a, changes):
+    """[(file, text)] of the inbox notes this change would send at once: deliver_inbox sends the notes of a
+    live agent with inbox on, with no draft step, even on trust = draft (review #201 F1, like #154 F2). Only
+    when the change turns that on. ponytail: a trial_hours or quiet_hours change that frees notes is not shown."""
+    on = lambda k: changes.get(k, a[k]) is True
+    if (a["live"] and a["inbox"]) or not (on("live") and on("inbox")):
+        return []
+    inbox = os.path.join(a["dir"], "inbox")  # a["dir"]: an existing agent may have its own dir
+    if not os.path.isdir(inbox):
+        return []
+    return [(x, read(os.path.join(inbox, x))) for x in sorted(os.listdir(inbox)) if x.endswith(".md")]
 
 
 def config_gate_ask(line):
-    """One proposal -> the exact changed lines + an Apply / Don't apply poll to the owner. A bad one: a note to
-    the coordinator, nothing to the owner. No poll = nothing can change."""
+    """One proposal -> the exact changed lines (+ the inbox notes it would send) and an Apply / Don't apply
+    poll to the owner. A bad one: a note to the coordinator, nothing to the owner. No poll = nothing changes."""
     name, changes, note, err = parse_config(line)
+    stamp = f"{note + ', ' if note else ''}{owner_now():%d %b %Y} on {CFG['owner']['name']}'s vote"
+    notes = []
     try:
-        more, old = config_now(name, changes, CFG)
+        text = read(CFG["config_path"])
+        more, a, old = config_now(name, changes, CFG, text)
         err += more
         if not err and old == changes:
             err.append(f"{name} already has these values")
         if not err:
-            text = read(CFG["config_path"])
-            new_text = config_edit(text, name, changes, note)
+            new_text = config_edit(text, name, changes, stamp)
             err += config_check(text, new_text, name, changes)
+            notes = config_wakes(a, changes)
     except (ValueError, OSError, tomllib.TOMLDecodeError) as e:
         err.append(str(e))
+    if not err and any(len(t) > CONTACT_NOTE_MAX for _, t in notes):  # shown whole or not at all
+        err.append(f"an inbox note of {name} is longer than {CONTACT_NOTE_MAX} characters, so the owner "
+                   "could not see all of it")
     if err:
         return agent_note("relay", f"@@CONFIG not proposed ({line[:80]}): " + "; ".join(err))
-    diff = [d for d in difflib.unified_diff(text.split("\n"), new_text.split("\n"), lineterm="", n=1)][2:]
-    send_text(OWNER, f"Change to relay.config.toml, agent {name}:\n\n" + "\n".join(diff))
+    diff = list(difflib.unified_diff(text.split("\n"), new_text.split("\n"), lineterm="", n=1))[2:]
+    first = "".join(f"\n\nInbox note {x}: {name}'s helper sends it right after Apply, with no draft step:\n{t}"
+                    for x, t in notes)
+    send_text(OWNER, f"Change to relay.config.toml, agent {name}:\n\n" + "\n".join(diff) + first)
     question = f"Apply to {name}: " + ", ".join(f"{k} = {toml_val(v)}" for k, v in changes.items()) + "?"
+    question = question if len(question) <= 250 else question[:240] + "… (see above)?"
     try:
-        mid = api("poll", {"recipient": OWNER, "question": question[:250], "options": [CONFIG_APPLY, CONFIG_NO],
+        mid = api("poll", {"recipient": OWNER, "question": question, "options": [CONFIG_APPLY, CONFIG_NO],
                            "selectable_count": 1}).get("message_id")
     except Exception:
         mid = None
     if not mid:
         return send_text(OWNER, "(could not make the poll, so nothing will change. Ask me again.)")
-    polls({mid: {"kind": "configgate", "chat": OWNER, "question": question[:250], "target": name, "changes": changes,
-                 "old": old, "note": note, "time": time.time(), "poll_id": mid}})
+    polls({mid: {"kind": "configgate", "chat": OWNER, "question": question, "target": name, "changes": changes,
+                 "old": old, "stamp": stamp, "inbox": digest(json.dumps(notes)), "time": time.time(),
+                 "poll_id": mid}})
 
 
 def config_gate_apply(rec):
     """The owner voted Apply -> under the gate lock: check again on the config as it is on disk (the poll record
-    is a file, never trusted), the values still the ones he saw, then config_swap. "" = resumed after its own
-    apply (nothing to say)."""
-    name, changes = str(rec.get("target", "")), rec.get("changes") or {}
-    if time.time() - rec.get("time", 0) > CONTACT_OK_HOURS * 3600:
-        return f"That proposal is older than {CONTACT_OK_HOURS} hours, so nothing changed. Ask me again."
-    if not isinstance(changes, dict):
-        return "Nothing changed: the stored proposal is broken. Ask me again."
+    is a file, never trusted), the values and inbox notes still the ones he saw, then config_swap.
+    "" = resumed after its own apply (nothing to say)."""
+    name, changes = str(rec.get("target", "")), rec.get("changes")
     conf = os.path.realpath(CFG["config_path"])
     with open(os.open(st("contact-gate.lock"), os.O_WRONLY | os.O_CREAT, 0o600)) as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         try:
             cur = load_config(conf)
-            err, now = config_now(name, changes, cur)
+            with open(conf, encoding="utf-8") as h:  # one read: the checks and the edit see the same text (F4)
+                seen = os.fstat(h.fileno())
+                text = h.read()
+            err, a, now = config_now(name, changes, cur, text)
         except Exception as e:
             return f"relay.config.toml does not load now, so nothing changed: {e}"
         if err:
             return "Nothing changed: " + "; ".join(err)
-        if now == changes:
+        if now == changes:  # before the age check: a resume after its own apply says nothing (review #201 F2)
             mine = (polls().get(rec.get("poll_id")) or {}).get("applying")
             return "" if mine else f"{name} already has these values."
+        if time.time() - rec.get("time", 0) > CONTACT_OK_HOURS * 3600:
+            return f"That proposal is older than {CONTACT_OK_HOURS} hours, so nothing changed. Ask me again."
         if now != rec.get("old"):
             return f"Nothing changed: these {name} lines changed after you saw them. Ask me again."
+        if digest(json.dumps(config_wakes(a, changes))) != rec.get("inbox"):
+            return "Nothing changed: the waiting inbox notes changed after you saw them. Ask me again."
         if validate(cur)[0]:
             return "Nothing changed: relay.config.toml has errors already. Run: python3 relay.py check"
-        with open(conf, encoding="utf-8") as h:
-            seen = os.fstat(h.fileno())
-            text = h.read()
         try:
-            new_text = config_edit(text, name, changes, rec.get("note", ""))
+            new_text = config_edit(text, name, changes, str(rec.get("stamp", "")))
             err = config_check(text, new_text, name, changes)
         except (ValueError, tomllib.TOMLDecodeError) as e:
             err = [str(e)]
