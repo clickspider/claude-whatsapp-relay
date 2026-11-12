@@ -1064,7 +1064,7 @@ def with_feedback(chat, msg_id, sender, fn):
 
 
 class ClaudeLimit(Exception):
-    """claude -p stopped because the plan's usage limit is reached. str() = the text for the chat."""
+    """claude -p stopped because the plan's usage limit is reached. str() = the text for the OWNER only (#204)."""
     def __init__(self, when, at=None):
         self.when, self.at = when, at  # at = reset time in epoch seconds, None = unknown
         p = CFG.get("prompts") or DEFAULTS["prompts"]
@@ -3501,8 +3501,10 @@ def group_turn(jid, a, items, addressed):
     else:
         head = ("New messages in the group, NOT addressed to you. Learn from them. Stay silent "
                 "unless a really important note is needed (see your rules).")
-    deliver(jid, a, run_agent(a, f"{a['group_label']} {head}\n" + "\n".join(lines)),
-            False, refs=refs)
+    out = run_agent(a, f"{a['group_label']} {head}\n" + "\n".join(lines))
+    for it in items:  # the run is done: a restart from here never runs the batch again (no double answer)
+        done_job(it[1])
+    deliver(jid, a, out, False, refs=refs)
 
 
 def flush(name, jid, a, addressed, msg_id=None, sender=None):
@@ -3511,7 +3513,16 @@ def flush(name, jid, a, addressed, msg_id=None, sender=None):
     if not b:
         return
     job = lambda: group_turn(jid, a, b["items"], addressed)
-    enqueue(name, (lambda: with_feedback(jid, msg_id, sender, job)) if addressed and msg_id else job)
+    fn = (lambda: with_feedback(jid, msg_id, sender, job)) if addressed and msg_id else job
+    keys = [it[1] for it in b["items"]]  # #204: the limit parks the batch (route records), like a 1:1 turn
+
+    def run():
+        try:
+            limit_guard(keys, fn)
+        finally:
+            for k in keys:
+                done_job(k)
+    enqueue(name, run)
 
 
 def listen(chat, a, msg_id, sender, content, media_type):
@@ -3521,7 +3532,10 @@ def listen(chat, a, msg_id, sender, content, media_type):
     with buf_lock:
         b = buffers.setdefault(a["name"], {"items": [], "last": 0})
         b["items"].append((who, msg_id, text, media_type, sender))
+        _claimed.add(msg_id)  # #204: route() keeps its in-flight record until the batch ran (limit park)
         if cap and len(b["items"]) > cap:  # keep only the newest messages
+            for it in b["items"][:-cap]:
+                done_job(it[1])
             del b["items"][:-cap]
         b["last"] = time.time()
     jsender = sender if "@" in (sender or "") else f"{sender}@s.whatsapp.net"

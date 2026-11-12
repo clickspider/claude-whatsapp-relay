@@ -144,6 +144,33 @@ class Queue(Base):
         self.hit("m6", {"route": ["m6", relay.OWNER, "s", "hi", ""]}, self.limit())
         self.assertEqual(relay.parked(), {})
 
+    def test_group_batch_is_parked_and_never_gets_the_line(self):
+        # #204 (12 Nov 2026): a tagged group message hit the limit; the batch was lost and the group saw
+        # "I hit my Claude limit". Now: nothing goes to the group, the batch parks and runs again after the reset.
+        gjid = "120363000000000001@g.us"
+        os.makedirs(os.path.join(self.tmp.name, "agents", "grp"), exist_ok=True)
+        cfg = relay.load_config(write_cfg(self.tmp.name, "[threads]\nenabled = true\n[[agent]]\nname = \"grp\"\n"
+                                          f"jid = \"{gjid}\"\nlive = true\ntrust = \"reply\"\ntrigger = \"listen\"\n"
+                                          "self_tags = [\"@bot\"]\n"))
+        cfg["owner"]["timezone"] = "Europe/Amsterdam"
+        relay.CFG.update(cfg)
+        sent_to = []
+        stubs = dict(log_thread=lambda *a, **k: None, quotes_us=lambda c, m: False, quoted_text=lambda c, m: "",
+                     media_text=lambda a, c, m, t, mt: t, with_feedback=lambda c, m, s, fn: fn(),
+                     flag=lambda a, k, v=None: None, run_agent=mock.Mock(side_effect=self.limit()),
+                     send_text=lambda c, t, **k: sent_to.append(c))
+        with mock.patch.multiple(relay, **stubs):
+            relay.route("g1", gjid, "15550100003", "@bot what time is dinner?", "")
+            self.assertIn("g1", relay._inflight)  # kept until the batch ran
+            with self.assertRaises(relay.ClaudeLimit):
+                self.jobs[-1]()
+        self.assertEqual(sent_to, [])
+        self.assertIn("route:g1", relay.parked())
+        self.assertNotIn("g1", relay._inflight)
+        with mock.patch.object(relay, "route") as r:
+            relay.resume_parked(relay.time.time() + 3600)
+        r.assert_called_once_with("g1", gjid, "15550100003", "@bot what time is dinner?", "")
+
     def test_owner_message_goes_again_with_the_note(self):
         relay.route("m1", relay.OWNER, "s", "plan my week", "")  # -> owner batch
         relay.CFG["owner"]["batch_seconds"] = 0
