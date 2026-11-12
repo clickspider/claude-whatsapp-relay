@@ -90,7 +90,7 @@ AGENT_DEFAULTS = {"name": "", "jid": "", "live": False, "trust": "draft", "trigg
                   "read_only": [], "checkins": False, "timezone": "", "tools": FILE_TOOLS,
                   "extra_mcp_config": "", "extra_allowed_tools": [], "extra_disallowed_tools": [],
                   "unrestricted": False, "load_claude_connectors": False, "plugin_dirs": [], "max_context_tokens": 200_000, "inbox": False,
-                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False, "images": False, "files": False, "mentions": False,
+                  "group_label": "", "ask_contact": False, "use_owner_voice": None, "quiet_hours": True, "gifs": False, "images": False, "videos": False, "files": False, "mentions": False,
                   "self_per_day": 0, "auto_reply": "", "turns_per_day": None, "trial_hours": 0,
                   "turns_message": "", "trial_message": "", "status_marks": True}
 
@@ -1689,14 +1689,14 @@ CONTACT_RULES = (
     "\nCONTACTS: to add a contact agent (a new person the relay talks to), never edit relay.config.toml. "
     "First write {agents}/<name>/RULES.md (and an inbox note if it starts the chat). Then add one line "
     "'@@CONTACT: <name> | <phone with country code> | key=value | ... | note=<who, one line>'. Keys: live, "
-    "use_owner_voice, status_marks, quiet_hours, inbox, images, files, gifs (true/false), trust (reply/draft), trigger (all/listen), "
+    "use_owner_voice, status_marks, quiet_hours, inbox, images, videos, files, gifs (true/false), trust (reply/draft), trigger (all/listen), "
     "timezone, max_context_tokens, self_per_day, turns_per_day, trial_hours. Defaults: live, trust=reply, "
     "trigger=all, the owner's voice, no status marks, inbox on. The relay shows the owner the block and an "
     "'Add / Don't add' poll; only that vote adds it, and the relay restarts by itself. Do not ask in text "
     "too. A thread that needs a contact writes the RULES.md and gives you the @@CONTACT line."
     "\nCONFIG: to change a setting of an agent that exists, never edit relay.config.toml either. Add one line "
-    "'@@CONFIG: <agent> | key=value | ... | note=<why, one line>'. Keys: the @@CONTACT keys (images, files, gifs = "
-    "the agent may send pictures / PDFs / GIFs, only files inside its own home folder, so copy them there first). Never name, jid, tools, paths or the global sections: those stay the owner's hand edit. "
+    "'@@CONFIG: <agent> | key=value | ... | note=<why, one line>'. Keys: the @@CONTACT keys (images, videos, files, gifs = "
+    "the agent may send pictures / videos / PDFs / GIFs, only files inside its own home folder, so copy them there first). Never name, jid, tools, paths or the global sections: those stay the owner's hand edit. "
     "The relay shows the owner the exact lines before and after and an 'Apply / Don't apply' poll; only that vote "
     "changes the file, and the relay restarts by itself. Do not ask in text too. A thread gives you the line.")
 THREAD_RULES = (
@@ -2542,13 +2542,13 @@ CONTACT_ADD, CONTACT_NO = "Add", "Don't add"
 CONTACT_OK_HOURS = 2  # an older proposal is never added: propose it again
 CONTACT_JID_RE = re.compile(r"^[1-9]\d{7,14}@s\.whatsapp\.net$")  # one person; groups stay a hand edit
 CONTACT_TZ_RE = re.compile(r"^[A-Za-z]+(/[A-Za-z0-9_+-]+){0,2}$")
-CONTACT_BOOL = ("live", "use_owner_voice", "status_marks", "quiet_hours", "inbox", "images", "files", "gifs")
+CONTACT_BOOL = ("live", "use_owner_voice", "status_marks", "quiet_hours", "inbox", "images", "videos", "files", "gifs")
 CONTACT_INT = {"max_context_tokens": (10_000, 200_000), "self_per_day": (0, 50), "turns_per_day": (0, 200),
                "trial_hours": (0, 720)}
 CONTACT_BASE = {"live": True, "trust": "reply", "trigger": "all", "use_owner_voice": True, "status_marks": False,
                 "inbox": True, "max_context_tokens": 100_000}
 CONTACT_KEYS = ("name", "jid", "live", "trust", "trigger", "use_owner_voice", "status_marks", "timezone",
-                "quiet_hours", "inbox", "images", "files", "gifs") + tuple(CONTACT_INT)
+                "quiet_hours", "inbox", "images", "videos", "files", "gifs") + tuple(CONTACT_INT)
 
 
 def parse_contact(line):
@@ -3117,8 +3117,8 @@ def write_history(a):
 
 def parse(out):
     note = CFG["prompts"]["owner_note_marker"]
-    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "REMIND": [], "QUOTE": "", "GIF": "", "STICKER": "", "MENTION": [], "IMAGE": [], "FILE": []}
-    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|REMIND|QUOTE|GIF|STICKER|MENTION|IMAGE|FILE)\s*:?\s*(.*)$")  # OWNER = template name, always private
+    body, marks = [], {"NOTE": [], "EN": "", "HOLD": False, "NEXT_CHECKIN": "", "REMIND": [], "QUOTE": "", "GIF": "", "STICKER": "", "MENTION": [], "IMAGE": [], "VIDEO": [], "FILE": []}
+    rx = re.compile(rf"\s*@@({re.escape(note)}|OWNER|EN|HOLD|NEXT_CHECKIN|REMIND|QUOTE|GIF|STICKER|MENTION|IMAGE|VIDEO|FILE)\s*:?\s*(.*)$")  # OWNER = template name, always private
     cont = None  # lines after a note/EN marker belong to it: a multi-line owner note once leaked to the contact
     for line in out.splitlines():
         m = rx.match(line)
@@ -3135,7 +3135,7 @@ def parse(out):
             marks["NOTE"].append(m.group(2))
         elif m.group(1) == "HOLD":
             marks["HOLD"] = True
-        elif m.group(1) in ("REMIND", "MENTION", "IMAGE", "FILE"):
+        elif m.group(1) in ("REMIND", "MENTION", "IMAGE", "VIDEO", "FILE"):
             marks[m.group(1)].append(m.group(2).strip())
         else:
             marks[m.group(1)] = m.group(2).strip()
@@ -3296,8 +3296,10 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         to_contact = a["ask_contact"] and not dry
         ask(jid if to_contact else OWNER, q if to_contact else f"{name} asks: {q}", opts, kind="ask", agent=name)
     images = m["IMAGE"] if a.get("images") and not held else []  # a held draft sends no images
+    videos = m["VIDEO"] if a.get("videos") and not held else []
     files = m["FILE"] if a.get("files") and not held else []
-    if not body and not images and not files:
+    media = images or videos or files
+    if not body and not media:
         return sending_text(refs, "")
     if held:
         flag(a, "pending", body)
@@ -3309,9 +3311,11 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
         return sending_text(refs, "")
     # before the pictures: from here a restart checks the receipt, never re-runs blind. With pictures the receipt
     # is "?" (unknown): a re-run would send them twice, and "" would hide a crash mid-pictures (review M1)
-    sending_text(refs, "?" if images or files else body)
+    sending_text(refs, "?" if media else body)
     for spec in images:  # before the text: the question comes after the pictures
         send_agent_image(a, OWNER if dry else jid, spec)
+    for spec in videos:  # #203: mom's washer video to amiel, 12 Nov 2026
+        send_agent_image(a, OWNER if dry else jid, spec, exts=(".mp4", ".mov"), max_mb=VIDEO_MAX_MB)
     for spec in files:
         send_agent_image(a, OWNER if dry else jid, spec, exts=(".pdf",))
     if not body:
@@ -3323,14 +3327,18 @@ def deliver(jid, a, out, dry, allow_hold=True, refs=None, hold=False):
     tags = []
     if a["mentions"] and m["MENTION"] and not dry:
         body, tags = add_mentions(a, body, m["MENTION"])
-    sending_text(refs, "?" if images or files else body)
+    sending_text(refs, "?" if media else body)
     send_text(OWNER if dry else jid, (f"[dry run → {name}]\n" if dry else "") + body, quote=quote, mentions=tags)
     if a["gifs"] and (m["GIF"] or m["STICKER"]):
         send_gif(OWNER if dry else jid, m["STICKER"] or m["GIF"], sticker=bool(m["STICKER"]))
 
 
-def send_agent_image(a, chat, spec, exts=(".jpg", ".jpeg", ".png", ".webp")):
+VIDEO_MAX_MB = 16  # WhatsApp's media limit for photos, videos and voice messages
+
+
+def send_agent_image(a, chat, spec, exts=(".jpg", ".jpeg", ".png", ".webp"), max_mb=None):
     """@@IMAGE: <path> | <caption> -> that image, sent to the agent's chat (agents with images = true).
+    @@VIDEO: the same for .mp4/.mov up to VIDEO_MAX_MB (agents with videos = true).
     @@FILE: the same for PDFs (agents with files = true).
     Only such files inside the agent's home; anything else is refused with a note to the owner."""
     path, _, caption = spec.partition("|")
@@ -3339,6 +3347,8 @@ def send_agent_image(a, chat, spec, exts=(".jpg", ".jpeg", ".png", ".webp")):
     if not (p.startswith(root + os.sep) and os.path.isfile(p)
             and p.lower().endswith(exts)):
         return send_text(OWNER, f"🔔 {a['name']}: file not sent ({path.strip()} is not a {'/'.join(exts)} file in its home)")
+    if max_mb and os.path.getsize(p) > max_mb * 1024 * 1024:
+        return send_text(OWNER, f"🔔 {a['name']}: file not sent ({os.path.basename(p)} is over {max_mb} MB)")
     out = os.path.join(CFG["bridge"]["outbox"], uuid.uuid4().hex[:8], os.path.basename(p))
     try:
         os.makedirs(os.path.dirname(out), exist_ok=True)

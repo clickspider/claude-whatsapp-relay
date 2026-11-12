@@ -84,6 +84,37 @@ class ParseTests(unittest.TestCase):
         relay.deliver("x@s", dict(a, files=False), "Hi\n@@FILE: cv/cv.pdf", False)  # off = nothing goes out
         self.assertEqual(sent, [])
 
+    def test_video_marker_sends_only_small_videos_in_home(self):
+        # #203, 12 Nov 2026: amiel's agent sends mom's washer video
+        import tempfile
+        home, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, "media", "out"))
+        for f, size in (("wall.mp4", 10), ("big.mov", relay.VIDEO_MAX_MB * 1024 * 1024 + 1), ("bed.jpg", 10)):
+            with open(os.path.join(home, "media", "out", f), "wb") as fh:
+                fh.truncate(size)
+        sent, texts = [], []
+        relay.CFG = {"bridge": {"outbox": out}, "prompts": {"owner_note_marker": "OWNER"}, "owner": {"name": "O"},
+                     "hooks": {"after_log": []}, "threads": {"enabled": False}, "ui": {"polls": False}}
+        for name, fake in (("api", lambda kind, payload: sent.append(payload)),
+                           ("send_text", lambda chat, text, **kw: texts.append((chat, text))),
+                           ("log_thread", lambda *a, **kw: None), ("pick_react", lambda *a: None)):
+            self.addCleanup(setattr, relay, name, getattr(relay, name))
+            setattr(relay, name, fake)
+        a = {"name": "amiel", "home": home, "trust": "reply", "checkins": False, "videos": True, "images": False,
+             "files": False, "mentions": False, "gifs": False, "ask_contact": False}
+        out_text = ("הנה הסרטון\n@@VIDEO: media/out/wall.mp4 | הקיר\n@@VIDEO: media/out/big.mov\n"
+                    "@@VIDEO: media/out/bed.jpg\n@@VIDEO: ../../../etc/passwd")
+        relay.deliver("amiel@s", a, out_text, False)
+        self.assertEqual([(os.path.basename(p["media_path"]), p["message"]) for p in sent], [("wall.mp4", "הקיר")])
+        self.assertEqual(texts[-1], ("amiel@s", "הנה הסרטון"))
+        self.assertEqual(len(texts), 4)  # 3 refused (too big, not a video, outside home): notes to the owner
+        sent.clear()
+        relay.deliver("x@s", dict(a, videos=False), "Hi\n@@VIDEO: media/out/wall.mp4", False)  # off = nothing goes out
+        relay.deliver("x@s", dict(a, trust="draft", dir=tempfile.mkdtemp()), "Hi\n@@VIDEO: media/out/wall.mp4", False)  # held draft: no video
+        self.assertEqual(sent, [])
+        self.assertIn("videos", relay.CONTACT_BOOL)  # @@CONFIG / @@CONTACT may set it
+        self.assertFalse(relay.AGENT_DEFAULTS["videos"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -353,6 +353,7 @@ bridge_label = "com.claude-whatsapp-relay.bridge"
 # turns_message = "" / trial_message = "" # what the contact reads at the cap / after the trial (default: prompts.turns_used_up / prompts.trial_ended)
 # quiet_hours = true                     # false = this agent ignores [quiet_hours] (check-ins + inbox notes any time)
 # gifs = false                           # true = it may add @@GIF: <words> or @@STICKER: <words> (needs ui.giphy_api_key)
+# videos = false                        # true = it may send .mp4/.mov (max 16 MB) from its home with @@VIDEO: <path> | <caption>
 # files = false                         # true = it may send PDFs from its home with @@FILE: <path>
 # mentions = false                       # true = it may tag a person from members with @@MENTION: <name> (groups; tag only, no DMs)
 # inbox = false                          # your Claude may leave it notes in agents/<name>/inbox/
