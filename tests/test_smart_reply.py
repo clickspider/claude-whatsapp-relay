@@ -46,7 +46,7 @@ class Heads(unittest.TestCase):
     def head(self, a, addressed):
         prompts = []
         with Patch(media_text=lambda *x: "hi", quoted_text=lambda *x: "",
-                   run_agent_told=lambda j, a, p, t: prompts.append(p) or "",
+                   run_agent=lambda a, p: prompts.append(p) or "",
                    deliver=lambda *x, **k: None):
             relay.group_turn("1@g.us", a, [("Lara", "m1", "hi", "", "s")], addressed)
         return prompts[0]

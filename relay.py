@@ -1308,24 +1308,6 @@ def run_claude(args, cwd, prompt):
     return r
 
 
-_limit_told = {}  # chat -> (reset time, when told)
-
-
-def run_agent_told(jid, a, prompt, tell):
-    """run_agent; on the usage limit, tell a trust=reply agent's own chat once per reset window
-    (draft agents never send unreviewed text), then re-raise: the worker tells the owner."""
-    try:
-        return run_agent(a, prompt)
-    except ClaudeLimit as e:
-        last = _limit_told.get(jid)
-        # ponytail: unknown reset time = one note per 5 h
-        if tell and a["live"] and a["trust"] == "reply" and not (
-                last and last[0] == e.when and time.time() - last[1] < 5 * 3600):
-            _limit_told[jid] = (e.when, time.time())
-            send_text(jid, str(e))
-        raise
-
-
 # ---------- owner chat ----------
 
 HANDOFF_PROMPT = ("HANDOFF: reply with max 15 lines: open topics, what was asked last, decisions "
@@ -3457,7 +3439,8 @@ def contact_turn(jid, a, msg_id, text, media_type, dry=False, sender=""):
     note = resume_note(msg_id)
     if media_type == "reaction":
         note += CFG["prompts"]["reaction"] + "\n"
-    out = run_agent_told(jid, a, f"{note}{label} #1: {untrusted(text)}", not dry)
+    # a contact never sees the limit line (#204): the job parks, resumes after the reset, owner gets limit_notice
+    out = run_agent(a, f"{note}{label} #1: {untrusted(text)}")
     mark_sending(msg_id)
     deliver(jid, a, out, dry, refs=refs)
 
@@ -3518,7 +3501,7 @@ def group_turn(jid, a, items, addressed):
     else:
         head = ("New messages in the group, NOT addressed to you. Learn from them. Stay silent "
                 "unless a really important note is needed (see your rules).")
-    deliver(jid, a, run_agent_told(jid, a, f"{a['group_label']} {head}\n" + "\n".join(lines), addressed),
+    deliver(jid, a, run_agent(a, f"{a['group_label']} {head}\n" + "\n".join(lines)),
             False, refs=refs)
 
 

@@ -188,21 +188,14 @@ class UsageLimit(AgentCase):
     def test_normal_answer_about_limits_is_not_a_limit(self):
         self.assertEqual(self.run_stub("Your rate limit reached its cap yesterday.", 0).returncode, 0)
 
-    def test_agent_chat_told_once_per_window_owner_always(self):
+    def test_contact_chat_never_gets_the_limit_line(self):
+        # 12 Nov 2026 (#204): tradespeople and family got "I hit my Claude limit". Only the owner is told.
         def boom(a, p):
             raise relay.ClaudeLimit("3pm")
-        relay._limit_told.clear()
-        with self.patch(run_agent=boom):
-            for _ in range(3):
-                with self.assertRaises(relay.ClaudeLimit):
-                    relay.run_agent_told(JID, self.a, "x", True)
-        self.assertEqual(self.sent, [(JID, "I hit my Claude limit. Back at 3pm.")])
-        self.a["trust"] = "draft"  # draft agents never send unreviewed text
-        relay._limit_told.clear()
-        with self.patch(run_agent=boom):
+        with self.patch(run_agent=boom, media_text=lambda a, c, m, t, mt: t):
             with self.assertRaises(relay.ClaudeLimit):
-                relay.run_agent_told(JID, self.a, "x", True)
-        self.assertEqual(len(self.sent), 1)
+                relay.contact_turn(JID, self.a, "m1", "hi", "text")
+        self.assertFalse([s for s in self.sent if s[0] == JID])
 
     def test_worker_tells_the_owner(self):
         import threading

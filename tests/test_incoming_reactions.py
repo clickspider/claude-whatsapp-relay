@@ -158,7 +158,7 @@ class ReachesTheAgent(Base):
                        agent_now=lambda a: relay.datetime.datetime(2026, 11, 1),
                        with_feedback=lambda *x: self.fail("with_feedback"), log_thread=lambda *x, **k: None,
                        download=lambda *x: self.fail("download"), member=lambda *x: "",
-                       run_agent_told=lambda j, a, p, t: seen.append(p) or "@@REACT: 👍",
+                       run_agent=lambda a, p: seen.append(p) or "@@REACT: 👍",
                        send_text=lambda *x, **k: sent.append(x), react=lambda *x: self.fail("react"),
                        flag=lambda *x: None, RESUMED=set()):
                 relay.dispatch("r", CONTACT, "p", 'REACTION ✅ to your message: "x"', "reaction", a)
@@ -180,7 +180,7 @@ class ReachesTheAgent(Base):
         with Patch(CFG=self.cfg, OWNER=OWNER, enqueue=lambda k, fn: fn(), log_thread=lambda *x: None,
                    member=lambda *x: "Sam", download=lambda *x: self.fail("download"), quoted_text=lambda *x: "",
                    with_feedback=lambda *x: self.fail("with_feedback"), smart_check=lambda *x: self.fail("smart"),
-                   run_agent_told=lambda j, a, p, t: prompts.append(p) or "",
+                   run_agent=lambda a, p: prompts.append(p) or "",
                    deliver=lambda *x, **k: delivered.append(k)):
             relay.listen(GROUP, a, "r", "p", 'REACTION ❤️ to your message: "x"', "reaction")
         self.assertIn("reaction to your own message", prompts[0])

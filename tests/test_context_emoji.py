@@ -17,7 +17,7 @@ trust = "{trust}"
 class ContextEmojiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = {k: getattr(relay, k) for k in ("api", "ask_owner_claude", "owner_prep", "run_agent_told", "CFG", "OWNER")}
+        self.saved = {k: getattr(relay, k) for k in ("api", "ask_owner_claude", "owner_prep", "run_agent", "CFG", "OWNER")}
         self.calls = []
         relay.api = lambda path, payload=None: self.calls.append((path, payload or {})) or {}
         relay.owner_prep = lambda *m: (m[1], False)
@@ -114,7 +114,7 @@ class ContextEmojiTests(unittest.TestCase):
     def contact(self, answer, trust):
         cfg = self.load(trust=trust)
         jid, a = relay.by_name("alex")
-        relay.run_agent_told = lambda *x: answer
+        relay.run_agent = lambda *x: answer
         relay.with_feedback(jid, "m2", "15550100002@s.whatsapp.net",
                             lambda: relay.contact_turn(jid, a, "m2", "you are sweet", None, sender="15550100002"))
         return jid
@@ -131,7 +131,7 @@ class ContextEmojiTests(unittest.TestCase):
     def test_listening_group_not_addressed_never_reacts(self):
         self.load()
         jid, a = relay.by_name("alex")
-        relay.run_agent_told = lambda *x: "@@REACT: 😂"
+        relay.run_agent = lambda *x: "@@REACT: 😂"
         relay.group_turn(jid, a, [("Bo", "m3", "lol", None, "15550100009@s.whatsapp.net")], False)
         self.assertEqual(self.reacts(), [])
         self.assertEqual(self.sends(), [])
