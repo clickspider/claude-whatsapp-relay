@@ -12,7 +12,7 @@ Owner commands for an agent named <n>:
   /new = fresh owner conversation
 All user-specific values live in the config file. See SECURITY.md.
 """
-import base64, contextlib, datetime, fcntl, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
+import base64, contextlib, datetime, difflib, fcntl, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request, uuid, wave
 from collections import Counter, defaultdict, deque
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1581,6 +1581,7 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
     answer, asks = take_asks(answer)
     answer = take_watchmail(answer)
     answer, contacts = take_contacts(answer)
+    answer, configs = take_contacts(answer, CONFIG_RE)
     files = re.findall(r"^\s*@@FILE\s*:?\s*(.+?)\s*$", answer, re.M)
     answer = re.sub(r"^\s*@@FILE\s*:?.*$\n?", "", answer, flags=re.M).strip()
     tail = [["ask", q, opts] for q, opts in asks] + [["file", f] for f in files]
@@ -1610,6 +1611,11 @@ def coordinator_send(answer, text, voice=False, refs=None, track=None):
             contact_gate_ask(c)
         except Exception as e:
             agent_note("relay", f"@@CONTACT failed ({c[:80]}): {e}")
+    for c in configs:
+        try:
+            config_gate_ask(c)
+        except Exception as e:
+            agent_note("relay", f"@@CONFIG failed ({c[:80]}): {e}")
 
 
 def send_tail(tail, track=None, start=0):
@@ -1683,11 +1689,16 @@ CONTACT_RULES = (
     "\nCONTACTS: to add a contact agent (a new person the relay talks to), never edit relay.config.toml. "
     "First write {agents}/<name>/RULES.md (and an inbox note if it starts the chat). Then add one line "
     "'@@CONTACT: <name> | <phone with country code> | key=value | ... | note=<who, one line>'. Keys: live, "
-    "use_owner_voice, status_marks, quiet_hours, inbox (true/false), trust (reply/draft), trigger (all/listen), "
+    "use_owner_voice, status_marks, quiet_hours, inbox, images, files, gifs (true/false), trust (reply/draft), trigger (all/listen), "
     "timezone, max_context_tokens, self_per_day, turns_per_day, trial_hours. Defaults: live, trust=reply, "
     "trigger=all, the owner's voice, no status marks, inbox on. The relay shows the owner the block and an "
     "'Add / Don't add' poll; only that vote adds it, and the relay restarts by itself. Do not ask in text "
-    "too. A thread that needs a contact writes the RULES.md and gives you the @@CONTACT line.")
+    "too. A thread that needs a contact writes the RULES.md and gives you the @@CONTACT line."
+    "\nCONFIG: to change a setting of an agent that exists, never edit relay.config.toml either. Add one line "
+    "'@@CONFIG: <agent> | key=value | ... | note=<why, one line>'. Keys: the @@CONTACT keys (images, files, gifs = "
+    "the agent may send pictures / PDFs / GIFs, only files inside its own home folder, so copy them there first). Never name, jid, tools, paths or the global sections: those stay the owner's hand edit. "
+    "The relay shows the owner the exact lines before and after and an 'Apply / Don't apply' poll; only that vote "
+    "changes the file, and the relay restarts by itself. Do not ask in text too. A thread gives you the line.")
 THREAD_RULES = (
     "\nTHREAD: you work on ONE thread (#{n}: {title}) of the owner's project. Other sessions handle "
     "the main chat and the other threads. Work until the task is done or you need the owner. Reply "
@@ -2531,13 +2542,13 @@ CONTACT_ADD, CONTACT_NO = "Add", "Don't add"
 CONTACT_OK_HOURS = 2  # an older proposal is never added: propose it again
 CONTACT_JID_RE = re.compile(r"^[1-9]\d{7,14}@s\.whatsapp\.net$")  # one person; groups stay a hand edit
 CONTACT_TZ_RE = re.compile(r"^[A-Za-z]+(/[A-Za-z0-9_+-]+){0,2}$")
-CONTACT_BOOL = ("live", "use_owner_voice", "status_marks", "quiet_hours", "inbox")
+CONTACT_BOOL = ("live", "use_owner_voice", "status_marks", "quiet_hours", "inbox", "images", "files", "gifs")
 CONTACT_INT = {"max_context_tokens": (10_000, 200_000), "self_per_day": (0, 50), "turns_per_day": (0, 200),
                "trial_hours": (0, 720)}
 CONTACT_BASE = {"live": True, "trust": "reply", "trigger": "all", "use_owner_voice": True, "status_marks": False,
                 "inbox": True, "max_context_tokens": 100_000}
 CONTACT_KEYS = ("name", "jid", "live", "trust", "trigger", "use_owner_voice", "status_marks", "timezone",
-                "quiet_hours", "inbox") + tuple(CONTACT_INT)
+                "quiet_hours", "inbox", "images", "files", "gifs") + tuple(CONTACT_INT)
 
 
 def parse_contact(line):
@@ -2549,7 +2560,15 @@ def parse_contact(line):
     f["name"] = parts[0].lower()
     num = re.sub(r"[\s+()-]", "", parts[1])
     f["jid"] = num if "@" in num else num + "@s.whatsapp.net"
-    for p in parts[2:]:
+    kv, note, err = parse_keys(parts[2:])
+    f.update(kv)
+    return f, note, err
+
+
+def parse_keys(parts):
+    """['key=value', ...] -> (fields, note, errors): only the keys a gate may set (CONTACT_KEYS without name/jid)."""
+    f, note, err = {}, "", []
+    for p in parts:
         k, eq, v = (x.strip() for x in p.partition("="))
         k = k.lower()
         if k == "note" and eq:
@@ -2578,9 +2597,20 @@ def check_contact(f, cfg):
         err.append(f"'{jid}' is not a phone number with country code (e.g. 972501234567)")
     elif jid == cfg["owner"]["jid"] or any(a["jid"] == jid for a in agents(cfg)):
         err.append(f"{jid} is already the owner or an agent")
-    if f.get("trust") not in ("reply", "draft"):
+    for k in ("trust", "trigger"):
+        if k not in f:
+            err.append(f"{k} is missing")
+    if NAME_RE.match(n) and not os.path.isfile(os.path.join(cfg["paths"]["agents_dir"], n, "RULES.md")):
+        err.append(f"write {os.path.join(cfg['paths']['agents_dir'], n, 'RULES.md')} first")
+    return err + check_values(f)
+
+
+def check_values(f):
+    """The value rules of every gate key that is in f. [] = fine."""
+    err = []
+    if "trust" in f and f["trust"] not in ("reply", "draft"):
         err.append("trust must be reply or draft")
-    if f.get("trigger") not in ("all", "listen"):
+    if "trigger" in f and f["trigger"] not in ("all", "listen"):
         err.append("trigger must be all or listen")
     for k in CONTACT_BOOL:
         if k in f and not isinstance(f[k], bool):
@@ -2595,24 +2625,31 @@ def check_contact(f, cfg):
             ZoneInfo(f["timezone"])
         except (ZoneInfoNotFoundError, ValueError):
             err.append(f"timezone '{f['timezone']}' is not a valid name (e.g. Asia/Jerusalem)")
-    if NAME_RE.match(n) and not os.path.isfile(os.path.join(cfg["paths"]["agents_dir"], n, "RULES.md")):
-        err.append(f"write {os.path.join(cfg['paths']['agents_dir'], n, 'RULES.md')} first")
     return err
 
 
+def toml_val(v):
+    """A checked value as TOML (strings are regex-checked before, then JSON-quoted)."""
+    return ("true" if v else "false") if isinstance(v, bool) else str(v) if isinstance(v, int) else json.dumps(v)
+
+
+def gate_note(note):
+    return "".join(c for c in str(note or "") if c.isprintable())[:120]  # here, not at parse: the poll record is a file
+
+
 def contact_block(f, note):
-    """The TOML lines, made only from checked values (strings are regex-checked, then JSON-quoted)."""
-    val = lambda v: ("true" if v else "false") if isinstance(v, bool) else str(v) if isinstance(v, int) else json.dumps(v)
-    note = "".join(c for c in str(note or "") if c.isprintable())[:120]  # here, not at parse: the poll record is a file
+    """The TOML lines, made only from checked values."""
+    note = gate_note(note)
     head = f"# {note + ', ' if note else ''}added {owner_now():%d %b %Y %H:%M} on {CFG['owner']['name']}'s vote (contact gate)"
-    return "\n".join([head, "[[agent]]"] + [f"{k} = {val(f[k])}" for k in CONTACT_KEYS if k in f]) + "\n"
+    return "\n".join([head, "[[agent]]"] + [f"{k} = {toml_val(f[k])}" for k in CONTACT_KEYS if k in f]) + "\n"
 
 
-def take_contacts(text):
-    """'@@CONTACT: ...' lines -> (rest of the text, [line]). Handled after the answer (contact_gate_ask)."""
+def take_contacts(text, rx=CONTACT_RE):
+    """'@@CONTACT: ...' lines (or rx = CONFIG_RE: '@@CONFIG: ...') -> (rest of the text, [line]).
+    Handled after the answer (contact_gate_ask, config_gate_ask)."""
     keep, found = [], []
     for line in (text or "").splitlines():
-        m = CONTACT_RE.match(line)
+        m = rx.match(line)
         (found.append(m.group(1)) if m else keep.append(line))
     return "\n".join(keep).strip(), found
 
@@ -2681,40 +2718,193 @@ def contact_gate_add(rec):
         with open(conf, encoding="utf-8") as h:
             seen = os.fstat(h.fileno())
             text = h.read()
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".contact-", suffix=".toml")  # O_EXCL, 0600
-        with os.fdopen(fd, "w", encoding="utf-8") as h:
-            h.write(text.rstrip("\n") + "\n\n" + contact_block(f, note))
-            h.flush()
-            os.fsync(h.fileno())
-        try:
-            new = load_config(tmp)
-            err = validate(new)[0]
+
+        def one_more(new):
             added = [a for a in agents(new) if a["name"] == f["name"]]
             if len(agents(new)) != len(agents(cur)) + 1 or len(added) != 1 or added[0]["jid"] != f["jid"]:
-                err.append("the new config does not hold exactly this one new agent")
-        except Exception as e:
-            err = [str(e)]
-        if err:
-            os.remove(tmp)
-            return "Nothing was added, the new config would fail its check: " + "; ".join(err)
-        now = os.stat(conf)
-        if (now.st_ino, now.st_mtime_ns, now.st_size) != (seen.st_ino, seen.st_mtime_ns, seen.st_size):
-            os.remove(tmp)  # a hand edit came in meanwhile: never overwrite it (review #154 F3)
-            return "Nothing was added: relay.config.toml changed just now. Ask me again."
-        shutil.copymode(conf, tmp)
-        bfd, bak = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".contact-", suffix=".bak")
-        os.close(bfd)
-        shutil.copy2(conf, bak)
-        os.replace(bak, conf + ".bak")  # the config before the last contact add (review #154 F5, N1)
-        if rec.get("poll_id"):
-            polls({rec["poll_id"]: dict(polls().get(rec["poll_id"]) or rec, adding=True)})  # before the replace
-        os.replace(tmp, conf)
-    return contact_added_text(f["name"])
+                return ["the new config does not hold exactly this one new agent"]
+            return []
+        why = config_swap(conf, seen, text.rstrip("\n") + "\n\n" + contact_block(f, note), one_more, rec, "adding")
+    return "Nothing was added: " + why if why else contact_added_text(f["name"])
+
+
+def config_swap(conf, seen, text, check, rec, mark):
+    """The end both gates share, called under the gate lock: text -> a copy next to the config, loaded, validated
+    and check(new) there; the config still as it was when read (seen); then .bak and replace. The relay sees the
+    new mtime and restarts by itself. "" = done, else why nothing changed."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".gate-", suffix=".toml")  # O_EXCL, 0600
+    with os.fdopen(fd, "w", encoding="utf-8") as h:
+        h.write(text)
+        h.flush()
+        os.fsync(h.fileno())
+    try:
+        new = load_config(tmp)
+        err = validate(new)[0] + check(new)
+    except Exception as e:
+        err = [str(e)]
+    if err:
+        os.remove(tmp)
+        return "the new config would fail its check: " + "; ".join(err)
+    now = os.stat(conf)
+    if (now.st_ino, now.st_mtime_ns, now.st_size) != (seen.st_ino, seen.st_mtime_ns, seen.st_size):
+        os.remove(tmp)  # a hand edit came in meanwhile: never overwrite it (review #154 F3)
+        return "relay.config.toml changed just now. Ask me again."
+    shutil.copymode(conf, tmp)
+    bfd, bak = tempfile.mkstemp(dir=os.path.dirname(conf), prefix=".gate-", suffix=".bak")
+    os.close(bfd)
+    shutil.copy2(conf, bak)
+    os.replace(bak, conf + ".bak")  # the config before the last gate change (review #154 F5, N1)
+    if rec.get("poll_id"):
+        polls({rec["poll_id"]: dict(polls().get(rec["poll_id"]) or rec, **{mark: True})})  # before the replace
+    os.replace(tmp, conf)
+    return ""
 
 
 def contact_added_text(name):
     return (f"Added {name}. The relay restarts in a few seconds, then {name} is live." if CFG["danger"]["self_edit"]
             else f"Added {name}. Restart the relay, then {name} is live.")
+
+
+# ---------- config gate (#201, owner 12 Nov 2026 17:36: "config changes only when I vote yes in a poll") ----------
+# The contact gate's way in, for an agent that already exists: '@@CONFIG: <agent> | key=value | ... | note=<why>'
+# -> the exact lines before and after + an Apply / Don't apply poll; only the owner's vote makes the RELAY change
+# those lines. Only the gate keys (CONTACT_KEYS without name/jid): no tools, paths, homes or global sections.
+
+CONFIG_RE = re.compile(r"^\s*@@CONFIG\s*:?\s*(.*)$")
+CONFIG_APPLY, CONFIG_NO = "Apply", "Don't apply"
+AGENT_HEAD_RE = re.compile(r"^\s*\[\[\s*agent\s*\]\]\s*(#.*)?$")
+
+
+def config_edit(text, name, changes, note):
+    """The config text with the changes made in the one [[agent]] block of that name: a key line there is
+    replaced, a missing key goes right under the name line. ValueError when the block or a key is not clear.
+    Never trusted alone: config_check compares the parsed result with the parsed original."""
+    lines = text.split("\n")
+    blocks = []
+    for h, line in enumerate(lines):
+        if AGENT_HEAD_RE.match(line):
+            end = next((j for j in range(h + 1, len(lines)) if lines[j].lstrip().startswith("[")), len(lines))
+            at = [j for j in range(h + 1, end) if re.match(rf"""^\s*name\s*=\s*["']{name}["']\s*(#.*)?$""", lines[j])]
+            blocks += [(h, at[0], end)] if at else []
+    if len(blocks) != 1:
+        raise ValueError(f"found {len(blocks)} [[agent]] blocks named '{name}', not 1")
+    h, at, end = blocks[0]
+    tag = f"  # {gate_note(note) + ', ' if gate_note(note) else ''}{owner_now():%d %b %Y} on {CFG['owner']['name']}'s vote"
+    for k, v in changes.items():
+        hit = [j for j in range(h + 1, end) if re.match(rf"^\s*{k}\s*=", lines[j])]
+        if len(hit) > 1:
+            raise ValueError(f"'{k}' is in the {name} block more than once")
+        if hit:
+            lines[hit[0]] = f"{k} = {toml_val(v)}{tag}"
+        else:
+            lines.insert(at + 1, f"{k} = {toml_val(v)}{tag}")
+            end += 1
+    return "\n".join(lines)
+
+
+def config_check(text, new_text, name, changes):
+    """[] when new_text parses to exactly text with only these keys of that agent set to these values."""
+    old, new = tomllib.loads(text), tomllib.loads(new_text)
+    hit = [i for i, a in enumerate(old.get("agent", [])) if a.get("name") == name]
+    if len(hit) != 1:
+        return [f"found {len(hit)} agents named '{name}', not 1"]
+    old["agent"][hit[0]].update(changes)
+    return [] if new == old else ["the new config would change more than these keys"]
+
+
+def parse_config(line):
+    """'<agent> | key=value | ... | note=<why>' -> (agent, changes, note, errors)."""
+    parts = [p.strip() for p in (line or "").split("|")]
+    name = parts[0].lower()
+    changes, note, err = parse_keys(parts[1:])
+    return name, changes, note, err
+
+
+def config_now(name, changes, cfg):
+    """(errors, the agent's current raw values of these keys: None = not in the file), from the config on disk."""
+    err = [f"'{k}' is not allowed (keys: {', '.join(CONTACT_KEYS[2:])})" for k in changes if k not in CONTACT_KEYS[2:]]
+    err += check_values(changes)
+    if not changes:
+        err.append("give at least one key=value")
+    if not NAME_RE.match(name) or not any(a["name"] == name for a in agents(cfg)):
+        return err + [f"there is no agent '{name}'"], {}
+    with open(cfg["config_path"], "rb") as h:
+        raw = next((a for a in tomllib.load(h).get("agent", []) if a.get("name") == name), {})
+    return err, {k: raw.get(k) for k in changes}
+
+
+def config_gate_ask(line):
+    """One proposal -> the exact changed lines + an Apply / Don't apply poll to the owner. A bad one: a note to
+    the coordinator, nothing to the owner. No poll = nothing can change."""
+    name, changes, note, err = parse_config(line)
+    try:
+        more, old = config_now(name, changes, CFG)
+        err += more
+        if not err and old == changes:
+            err.append(f"{name} already has these values")
+        if not err:
+            text = read(CFG["config_path"])
+            new_text = config_edit(text, name, changes, note)
+            err += config_check(text, new_text, name, changes)
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as e:
+        err.append(str(e))
+    if err:
+        return agent_note("relay", f"@@CONFIG not proposed ({line[:80]}): " + "; ".join(err))
+    diff = [d for d in difflib.unified_diff(text.split("\n"), new_text.split("\n"), lineterm="", n=1)][2:]
+    send_text(OWNER, f"Change to relay.config.toml, agent {name}:\n\n" + "\n".join(diff))
+    question = f"Apply to {name}: " + ", ".join(f"{k} = {toml_val(v)}" for k, v in changes.items()) + "?"
+    try:
+        mid = api("poll", {"recipient": OWNER, "question": question[:250], "options": [CONFIG_APPLY, CONFIG_NO],
+                           "selectable_count": 1}).get("message_id")
+    except Exception:
+        mid = None
+    if not mid:
+        return send_text(OWNER, "(could not make the poll, so nothing will change. Ask me again.)")
+    polls({mid: {"kind": "configgate", "chat": OWNER, "question": question[:250], "target": name, "changes": changes,
+                 "old": old, "note": note, "time": time.time(), "poll_id": mid}})
+
+
+def config_gate_apply(rec):
+    """The owner voted Apply -> under the gate lock: check again on the config as it is on disk (the poll record
+    is a file, never trusted), the values still the ones he saw, then config_swap. "" = resumed after its own
+    apply (nothing to say)."""
+    name, changes = str(rec.get("target", "")), rec.get("changes") or {}
+    if time.time() - rec.get("time", 0) > CONTACT_OK_HOURS * 3600:
+        return f"That proposal is older than {CONTACT_OK_HOURS} hours, so nothing changed. Ask me again."
+    if not isinstance(changes, dict):
+        return "Nothing changed: the stored proposal is broken. Ask me again."
+    conf = os.path.realpath(CFG["config_path"])
+    with open(os.open(st("contact-gate.lock"), os.O_WRONLY | os.O_CREAT, 0o600)) as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            cur = load_config(conf)
+            err, now = config_now(name, changes, cur)
+        except Exception as e:
+            return f"relay.config.toml does not load now, so nothing changed: {e}"
+        if err:
+            return "Nothing changed: " + "; ".join(err)
+        if now == changes:
+            mine = (polls().get(rec.get("poll_id")) or {}).get("applying")
+            return "" if mine else f"{name} already has these values."
+        if now != rec.get("old"):
+            return f"Nothing changed: these {name} lines changed after you saw them. Ask me again."
+        if validate(cur)[0]:
+            return "Nothing changed: relay.config.toml has errors already. Run: python3 relay.py check"
+        with open(conf, encoding="utf-8") as h:
+            seen = os.fstat(h.fileno())
+            text = h.read()
+        try:
+            new_text = config_edit(text, name, changes, rec.get("note", ""))
+            err = config_check(text, new_text, name, changes)
+        except (ValueError, tomllib.TOMLDecodeError) as e:
+            err = [str(e)]
+        if err:
+            return "Nothing changed: " + "; ".join(err)
+        why = config_swap(conf, seen, new_text, lambda new: [], rec, "applying")
+    if why:
+        return "Nothing changed: " + why
+    return (f"Changed {name}. The relay restarts in a few seconds with it." if CFG["danger"]["self_edit"]
+            else f"Changed {name}. Restart the relay to use it.")
 
 
 def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
@@ -2726,8 +2916,8 @@ def on_vote(vote_id, chat, sender, poll_id, choice, resumed=False):
         if choice != MAIL_SEND:  # he changed his tap to Don't send (or took it back): that wins until used
             return send_text(OWNER, mail_gate_retract(poll_id))
         return mail_gate_reopen_tried(poll_id)
-    if rec and rec.get("kind") == "contactgate" and rec.get("done") and not resumed and rec["chat"] == chat:
-        return send_text(OWNER, "That contact poll is closed: a new tap changes nothing. Ask me if it must change.")
+    if rec and rec.get("kind") in ("contactgate", "configgate") and rec.get("done") and not resumed and rec["chat"] == chat:
+        return send_text(OWNER, "That poll is closed: a new tap changes nothing. Ask me if it must change.")
     if not rec or rec.get("done") and not resumed or rec["chat"] != chat or choice in ("", "(none)"):
         return
     if resumed and vote_id in stopped_votes():  # a /stop stopped it before the crash or the limit
@@ -2801,6 +2991,11 @@ def vote_job(vote_id, chat, sender, rec, choice, name, jid, a):
         if msg:
             send_text(OWNER, msg)
         return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}. Relay: {msg or 'added'}", None)
+    if rec["kind"] == "configgate":  # on_vote checked: our poll, in the owner chat, acts once
+        msg = config_gate_apply(rec) if choice == CONFIG_APPLY else "OK, nothing changed."
+        if msg:
+            send_text(OWNER, msg)
+        return owner_add(vote_id, f"ANSWER to \"{rec['question']}\": {choice}. Relay: {msg or 'changed'}", None)
     if rec["kind"] == "draft":
         draft = flag(a, "pending")
         if not draft or digest(draft) != rec["draft"]:
