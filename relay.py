@@ -4346,9 +4346,24 @@ def deliver_inbox(a, fixes_only=False):
         prompt = CFG["prompts"]["from_owner_claude"] + note + INBOX_REPLY_RULE
         if note.upper().startswith("FIX:"):
             enqueue_job(a["name"], lambda a=a, prompt=prompt: fix_last(a, prompt), key)
+        elif note.startswith("MAIL ALERT"):  # #214 r2 F3: mail text never meets a tool that reaches out
+            enqueue_job(a["name"], lambda a=a, prompt=prompt: deliver(
+                a["jid"], a, mail_alert_run(a, prompt), False, allow_hold=False), key)
         else:
             enqueue_job(a["name"], lambda a=a, prompt=prompt: deliver(
                 a["jid"], a, run_agent(a, prompt), False, allow_hold=False), key)
+
+
+def mail_alert_run(a, prompt):
+    """#214 r2 F3: a one-shot run, read-only built-ins, no MCP (no browser), no session: the mail text never
+    reaches a tool that can send data out, nor the agent's later turns (no reminder planted from it either)."""
+    ro = dict(a, tools=[t for t in a["tools"] if t in ("Read", "Glob", "Grep")], extra_mcp_config="",
+              extra_allowed_tools=[], plugin_dirs=[])
+    r = run_claude(agent_args(CFG, ro, "", True)[:-2] + ["--strict-mcp-config", "--no-session-persistence"],
+                   a["dir"], prompt)
+    if r.returncode != 0 and not r.stdout.strip():
+        raise RuntimeError(r.stderr.strip()[-800:] or "agent failed")
+    return re.sub(r"(?m)^\s*@@(REMIND|NEXT_CHECKIN)\b.*$\n?", "", r.stdout).strip()
 
 
 def fix_last(a, prompt):
