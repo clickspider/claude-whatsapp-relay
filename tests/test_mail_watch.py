@@ -247,7 +247,7 @@ class MailWatch(unittest.TestCase):
         a = relay.CFG["agents"][0]
         a.update(timezone="Europe/Amsterdam", home=a["dir"], unrestricted=True,
                  tools=["Read", "Glob", "Grep", "Edit", "Write", "WebFetch"], extra_mcp_config="/x/wedding.json",
-                 extra_allowed_tools=["mcp__browser__open_page"], write_also=["/w"])
+                 extra_allowed_tools=["mcp__browser__open_page"], write_also=["/w"], plugin_dirs=["/p"])
         relay.CFG["danger"]["allow_unrestricted_agents"] = True
         relay.flag(a, "session-id", "S1")
         jobs = self.mail_alert_jobs(a, [("1-mail-x.md", "MAIL ALERT from the mail watch ..."),
@@ -265,6 +265,7 @@ class MailWatch(unittest.TestCase):
             self.assertIn(yes, mail)
         self.assertEqual(mail[mail.index("--tools") + 1], "Read,Glob,Grep")
         self.assertNotIn("open_page", " ".join(mail))
+        self.assertNotIn("--plugin-dir", mail)  # review r3 N1
         self.assertIn("--mcp-config", other)
         self.assertIn("--resume", other)
         self.assertEqual(relay.flag(a, "session-id"), "S1")
