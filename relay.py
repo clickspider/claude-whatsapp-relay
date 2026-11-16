@@ -2234,6 +2234,9 @@ def _coordinator_digest():
             head + DELIVERY_PROMPT.format(name=CFG["owner"]["name"], items="\n".join(f"- {i}" for i in items)))))
         if not SKIP_RE.sub("", answer).strip():  # silence is a recorded choice, never a lost event
             main_log("COORDINATOR", "Chose silence (it already reached the owner) for: " + "; ".join(items))
+            must = [i[len("🔔 mail: "):] for i in items if i.startswith("🔔 mail: ")]
+            if must:  # #171 + owner 16 Nov 09:20: a watched reply / ACTION NEEDED mail is never dropped (plain code)
+                answer = "Mail you must see:\n" + "\n".join(f"- {x}" for x in must)
     inflight("digest", {"digest": True, "sending": True, "upto": upto, "after": bridge_rowid(),
                         "text": last_sent(answer)[-4000:]})  # a restart now: check the receipt, never blind
     coordinator_send(answer, "", track="digest")
@@ -2251,7 +2254,7 @@ DELIVERY_PROMPT = (
 FINISHED_WHO = re.compile(r"^(#\d+ .*\((?:done|review|blocked)\)|🔔 job)$")
 
 
-MAIL_MUST = re.compile(r"^- ((?:ACTION NEEDED|The reply you asked to watch).{0,150})", re.M)
+MAIL_MUST = re.compile(r"^- ((?:ACTION NEEDED|The reply you asked to watch)[^\n]*)", re.M)  # whole line
 
 
 def finished_items(news):
@@ -2317,7 +2320,8 @@ def coordinator_own(who):
 
 MORNING_PROMPT = (" These items came in at night. Nothing is dropped (owner's rule, 16 Nov 2026): send the owner "
                   "what they must know or decide this morning, and route every other item now (@@TO #n, or an "
-                  "inbox note to the agent it belongs to); never a list of everything.")
+                  "inbox note to the agent it belongs to; a mail line that says it was also sent to an agent's chat is "
+                  "routed already); never a list of everything.")
 NIGHT_TURN = ("(It is night for the owner. Answer what they ask. Do not bring up unrelated thread news now "
               "unless it is urgent: it waits for the morning.)\n")
 NIGHT_PROMPT = (" It is night for the owner now (owner.night): write ONLY if it is urgent and cannot wait until "
@@ -4878,7 +4882,8 @@ def mail_thread_topics(m):
     the owner himself wrote to in this Gmail thread (SENT mail only), so a reply from any address counts."""
     try:
         msgs = gmail(f"threads/{m['thrid']}", format="metadata").get("messages") or []
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as e:
+        mail_log(m, f"thread check failed (HTTP {e.code}), sender only")
         return []
     sent = [m2 for m2 in msgs if "SENT" in (m2.get("labelIds") or [])]
     to = [h["value"] for x in sent for h in (x.get("payload") or {}).get("headers", [])

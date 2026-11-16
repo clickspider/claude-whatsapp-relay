@@ -297,7 +297,8 @@ class MailWatch(unittest.TestCase):
     def test_reply_from_another_address_in_our_vendor_thread(self):
         inbox = self.party()  # WAUW 13 Nov: the vendor answered from a private gmail address
         relay.mail_state(lambda s: s.update(history="100"))
-        sent = {"id": "s1", "labelIds": ["SENT"], "payload": {"headers": [{"name": "To", "value": "Team <info@dj.example>"}]}}
+        sent = {"id": "s1", "labelIds": ["SENT"], "payload": {"headers": [{"name": "To", "value": "me@gmail.com"},
+                                                                            {"name": "Cc", "value": "Team <info@dj.example>"}]}}
         fake = {"id": "s2", "labelIds": ["INBOX"], "payload": {"headers": [{"name": "To", "value": "info@dj.example"}]}}
         g = FakeGmail([msg("w1", "t1", "Greet <greet@free.example>", "Re: styling", "free on 12 July"),
                        msg("w2", "t2", "x@free.example", "Re: styling", "x")],
@@ -319,6 +320,19 @@ class MailWatch(unittest.TestCase):
         self.assertEqual(len(items), 2)
         self.assertTrue(items[0].startswith("🔔 mail: The reply you asked to watch. From Booth"))
         self.assertEqual(items[1], "#3 film (done)")
+
+    def test_watched_reply_survives_two_skips(self):
+        relay.main_log("🔔 mail", relay.untrusted("New important mail:\n- The reply you asked to watch. From Booth "
+                                                  "<info@booth.example>: \"Offerte\". (thread-id 1a)"))  # review r5 F1: the Booth miss, never dropped
+        relay._digest["due"] = True
+        with mock.patch.object(relay, "ask_owner_claude", return_value="@@SKIP") as ask, \
+                mock.patch.object(relay, "owner_night", return_value=False), \
+                mock.patch.object(relay, "coordinator_send") as cs:
+            relay.coordinator_digest()
+        self.assertEqual(ask.call_count, 2)
+        sent = cs.call_args[0][0]
+        self.assertTrue(sent.startswith("Mail you must see:\n- The reply you asked to watch. From Booth"))
+        self.assertIn("(thread-id 1a)", sent)  # r5 N3: the whole line
 
     def test_mail_agents_config(self):
         self.party(inbox=False)
