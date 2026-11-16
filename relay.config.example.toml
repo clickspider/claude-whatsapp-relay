@@ -255,6 +255,10 @@ attach_dir = ""
 attach_deny = []                       # never these files (globs relative to attach_dir, e.g. "money/*password*"); hidden folders (.git) are always refused
 check_minutes = 5
 digest_hour = 8                        # -1 = no morning digest
+# Optional: a mail on one of these watch topics also goes to that agent's inbox (the agent needs inbox = true),
+# so it posts the news with ONE proposed next step in its own chat. The agent only proposes; replies stay yours.
+# MED: the first 500 characters of the mail reach that agent, marked as data. e.g. { dj = "party" }
+agents = {}
 [mail.watch]
 # topic = ["sender address, domain or word", ...]: a hint for the sort; ads from these still count.
 # example = ["lawyer.example", "invoice 1234"]
