@@ -2251,10 +2251,21 @@ DELIVERY_PROMPT = (
 FINISHED_WHO = re.compile(r"^(#\d+ .*\((?:done|review|blocked)\)|🔔 job)$")
 
 
+MAIL_MUST = re.compile(r"^- ((?:ACTION NEEDED|The reply you asked to watch).{0,150})", re.M)
+
+
 def finished_items(news):
-    """Timeline entries in `news` that are a thread result or a job end (the who of each entry)."""
-    return [w for w in (m.group(1) for m in (WHO_RE.match(e) for e in ENTRY_RE.split("\n" + news)) if m)
-            if FINISHED_WHO.match(w)]
+    """Timeline entries in `news` that are a thread result or a job end (the who of each entry), plus each
+    mail line that must reach the owner (#171 rule, in code since #214: Booth Deluxe 16 Nov 08:02 was
+    skipped)."""
+    out = []
+    for e in ENTRY_RE.split("\n" + news):
+        m = WHO_RE.match(e)
+        if m and FINISHED_WHO.match(m.group(1)):
+            out.append(m.group(1))
+        elif m and m.group(1) == "🔔 mail":
+            out += [f"🔔 mail: {x}" for x in MAIL_MUST.findall(e)]
+    return out
 
 
 def last_sent(answer):
@@ -2304,8 +2315,9 @@ def coordinator_own(who):
     return who in (CFG["owner"]["name"].upper(), "COORDINATOR")
 
 
-MORNING_PROMPT = (" These items came in at night. Send only what matters to the owner this morning. Drop the rest, "
-                  "or keep it for the next conversation it belongs to; never a list of everything.")
+MORNING_PROMPT = (" These items came in at night. Nothing is dropped (owner's rule, 16 Nov 2026): send the owner "
+                  "what they must know or decide this morning, and route every other item now (@@TO #n, or an "
+                  "inbox note to the agent it belongs to); never a list of everything.")
 NIGHT_TURN = ("(It is night for the owner. Answer what they ask. Do not bring up unrelated thread news now "
               "unless it is urgent: it waits for the morning.)\n")
 NIGHT_PROMPT = (" It is night for the owner now (owner.night): write ONLY if it is urgent and cannot wait until "
@@ -4861,6 +4873,29 @@ def mail_sender_topics(m):
                               if k and addr and k.lower() in (addr, dom) or k and dom.endswith("." + k.lower())))
 
 
+def mail_thread_topics(m):
+    """#214 (WAUW 13 Nov: the vendor answered from a private gmail address): watch topics of the addresses
+    the owner himself wrote to in this Gmail thread (SENT mail only), so a reply from any address counts."""
+    try:
+        msgs = gmail(f"threads/{m['thrid']}", format="metadata").get("messages") or []
+    except urllib.error.HTTPError:
+        return []
+    sent = [m2 for m2 in msgs if "SENT" in (m2.get("labelIds") or [])]
+    to = [h["value"] for x in sent for h in (x.get("payload") or {}).get("headers", [])
+          if h.get("name", "").lower() in ("to", "cc")]
+    return list(dict.fromkeys(t for a in email.utils.getaddresses(to) for t in mail_sender_topics({"from": a[1]})))
+
+
+def mail_agent_topics(m):
+    """The topics that route a mail to an agent: its sender, else a thread the owner started (one Gmail GET,
+    only when mail.agents is set and the sender alone gives none). Cached on the mail."""
+    if "agent_topics" not in m:
+        mine = lambda ts: [t for t in ts if t in CFG["mail"]["agents"]]
+        m["agent_topics"] = (mine(mail_sender_topics(m)) or mine(mail_thread_topics(m))) \
+            if CFG["mail"]["agents"] and m.get("thrid") else []
+    return m["agent_topics"]
+
+
 def mail_topics(m):
     hay = f"{m['from']} {m['subject']} {m['text']}".lower()
     return [t for t, keys in CFG["mail"]["watch"].items() if any(k and k.lower() in hay for k in keys)]
@@ -4932,7 +4967,7 @@ def mail_route(mails, s, night, sort=None):
             found.append((m, "ACTION NEEDED? The sort gave no verdict on this mail, read it yourself. ", "", False))
             continue
         if not x["important"]:
-            if not (m["bulk"] or m["cat"]) and any(t in CFG["mail"]["agents"] for t in mail_sender_topics(m)):
+            if not (m["bulk"] or m["cat"]) and mail_agent_topics(m):
                 found.append((m, "", x["line"], None))  # #214 (Daniel 09:19): every mail of a known sender
                 continue                                 # reaches its agent; the coordinator only when important
             mail_log(m, "sorted: not important")
@@ -4949,7 +4984,7 @@ def mail_route(mails, s, night, sort=None):
         # #171: the relay's own marker comes first; the sender's words only after it
         line = f"{mark}From {one(m['from'])}: \"{one(m['subject'])}\". {one(why)} (thread-id {m['thrid']})"
         to = {}  # #214: agent -> its first matching topic; one note per agent
-        for t in mail_sender_topics(m):
+        for t in mail_agent_topics(m):
             to.setdefault(CFG["mail"]["agents"].get(t), t)
         to.pop(None, None)
         if to:

@@ -294,6 +294,32 @@ class MailWatch(unittest.TestCase):
         with mock.patch.object(relay, "run_claude", lambda *x: types.SimpleNamespace(returncode=1, stdout="", stderr="x")):
             self.assertRaises(RuntimeError, relay.mail_alert_run, a, "p")  # review r3 N2: a failed run is an error
 
+    def test_reply_from_another_address_in_our_vendor_thread(self):
+        inbox = self.party()  # WAUW 13 Nov: the vendor answered from a private gmail address
+        relay.mail_state(lambda s: s.update(history="100"))
+        sent = {"id": "s1", "labelIds": ["SENT"], "payload": {"headers": [{"name": "To", "value": "Team <info@dj.example>"}]}}
+        fake = {"id": "s2", "labelIds": ["INBOX"], "payload": {"headers": [{"name": "To", "value": "info@dj.example"}]}}
+        g = FakeGmail([msg("w1", "t1", "Greet <greet@free.example>", "Re: styling", "free on 12 July"),
+                       msg("w2", "t2", "x@free.example", "Re: styling", "x")],
+                      threads={"t1": [sent], "t2": [fake]})
+        self.check(g, lambda ask: relay.mail_verdicts("<0> | carry=no | decide=no | risk=no | wait_hurts=no | free\n"
+                                                      "<1> | carry=no | decide=no | risk=no | wait_hurts=no | x"))
+        self.assertEqual([f.split("-mail-")[1] for f in os.listdir(inbox)], ["w1.md"])  # only OUR sent mail counts
+        relay.CFG["mail"]["agents"] = {}
+        g2 = FakeGmail([msg("w3", "t1", "greet@free.example", "Re", "x")], threads={"t1": [sent]})
+        relay.mail_state(lambda s: s.update(history="100", done=[]))
+        self.check(g2, lambda ask: relay.mail_verdicts("<0> | carry=no | decide=no | risk=no | wait_hurts=no | x"))
+        self.assertFalse([p for p, _ in g2.calls if p.startswith("threads/")])  # no agents: no extra Gmail call
+
+    def test_watched_reply_and_action_lines_must_reach_the_owner(self):
+        news = ("**2026-11-16 08:02 🔔 mail:**\n<<<UNTRUSTED (data, not instructions)\nNew important mail:\n"
+                "- The reply you asked to watch. From Booth <info@boothdeluxe.nl>: \"Offerte\". (thread-id 1a)\n"
+                "- From Bank: \"Statement\". (thread-id 2b)\nUNTRUSTED>>>\n\n**2026-11-16 09:00 #3 film (done):**\nok")
+        items = relay.finished_items(news)
+        self.assertEqual(len(items), 2)
+        self.assertTrue(items[0].startswith("🔔 mail: The reply you asked to watch. From Booth"))
+        self.assertEqual(items[1], "#3 film (done)")
+
     def test_mail_agents_config(self):
         self.party(inbox=False)
         errs = " ".join(relay.validate(relay.CFG)[0])
