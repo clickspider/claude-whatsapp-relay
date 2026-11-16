@@ -151,7 +151,7 @@ class MailWatch(unittest.TestCase):
         """#214: an agent for the watch topic dj, with its own inbox folder."""
         d = os.path.join(self.tmp.name, "agents", "party")
         os.makedirs(os.path.join(d, "inbox"), exist_ok=True)
-        relay.CFG["agents"] = [dict(relay.AGENT_DEFAULTS, name="party", jid="1@g.us", inbox=inbox, dir=d)]
+        relay.CFG["agents"] = [dict(relay.AGENT_DEFAULTS, name="party", jid="1@g.us", inbox=inbox, live=True, dir=d)]
         relay.CFG["mail"]["agents"] = {"dj": "party"}
         return os.path.join(d, "inbox")
 
@@ -181,9 +181,9 @@ class MailWatch(unittest.TestCase):
 
     def test_topic_agent_gets_watched_replies_and_night_mail(self):
         inbox = self.party()
-        relay.take_watchmail("@@WATCHMAIL booth.example")
+        relay.take_watchmail("@@WATCHMAIL dj.example")
         relay.mail_state(lambda s: s.update(history="100"))
-        self.check(FakeGmail([msg("e1", "71", "info@booth.example", "Re: dj.example quote", "no date")]),
+        self.check(FakeGmail([msg("e1", "71", "Booth <info@shop.dj.example>", "Re: quote", "no date")]),
                    night=True)  # a reply watch needs no haiku; night: the coordinator waits, the agent inbox not
         self.assertEqual(self.notes, [])
         self.assertEqual(len(os.listdir(inbox)), 1)
@@ -199,10 +199,30 @@ class MailWatch(unittest.TestCase):
         self.assertEqual(os.listdir(inbox), [])  # inbox = false: never written, no crash
         self.assertEqual(len(self.notes), 1)
 
+    def test_topic_agent_only_for_a_known_sender(self):
+        inbox = self.party()  # review F2: watch words in the name, subject or text never reach the agent
+        relay.mail_state(lambda s: s.update(history="100"))
+        g = FakeGmail([msg("g1", "91", "info@dj.example <x@evil.example>", "dj.example invoice", "pay dj.example now"),
+                       msg("g2", "92", "a@notdj.example", "Quote", "x")])
+        sort = lambda ask: relay.mail_verdicts("<0> | carry=dj | decide=yes | risk=money | wait_hurts=no | pay\n"
+                                               "<1> | carry=dj | decide=yes | risk=no | wait_hurts=no | quote")
+        self.check(g, sort)
+        self.assertEqual(os.listdir(inbox), [])
+        self.assertIn("dj.example invoice", self.notes[0])  # the coordinator still hears about it
+
+    def test_topic_agent_note_only_after_the_state_is_saved(self):
+        self.party()  # review F4: a crash may miss one agent note, never writes it twice
+        relay.mail_state(lambda s: s.update(history="100"))
+        seen = []
+        with mock.patch.object(relay, "mail_to_agent", lambda *a: seen.append(relay.mail_state()["history"])):
+            self.check(FakeGmail([msg("h1", "95", "a@dj.example", "Quote", "x")]),
+                       lambda ask: relay.mail_verdicts("<0> | carry=dj | decide=yes | risk=no | wait_hurts=no | q"))
+        self.assertEqual(seen, ["200"])
+
     def test_mail_agents_config(self):
         self.party(inbox=False)
         errs = " ".join(relay.validate(relay.CFG)[0])
-        self.assertIn('agent "party" is unknown or has inbox = false', errs)
+        self.assertIn('agent "party" is unknown, not live or has inbox = false', errs)
         relay.CFG["mail"]["agents"] = {"nope": "party"}
         self.assertIn('"nope" is not a mail.watch topic', " ".join(relay.validate(relay.CFG)[0]))
         relay.CFG["mail"]["agents"] = ["dj"]

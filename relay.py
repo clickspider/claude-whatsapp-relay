@@ -12,7 +12,7 @@ Owner commands for an agent named <n>:
   /new = fresh owner conversation
 All user-specific values live in the config file. See SECURITY.md.
 """
-import base64, contextlib, datetime, difflib, fcntl, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
+import base64, contextlib, datetime, difflib, email.utils, fcntl, hashlib, json, os, queue, random, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request, uuid, wave
 from collections import Counter, defaultdict, deque
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -225,8 +225,8 @@ def validate(cfg):
         for t, n in ml["agents"].items():
             if not isinstance(ml["watch"], dict) or t not in ml["watch"]:
                 err.append(f'mail.agents: "{t}" is not a mail.watch topic.')
-            elif not (n in names and names[n]["inbox"]):
-                err.append(f'mail.agents: agent "{n}" is unknown or has inbox = false.')
+            elif not (n in names and names[n]["inbox"] and names[n]["live"]):
+                err.append(f'mail.agents: agent "{n}" is unknown, not live or has inbox = false.')
     lim = cfg["limits"]
     for k in ("per_minute", "per_day", "group_buffer_max", "run_timeout_seconds", "history_grace_seconds",
               "history_messages", "agent_turns_per_day", "limit_resume_tries"):
@@ -4662,9 +4662,8 @@ MAIL_RULES = (
     "Never delete, archive, label or mark mail. When the owner wants to hear when someone answers by "
     "email, add a line '@@WATCHMAIL #<n>: <thread-id from the 🔔 mail entry, or the sender address or domain>' "
     "(#<n> is optional). An entry that STARTS with 'ACTION NEEDED' or 'The reply you asked to watch' always "
-    "gets your one short message to the owner, never silence (#171, 9 Nov 2026), unless it ends with 'Also sent "
-    "to the <agent> agent's chat': that agent already posts it there with a next step, so do not tell the "
-    "owner the same again; still route it to its thread (@@TO) (#214, 16 Nov 2026).")
+    "gets your one short message to the owner, never silence (#171, 9 Nov 2026), also when it says it was "
+    "sent to an agent's chat too (#214 review F1: that agent may be paused, quiet or fail).")
 # Daniel 5 Nov 2026 12:19 (#124): attachments, same read-only access. The coordinator and every thread get this.
 MAIL_FILES = (
     "\nMAIL FILES: the Gmail tools show only attachment ids. To read an attachment (PDF, image, docx), run "
@@ -4838,6 +4837,15 @@ def mail_handled(m):
     return any("SENT" in (x.get("labelIds") or []) and int(x.get("internalDate") or 0) > m["date"] for x in msgs)
 
 
+def mail_sender_topics(m):
+    """#214 review F2: watch topics whose address or domain IS the sender (never words in the name, subject or
+    text), so only a known sender reaches an agent's chat."""
+    addr = email.utils.parseaddr(m["from"])[1].lower()
+    dom = addr.rpartition("@")[2]
+    return list(dict.fromkeys(t for t, keys in CFG["mail"]["watch"].items() for k in keys
+                              if k and addr and k.lower() in (addr, dom) or k and dom.endswith("." + k.lower())))
+
+
 def mail_topics(m):
     hay = f"{m['from']} {m['subject']} {m['text']}".lower()
     return [t for t, keys in CFG["mail"]["watch"].items() if any(k and k.lower() in hay for k in keys)]
@@ -4923,7 +4931,7 @@ def mail_route(mails, s, night, sort=None):
         # #171: the relay's own marker comes first; the sender's words only after it
         line = f"{mark}From {one(m['from'])}: \"{one(m['subject'])}\". {one(why)} (thread-id {m['thrid']})"
         to = {}  # #214: agent -> its first matching topic; one note per agent
-        for t in m.get("topics") or mail_topics(m):
+        for t in mail_sender_topics(m):
             to.setdefault(CFG["mail"]["agents"].get(t), t)
         to.pop(None, None)
         if to:
@@ -4943,7 +4951,8 @@ def mail_to_agent(name, topic, m, why):
     inbox = os.path.join(a["dir"], "inbox") if a else ""
     if not (a and a["inbox"] and os.path.isdir(inbox)):
         return print(f"{owner_now():%H:%M} mail {m['id']}: agent {name} has no inbox, not sent there", flush=True)
-    mail = untrusted(f"From: {m['from']}\nSubject: {m['subject']}\nSort note: {why or '-'}\n"
+    one = lambda t: " ".join(str(t).split())
+    mail = untrusted(f"From: {one(m['from'])}\nSubject: {one(m['subject'])}\nSort note: {one(why) or '-'}\n"
                      f"Text (start): {m['text']}")
     fn = f"{owner_now():%Y%m%d-%H%M}-mail-{re.sub(r'[^0-9A-Za-z]', '', m['id'])}.md"
     write(os.path.join(inbox, fn), MAIL_AGENT_NOTE.format(topic=topic, mail=mail))
