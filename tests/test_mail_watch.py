@@ -199,6 +199,19 @@ class MailWatch(unittest.TestCase):
         self.assertEqual(os.listdir(inbox), [])  # inbox = false: never written, no crash
         self.assertEqual(len(self.notes), 1)
 
+    def test_every_mail_of_a_known_sender_reaches_the_agent(self):
+        inbox = self.party()  # Daniel 16 Nov 09:19: every wedding mail goes to the wedding agent
+        relay.mail_state(lambda s: s.update(history="100"))
+        g = FakeGmail([msg("k1", "99", "a@dj.example", "Thanks", "see you then"),
+                       msg("k2", "100", "a@dj.example", "Newsletter", "x", bulk=True),
+                       msg("k3", "101", "x@shop.example", "Thanks", "x")])
+        sort = lambda ask: relay.mail_verdicts("\n".join(f"<{i}> | carry=no | decide=no | risk=no | wait_hurts=no | "
+                                                         "nothing" for i in range(3)))
+        self.check(g, sort)
+        self.assertEqual([f.split("-mail-")[1] for f in os.listdir(inbox)], ["k1.md"])  # not the newsletter
+        self.assertEqual(self.notes, [])  # not important: the coordinator is not told
+        self.assertEqual(relay.mail_state()["digest"], [])
+
     def test_topic_agent_only_for_a_known_sender(self):
         inbox = self.party()  # review F2: watch words in the name, subject or text never reach the agent
         relay.mail_state(lambda s: s.update(history="100"))

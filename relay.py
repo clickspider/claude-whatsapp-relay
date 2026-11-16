@@ -4932,6 +4932,9 @@ def mail_route(mails, s, night, sort=None):
             found.append((m, "ACTION NEEDED? The sort gave no verdict on this mail, read it yourself. ", "", False))
             continue
         if not x["important"]:
+            if not (m["bulk"] or m["cat"]) and any(t in CFG["mail"]["agents"] for t in mail_sender_topics(m)):
+                found.append((m, "", x["line"], None))  # #214 (Daniel 09:19): every mail of a known sender
+                continue                                 # reaches its agent; the coordinator only when important
             mail_log(m, "sorted: not important")
             continue
         c = x["carry"].lstrip("#")
@@ -4952,6 +4955,9 @@ def mail_route(mails, s, night, sort=None):
         if to:
             line += f" Also sent to the {', '.join(sorted(to))} agent's chat."
             notes += [(n, t, m, why) for n, t in sorted(to.items())]
+        if urgent is None:
+            mail_log(m, "sorted: not important, to the agent only")
+            continue
         items.append({"id": m["id"], "thrid": m["thrid"], "date": m["date"], "line": line})
         if urgent or not night:  # Instinct: at night only when waiting costs a loss or a deadline
             lines.append(line)
