@@ -1097,8 +1097,27 @@ def pick_react(chat, emoji):
     not addressed) = no reaction."""
     slot = getattr(_react, "slot", None)
     if emoji and slot and slot["chat"] == chat and not slot["done"] and react_on(CFG):
-        slot["done"] = True
+        slot["done"], slot["emoji"] = True, emoji
         react(chat, slot["msg_id"], slot["sender"], emoji)
+
+
+LOOKING = ("👀", "🔍")
+
+
+def eyes_on(n):
+    """#232 (owner 19 Nov 16:43): the owner message that got 👀/🔍 when work went to thread n is kept on the thread,
+    so its report can swap the mark for ✅ (thread_eyes_done). Else finished work looked stuck."""
+    slot = getattr(_react, "slot", None)
+    if slot and slot["chat"] == OWNER and slot.get("emoji") in LOOKING:
+        eyes = [e for e in threads_db().get(n, {}).get("eyes", []) if e[0] != slot["msg_id"]]
+        threads_db(n, eyes=(eyes + [[slot["msg_id"], slot["sender"]]])[-10:])
+
+
+def thread_eyes_done(n):
+    """Thread n finished (done or review): ✅ replaces the 👀 on each owner message that went to it."""
+    for msg_id, sender in threads_db().get(n, {}).get("eyes", []):
+        react(OWNER, msg_id, sender, "✅")
+    threads_db(n, eyes=[])
 
 
 def with_feedback(chat, msg_id, sender, fn):
@@ -2066,6 +2085,7 @@ def thread_dispatch(note, owner_text):
         threads_db(n, title=a, state="working", sid="", last="", topic=topic, effort=effort,
                    model=pick_model(model, effort, a, b, owner_text, topic))
         prompt = f"BRIEF FROM THE COORDINATOR: {b}" + (f"\n\n{name} SAID:\n{owner_text}" if owner_text else "")
+        eyes_on(n)  # before the job: a fast report finds its mark
         thread_job(n, prompt)
         return f"Started #{n}: {a}"
     if a not in threads_db():
@@ -2079,6 +2099,7 @@ def thread_dispatch(note, owner_text):
     threads_db(a, state="working", **({"effort": effort} if effort else {}), **({"topic": topic} if topic else {}),
                **({"model": model} if model else {}))
     prompt = f"NOTE FROM THE COORDINATOR: {b}" + (f"\n\n{name} SAID:\n{owner_text}" if owner_text else "")
+    eyes_on(a)
     thread_job(a, prompt)
     return f"Sent to #{a}."
 
@@ -2141,6 +2162,8 @@ def thread_run(n, prompt):
     main_log(f"#{n} {t['title']} ({state})", body)
     threads_db(n, sid=sid, state="closed" if state == "done" else state,
                last=(body.splitlines() or [""])[0][:160], timeouts=0, reported=time.time())
+    if state in ("done", "review") and react_on(CFG):
+        thread_eyes_done(n)  # blocked keeps its 👀: it still waits
     digest_soon()
 
 

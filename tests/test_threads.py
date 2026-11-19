@@ -79,6 +79,29 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(relay.thread_list(), "")
         self.assertIn("closed", relay.thread_list(closed=True))
 
+    def test_eyes_swap_to_check_when_the_thread_finishes(self):
+        # #232, owner 19 Nov 16:43: 👀 stayed on finished work, so it looked stuck
+        reacts = []
+        relay.CFG["feedback"].update(reactions=True, context_reactions=True)
+        with mock.patch.object(relay, "react", lambda c, m, s, e: reacts.append((m, e))), \
+                mock.patch.object(relay, "thread_job"):
+            relay._react.slot = {"chat": relay.OWNER, "msg_id": "m1", "sender": relay.OWNER, "done": False}
+            relay.pick_react(relay.OWNER, "👀")
+            relay.thread_dispatch(("new", "film", "cut it"), "cut the film")
+            n = max(relay.threads_db(), key=int)
+            relay._react.slot = {"chat": relay.OWNER, "msg_id": "m2", "sender": relay.OWNER, "done": False}
+            relay.pick_react(relay.OWNER, "👍")  # not a 'looking' mark: nothing to swap later
+            relay.thread_dispatch(("to", n, "shorter"), "shorter")
+            relay._react.slot = None
+            self.assertEqual([e[0] for e in relay.threads_db()[n]["eyes"]], ["m1"])
+            with mock.patch.object(relay, "run_claude", return_value=R("need your pick\n@@STATE: blocked")):
+                relay.thread_run(n, "go")
+            self.assertEqual(reacts, [("m1", "👀"), ("m2", "👍")])  # blocked still waits: 👀 stays
+            with mock.patch.object(relay, "run_claude", return_value=R("v2 ready\n@@STATE: review")):
+                relay.thread_run(n, "go")
+            self.assertEqual(reacts[-1], ("m1", "✅"))
+            self.assertEqual(relay.threads_db()[n]["eyes"], [])
+
     def test_context_flows_everywhere(self):
         # main chat -> thread, thread -> other thread, thread -> coordinator; nobody gets their own back
         relay.threads_db("5", title="money", state="working", sid="", last="")
