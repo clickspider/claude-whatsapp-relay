@@ -1109,15 +1109,25 @@ def eyes_on(n):
     so its report can swap the mark for ✅ (thread_eyes_done). Else finished work looked stuck."""
     slot = getattr(_react, "slot", None)
     if slot and slot["chat"] == OWNER and slot.get("emoji") in LOOKING:
-        eyes = [e for e in threads_db().get(n, {}).get("eyes", []) if e[0] != slot["msg_id"]]
-        threads_db(n, eyes=(eyes + [[slot["msg_id"], slot["sender"]]])[-10:])
+        e = [slot["msg_id"], slot["sender"]]
+        thread_eyes(n, lambda old: ([x for x in old if x[0] != e[0]] + [e])[-10:])
 
 
-def thread_eyes_done(n):
-    """Thread n finished (done or review): ✅ replaces the 👀 on each owner message that went to it."""
-    for msg_id, sender in threads_db().get(n, {}).get("eyes", []):
+def thread_eyes(n, fn):
+    """One read-modify-write of thread n's eyes under the lock: an owner turn and a report run at once."""
+    with _tlock:
+        data = load_state("threads.json")
+        t = data.setdefault(str(n), {})
+        t["eyes"] = fn(t.get("eyes", []))
+        write(st("threads.json"), json.dumps(data))
+
+
+def thread_eyes_done(n, seen):
+    """Thread n finished (done or review): ✅ replaces the 👀 on each owner message the run started with
+    (seen). A message handed over during the run waits for the next report."""
+    for msg_id, sender in seen:
         react(OWNER, msg_id, sender, "✅")
-    threads_db(n, eyes=[])
+    thread_eyes(n, lambda old: [x for x in old if x not in seen])
 
 
 def with_feedback(chat, msg_id, sender, fn):
@@ -2162,8 +2172,8 @@ def thread_run(n, prompt):
     main_log(f"#{n} {t['title']} ({state})", body)
     threads_db(n, sid=sid, state="closed" if state == "done" else state,
                last=(body.splitlines() or [""])[0][:160], timeouts=0, reported=time.time())
-    if state in ("done", "review") and react_on(CFG):
-        thread_eyes_done(n)  # blocked keeps its 👀: it still waits
+    if m and state in ("done", "review") and react_on(CFG):  # m: a stated end, not a crash's stderr
+        thread_eyes_done(n, t.get("eyes", []))  # blocked keeps its 👀: it still waits
     digest_soon()
 
 

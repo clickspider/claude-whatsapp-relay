@@ -102,6 +102,41 @@ class ThreadTests(unittest.TestCase):
             self.assertEqual(reacts[-1], ("m1", "✅"))
             self.assertEqual(relay.threads_db()[n]["eyes"], [])
 
+    def test_eyes_note_during_a_run_crash_and_cap(self):
+        # #232 review R3-1/R3-3/R3-5: a note handed over during a run waits for the next report; a crash without
+        # @@STATE never gets ✅; the @@TO path saves; max 10 kept
+        reacts = []
+        relay.CFG["feedback"].update(reactions=True, context_reactions=True)
+        relay.threads_db("4", title="film", state="working", sid="", last="")
+
+        def to(msg):
+            relay._react.slot = {"chat": relay.OWNER, "msg_id": msg, "sender": relay.OWNER, "done": False}
+            relay.pick_react(relay.OWNER, "👀")
+            relay.thread_dispatch(("to", "4", "note"), "note")
+            relay._react.slot = None
+        with mock.patch.object(relay, "react", lambda c, m, s, e: reacts.append((m, e))), \
+                mock.patch.object(relay, "thread_job"):
+            to("m1")
+
+            def run_with_note(*a, **k):
+                to("m2")  # the owner hands over more while this run works
+                return R("v1 ready\n@@STATE: review")
+            with mock.patch.object(relay, "run_claude", side_effect=run_with_note):
+                relay.thread_run("4", "go")
+            self.assertIn(("m1", "✅"), reacts)
+            self.assertNotIn(("m2", "✅"), reacts)
+            self.assertEqual([e[0] for e in relay.threads_db()["4"]["eyes"]], ["m2"])
+            crash = R("")
+            crash.stderr, crash.returncode = "boom", 1
+            with mock.patch.object(relay, "run_claude", return_value=crash):
+                relay.thread_run("4", "go")
+            self.assertNotIn(("m2", "✅"), reacts)
+            for i in range(12):
+                to(f"x{i}")
+            eyes = [e[0] for e in relay.threads_db()["4"]["eyes"]]
+            self.assertEqual(len(eyes), 10)
+            self.assertEqual(eyes[-1], "x11")
+
     def test_context_flows_everywhere(self):
         # main chat -> thread, thread -> other thread, thread -> coordinator; nobody gets their own back
         relay.threads_db("5", title="money", state="working", sid="", last="")
