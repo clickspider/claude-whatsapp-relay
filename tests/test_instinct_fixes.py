@@ -57,6 +57,15 @@ class InstinctFixes(unittest.TestCase):
             relay.digest_after_night(AT(23))
         self.assertEqual(tm.call_args[0][0], 8.5 * 3600 + 5)
 
+    def test_owner_turn_clears_the_morning_flag(self):  # #232 review F1 / R2-2
+        relay.CFG["owner"]["night"] = [23, 8]
+        relay._digest["morning"] = True
+        with mock.patch.object(relay, "owner_night", return_value=False), \
+                mock.patch.object(relay, "ask_owner_claude", return_value="ok"), \
+                mock.patch.object(relay, "pick_react"), mock.patch.object(relay, "coordinator_send"):
+            relay.owner_turn("m1", "hi", None)
+        self.assertNotIn("morning", relay._digest)
+
     def test_digest_after_night_when_the_night_is_over_never_waits_a_day(self):
         # #232, 19 Nov 2026: the 08:00 digest ran as night, answered @@SKIP after 08:00, and armed a timer for
         # the next morning; every daytime report joined that timer, so no digest came all day.

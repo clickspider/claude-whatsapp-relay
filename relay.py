@@ -1520,7 +1520,7 @@ def owner_turn(msg_id, text, media_type, batch=None):
     head += f"{CFG['owner']['name']} SAYS:\n" if head else ""
     head = (NIGHT_TURN if night else "") + (CUT_NOTE if cut else "") + head  # never inside the owner's own words (daylog, main log)
     answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(head + text)))
-    if not emoji and threads_on and any(THREAD_MARK_RE.match(x) for x in answer.splitlines()):
+    if not emoji and threads_on and take_thread_markers(take_drafts(answer)[0])[1]:  # what dispatch reads (review R2-1)
         emoji = "👀"  # #232 (owner 19 Nov 12:37): work handed to a thread gets 👀 in code, never only by memory
     pick_react(OWNER, emoji)
     coordinator_send(answer, text, voice=voice, refs=refs)

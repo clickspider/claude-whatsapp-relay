@@ -84,7 +84,7 @@ and follow its SETUP.md with me, one question at a time.
 | ↩️ **Quote-replies** | Claude can answer as a WhatsApp reply to one message (`@@QUOTE: #n`). When several messages came together, or newer ones came in before the answer, the reply quotes the last one by itself (`ui.auto_quote`). In a group, replying to the agent's message talks to it. |
 | 🌙 **Quiet hours** | Agents never start a conversation at night or on your days off. Replies still go out. |
 | 🧵 **Threads** | Optional (`[threads]`). Your chat works like a Claude Project: it starts a thread for each real task, threads run in parallel, and each reply carries its tag (`#3 flat move: ...`). |
-| 👀 **Feedback** | "typing…" while Claude works. The relay never reacts by itself. Claude reacts only when a person would, after reading, just before the answer (👀 looking into it, 👍 got it, ✅ done, ❤️/😂 the human bit); most messages get none: `[feedback] context_reactions`. An emoji on a message reaches Claude as a short answer to that message, so ✅ can replace typing. |
+| 👀 **Feedback** | "typing…" while Claude works. The relay never reacts by itself, with one exception: when Claude hands your message to a thread and picked no emoji, it gets 👀. Claude reacts only when a person would, after reading, just before the answer (👀 looking into it, 👍 got it, ✅ done, ❤️/😂 the human bit); most messages get none: `[feedback] context_reactions`. An emoji on a message reaches Claude as a short answer to that message, so ✅ can replace typing. |
 
 ## Commands in your chat
 

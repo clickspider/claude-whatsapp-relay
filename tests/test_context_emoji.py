@@ -96,6 +96,16 @@ class ContextEmojiTests(unittest.TestCase):
             self.calls.clear()
             self.owner("Sure, 3 eggs.", "breakfast?")  # no hand-off: still no reaction
             self.assertEqual(self.reacts(), [])
+            for shape in ("@@DRAFT\n@@THREAD: x | y\n@@END", "@@THREAD:", "@@TO: no number", "@@TOPIC: x"):
+                self.calls.clear()  # review R2-1: only a marker that really dispatches counts
+                self.owner(shape + "\nok", "hi")
+                self.assertEqual(self.reacts(), [], shape)
+
+    def test_no_eyes_when_threads_are_off(self):  # review R2-2
+        self.load()
+        with unittest.mock.patch.object(relay, "coordinator_send"):
+            self.owner("@@THREAD: Read the article | find 3 ideas\nOn it.", "what can we take?")
+        self.assertEqual(self.reacts(), [])
 
     def test_instinct_set_allowed(self):
         for e in ("👀", "🔍", "✅", "👍"):

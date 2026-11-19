@@ -99,7 +99,8 @@ agent_base_rules = ""
 [feedback]
 # Show "typing..." in WhatsApp while Claude works (repeated every 10 s).
 typing = true
-# Reactions on your message: only the one Claude picks after reading. The relay never reacts by itself.
+# Reactions on your message: only the one Claude picks after reading. The relay never reacts by itself,
+# except 👀 when Claude hands your message to a thread (@@THREAD / @@TO) and picked no emoji.
 reactions = true
 # Claude reacts only when a person would (👀 looking into it, 👍 got it, ✅ done, ❤️/😂 the human bit),
 # sent just before its answer; most messages get none; a reaction alone can be the whole answer. Needs reactions = true.
