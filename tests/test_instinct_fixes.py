@@ -55,7 +55,18 @@ class InstinctFixes(unittest.TestCase):
         relay.CFG["owner"]["night"] = [23, 8]
         with mock.patch.object(relay.threading, "Timer") as tm:
             relay.digest_after_night(AT(23))
-        self.assertEqual(tm.call_args[0][0], 8.5 * 3600)
+        self.assertEqual(tm.call_args[0][0], 8.5 * 3600 + 5)
+
+    def test_digest_after_night_when_the_night_is_over_never_waits_a_day(self):
+        # #232, 19 Nov 2026: the 08:00 digest ran as night, answered @@SKIP after 08:00, and armed a timer for
+        # the next morning; every daytime report joined that timer, so no digest came all day.
+        relay.CFG["owner"]["night"] = [23, 8]
+        self.digests.clear()
+        with mock.patch.object(relay.threading, "Timer") as tm:
+            relay.digest_after_night(AT(8))
+        tm.assert_not_called()  # no timer for tomorrow
+        self.assertEqual(self.digests, [1])  # the normal digest_soon wait instead
+        self.assertTrue(relay._digest["due"] and relay._digest["morning"])
 
     # B: @@SKIP never goes out, for agents too
     def test_agent_skip_sends_nothing(self):

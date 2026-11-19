@@ -2339,8 +2339,15 @@ def owner_night(now=None):
 
 def digest_after_night(now=None):
     """Run the digest again at the end of owner.night.
-    ponytail: a restart at night drops this timer; the next thread report or owner message picks the news up."""
+    ponytail: a restart at night drops this timer; the next thread report or owner message picks the news up.
+    #232 (19 Nov 2026): the 08:00 timer fired a moment before 08:00, so that digest still ran as night; it
+    answered @@SKIP after 08:00 and this set a timer for TOMORROW 08:00. While that timer lived, digest_soon
+    joined every daytime report to it: no digest all day. The night is over now: page on in normal time."""
     now = now or owner_now()
+    if not owner_night(now):
+        with _tlock:
+            _digest["morning"] = True  # the morning prompt still applies to this news
+        return digest_soon()
     end = now.replace(hour=CFG["owner"]["night"][1], minute=0, second=0, microsecond=0)
     if end <= now:
         end += datetime.timedelta(days=1)
@@ -2348,7 +2355,7 @@ def digest_after_night(now=None):
         _digest["due"], _digest["morning"] = True, True
         if _digest["timer"] and _digest["timer"].is_alive():
             _digest["timer"].cancel()
-        _digest["timer"] = threading.Timer((end - now).total_seconds(), digest_job)
+        _digest["timer"] = threading.Timer((end - now).total_seconds() + 5, digest_job)  # +5 s: lands after the night
         _digest["timer"].daemon = True
         _digest["timer"].start()
 
