@@ -61,6 +61,7 @@ class InstinctFixes(unittest.TestCase):
         # #232, 19 Nov 2026: the 08:00 digest ran as night, answered @@SKIP after 08:00, and armed a timer for
         # the next morning; every daytime report joined that timer, so no digest came all day.
         relay.CFG["owner"]["night"] = [23, 8]
+        relay._digest.pop("morning", None)  # review F2: no flag left from an earlier test
         self.digests.clear()
         with mock.patch.object(relay.threading, "Timer") as tm:
             relay.digest_after_night(AT(8))

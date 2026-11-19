@@ -1509,6 +1509,7 @@ def owner_turn(msg_id, text, media_type, batch=None):
     night = threads_on and owner_night()
     if not night:  # at night the news stays unread for the morning digest (Instinct: no late-night admin)
         _digest["due"] = False  # this turn reads the thread news itself
+        _digest.pop("morning", None)  # #232 review F1: a later daytime digest never gets the morning prompt
     listing = thread_list() if threads_on else ""
     t0 = time.time()  # 5 Nov 2026: read with peek, mark read only after the answer went out (a restart loses nothing)
     news, upto = main_since("coordinator", coordinator_own, peek=True, offset=True) if threads_on else ("", 0)
