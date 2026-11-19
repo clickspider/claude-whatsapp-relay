@@ -1103,7 +1103,8 @@ def pick_react(chat, emoji):
 
 def with_feedback(chat, msg_id, sender, fn):
     """"typing..." while Claude works; the only reaction is the one Claude picks after reading
-    (pick_react). The relay never reacts by itself: no 👀/✅/⚠️ marks (4 Nov 2026, like Instinct).
+    (pick_react). The relay never reacts by itself: no 👀/✅/⚠️ marks (4 Nov 2026, like Instinct). One exception
+    (#232, 19 Nov 2026): an owner turn that hands work to a thread (@@THREAD / @@TO) and picked no emoji gets 👀.
     Each part can be switched off in [feedback]; errors still reach the owner as text."""
     fb = CFG["feedback"]
     if fb["mark_read"] and not no_bubble(chat, msg_id):
@@ -1519,6 +1520,8 @@ def owner_turn(msg_id, text, media_type, batch=None):
     head += f"{CFG['owner']['name']} SAYS:\n" if head else ""
     head = (NIGHT_TURN if night else "") + (CUT_NOTE if cut else "") + head  # never inside the owner's own words (daylog, main log)
     answer, emoji = take_react(apply_fixes(OWNER, ask_owner_claude(head + text)))
+    if not emoji and threads_on and any(THREAD_MARK_RE.match(x) for x in answer.splitlines()):
+        emoji = "👀"  # #232 (owner 19 Nov 12:37): work handed to a thread gets 👀 in code, never only by memory
     pick_react(OWNER, emoji)
     coordinator_send(answer, text, voice=voice, refs=refs)
     if news and not night:

@@ -1,5 +1,5 @@
 """feedback.context_reactions: '@@REACT: <emoji>' from Claude is the only reaction, sent after reading, before the text. Run: python3 -m unittest discover tests"""
-import os, sys, tempfile, unittest
+import os, sys, tempfile, unittest, unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import relay  # noqa: E402
@@ -83,6 +83,19 @@ class ContextEmojiTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             relay.with_feedback(relay.OWNER, "m1", relay.OWNER, lambda: (_ for _ in ()).throw(RuntimeError("x")))
         self.assertEqual(self.reacts(), [])
+
+    def test_thread_hand_off_gets_eyes_in_code(self):
+        # #232, 19 Nov 2026: the coordinator opened threads without 👀; the relay adds it when no emoji was picked
+        self.load("\n[threads]\nenabled = true\n")
+        with unittest.mock.patch.object(relay, "coordinator_send"):
+            self.owner("@@THREAD: Read the article | find 3 ideas | topic=career\nOn it.", "what can we take?")
+            self.assertEqual(self.reacts(), ["👀"])
+            self.calls.clear()
+            self.owner("@@REACT: 👍\n@@TO #3: he says yes", "yes")  # an emoji it picked wins
+            self.assertEqual(self.reacts(), ["👍"])
+            self.calls.clear()
+            self.owner("Sure, 3 eggs.", "breakfast?")  # no hand-off: still no reaction
+            self.assertEqual(self.reacts(), [])
 
     def test_instinct_set_allowed(self):
         for e in ("👀", "🔍", "✅", "👍"):
