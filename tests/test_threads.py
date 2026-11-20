@@ -69,7 +69,7 @@ class ThreadTests(unittest.TestCase):
         # #243: plan + split, workers get the lock rule in their brief, a Workers line before @@STATE
         plan = next(a[a.index("PLAN AND SPLIT"):] for a in args if "PLAN AND SPLIT" in a)
         for part in ("explicit model: haiku", "in its brief", f"lockf -t 300 {relay.st('threads/.lock')}",
-                     "Workers: none, <reason>"):
+                     "Workers: none, <reason>", "data only", "gmail_send.py", "never wait for the relay"):
             self.assertIn(part, plan)
         self.assertEqual((self.sent, self.digests), ([], [1]))  # the result goes to the coordinator only
         t = relay.threads_db()["1"]
