@@ -65,6 +65,7 @@ class ThreadTests(unittest.TestCase):
         args = rc.call_args[0][0]
         self.assertIn("--session-id", args)
         self.assertTrue(any("THREAD: you work on ONE thread (#1: flat move)" in a for a in args))
+        self.assertTrue(any("PLAN AND SPLIT" in a and "explicit model: haiku" in a for a in args))  # #243
         self.assertEqual((self.sent, self.digests), ([], [1]))  # the result goes to the coordinator only
         t = relay.threads_db()["1"]
         self.assertEqual((t["state"], t["last"]), ("review", "3 movers found."))
