@@ -60,12 +60,17 @@ class ThreadTests(unittest.TestCase):
                          "Started #1: flat move")
         key, job = self.jobs.pop()
         self.assertEqual(key, "#1")
-        with mock.patch.object(relay, "run_claude", return_value=R("3 movers found.\n@@STATE: review")) as rc:
+        with mock.patch.object(relay, "run_claude",
+                               return_value=R("3 movers found.\nWorkers: none, one lookup\n@@STATE: review")) as rc:
             job()
         args = rc.call_args[0][0]
         self.assertIn("--session-id", args)
         self.assertTrue(any("THREAD: you work on ONE thread (#1: flat move)" in a for a in args))
-        self.assertTrue(any("PLAN AND SPLIT" in a and "explicit model: haiku" in a for a in args))  # #243
+        # #243: plan + split, workers get the lock rule in their brief, a Workers line before @@STATE
+        plan = next(a[a.index("PLAN AND SPLIT"):] for a in args if "PLAN AND SPLIT" in a)
+        for part in ("explicit model: haiku", "in its brief", f"lockf -t 300 {relay.st('threads/.lock')}",
+                     "Workers: none, <reason>"):
+            self.assertIn(part, plan)
         self.assertEqual((self.sent, self.digests), ([], [1]))  # the result goes to the coordinator only
         t = relay.threads_db()["1"]
         self.assertEqual((t["state"], t["last"]), ("review", "3 movers found."))
